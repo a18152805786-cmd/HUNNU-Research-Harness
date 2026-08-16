@@ -83,7 +83,7 @@ This section defines **how** an Agent calls Harness after global routing has sel
 49. `PreflightMaxDownloadsPerSource=1`. Research-candidate preflight downloads count toward the formal download cap; readiness-only downloads remain separately audited overhead and cannot bypass that preflight limit. Large planned-source sets remain subject to the planning and budget gate.
 50. Start a formal all-source run only when `UnattendedRunClearance=true`, meaning every planned source is ready and no user-action or `NOT_READY` source remains. Partial execution requires the user's explicit `ProceedWithPartialSources=true`; preflight itself never starts the formal research run.
 
-## Global Paper Library / Personal Literature Corpus (v0.2.11)
+## Global Paper Library / Personal Literature Corpus (v0.2.12)
 
 51. Long-lived literature full text belongs below `Output Root\library\papers`; derived reading assets belong below `Output Root\library\notes\<PaperID>`. Never write Library assets into Core Root or mix notes with managed full text.
 52. Reuse the existing `stable_paper_id()` unchanged for logical work identity. SHA-256 identifies a concrete file version. The same PaperID with a different SHA-256 is a same-work/different-version reconciliation case and must never silently overwrite the existing managed file.

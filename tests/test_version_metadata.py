@@ -17,11 +17,11 @@ class VersionMetadataTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(project["project"]["version"], "0.2.11")
-        self.assertEqual(__version__, "0.2.11")
+        self.assertEqual(project["project"]["version"], "0.2.12")
+        self.assertEqual(__version__, "0.2.12")
         self.assertEqual(
             importlib.metadata.version("hunnu-research-harness"),
-            "0.2.11",
+            "0.2.12",
         )
 
     def test_root_cli_reports_runtime_package_version(self) -> None:
@@ -31,7 +31,7 @@ class VersionMetadataTests(unittest.TestCase):
             build_parser().parse_args(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue().strip(), "hunnu-harness 0.2.11")
+        self.assertEqual(output.getvalue().strip(), "hunnu-harness 0.2.12")
 
 
 if __name__ == "__main__":
