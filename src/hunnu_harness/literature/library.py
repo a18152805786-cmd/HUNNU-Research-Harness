@@ -37,7 +37,7 @@ from .normalization import normalize_doi, normalize_person, normalize_title, sha
 from .security import sanitize_url
 
 
-CATALOG_SCHEMA_VERSION = "0.2.10"
+CATALOG_SCHEMA_VERSION = "0.2.11"
 _PAPER_ID_RE = re.compile(r"^P[0-9A-F]{12}$")
 
 

@@ -43,6 +43,11 @@ from .fulltext import (
     ExternalIdentityVerificationResult,
     verify_external_paper_identity,
 )
+from .metadata_correction import (
+    BibliographicCorrection,
+    BibliographicCorrectionResult,
+    BibliographicMetadataCorrector,
+)
 
 __all__ = [
     "AccessDecision",
@@ -76,4 +81,7 @@ __all__ = [
     "ExternalIdentityDecision",
     "ExternalIdentityVerificationResult",
     "verify_external_paper_identity",
+    "BibliographicCorrection",
+    "BibliographicCorrectionResult",
+    "BibliographicMetadataCorrector",
 ]
