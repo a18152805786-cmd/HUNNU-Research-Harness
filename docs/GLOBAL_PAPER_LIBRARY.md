@@ -84,9 +84,22 @@ Python callers may use `ExternalPaperImporter.stage_pdf()` and `ExternalPaperImp
 
 ## Atomicity and recovery
 
-The managed file is copied to a same-directory temporary file, SHA-256 verified, and committed with a no-overwrite hard-link operation. Catalog temporary files are prepared before commit. The managed file is committed before JSONL, so the catalog cannot claim a missing newly ingested file. JSONL is atomically replaced and remains authoritative; CSV is a rebuildable projection.
+The managed file is copied to a same-directory temporary file, SHA-256 verified, and committed with a no-overwrite hard-link operation. Catalog temporary files are prepared before commit. The managed file is committed before JSONL, so the catalog cannot claim a missing newly ingested file. `papers.jsonl` is the source of truth and is atomically replaced. `papers.csv` is a rebuildable human-readable projection; JSONL and CSV are not one simultaneous two-file transaction. If JSONL replacement succeeds but CSV projection replacement fails, CSV may be temporarily stale and can be rebuilt from JSONL; this does not lose the authoritative catalog or managed paper assets.
 
 An interruption can at worst leave an unreferenced managed file or a stale CSV projection. It cannot overwrite an existing paper or make JSONL point to a file that was never committed. Any occupied but uncataloged destination is treated as a review conflict on the next attempt.
+
+## Metadata correction safety
+
+Bibliographic correction is limited to title, authors, year, and journal. DOI-
+anchored records must retain the `stable_paper_id()` derived from their DOI.
+For records without a DOI, a correction to title, first author, or year is
+accepted only when the complete corrected fallback identity recomputes to the
+existing PaperID; an incomplete or different fallback identity fails closed
+with identity escalation. Journal-only correction does not participate in the
+fallback identity. Before the catalog commit, a deep immutable snapshot checks
+the PaperID, DOI, file hashes and paths, versions, and acquisition/import
+provenance (including nested version provenance). Only the
+`metadata_corrections` list may change, and it is append-only.
 
 ## Notes contract
 
