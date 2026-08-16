@@ -1,0 +1,26 @@
+databases:
+  cnrds:
+    display_name: CNRDS
+    institution: 湖南师范大学
+    modules:
+      cnfs: 上市公司财务基础数据/财务报表
+    expected_text:
+      - CNRDS
+      - 中国研究数据服务平台
+      - 学校账号
+    tables:
+      - 资产负债表
+      - 利润表
+      - 现金流量表
+  cnki:
+    display_name: 中国知网
+    adapter_status: reserved
+  wanfang:
+    display_name: 万方
+    adapter_status: reserved
+  resset:
+    display_name: RESSET
+    adapter_status: reserved
+  eps:
+    display_name: EPS
+    adapter_status: reserved
