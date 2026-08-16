@@ -1,4 +1,4 @@
-# HUNNU Research Harness v0.2.11
+# HUNNU Research Harness v0.2.12
 
 湖南师范大学数字资源研究自动化 Harness。它把“人工完成学校认证”和“登录后的研究操作”明确分开：Harness 可以识别页面、进入 CNRDS CNFS、选择研究条件、触发合法下载并归档原始文件；它不会输入密码、验证码或 MFA，也不会导出 cookie。
 

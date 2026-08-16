@@ -1,4 +1,4 @@
-# Global Paper Library / Personal Literature Corpus (v0.2.11)
+# Global Paper Library / Personal Literature Corpus (v0.2.12)
 
 ## Boundary
 
@@ -94,4 +94,4 @@ All generated reading assets belong below `library/notes/<PaperID>/`, for exampl
 
 ## Migration boundary
 
-v0.2.11 performs no historical run migration. Existing `runs/.../downloads/` files remain untouched. A future migration must begin with a bounded dry-run inventory and may only COPY, verify `source SHA256 == destination SHA256`, and retain all original run evidence.
+v0.2.12 performs no historical run migration. Existing `runs/.../downloads/` files remain untouched. A future migration must begin with a bounded dry-run inventory and may only COPY, verify `source SHA256 == destination SHA256`, and retain all original run evidence.

@@ -13,6 +13,16 @@ from .pdf import PDFValidator
 _HTML_PREFIXES = (b"<!doctype html", b"<html", b"<?xml")
 _CAJ_SIGNATURES = (b"CAJ", b"HNLC", b"KDH")
 _DOI_CONTENT_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+_BOUNDED_LOCAL_DOI_PAGE_LIMIT = 3
+_REFERENCE_HEADING_RE = re.compile(
+    r"(?i)^\s*(?:参考文献|文后参考文献|references?|bibliography)"
+    r"(?:\s*[:：].*|\s*)$"
+)
+_DOI_LABEL_RE = re.compile(r"(?i)(?:\bdoi\b|doi\.org|数字对象标识)")
+_ARTICLE_IDENTITY_MARKER_RE = re.compile(
+    r"(?i)(?:citation(?:\s+format)?|title|authors?|journal|article|bibliographic|"
+    r"publication|题目|题名|作者|期刊|引用格式|文献标识码|网络首发)"
+)
 _MIN_EXPLICIT_TITLE_EVIDENCE_CHARS = 12
 _TRAILING_BYLINE_RE = re.compile(
     r"^(?P<title>.+?)\s*[-‐‑‒–—―:：]\s*(?P<byline>[^\r\n]+?)\s*$"
@@ -43,6 +53,7 @@ class ExternalIdentityVerificationResult:
     claimed_doi: str = UNKNOWN
     extracted_dois: tuple[str, ...] = ()
     reason: str = UNKNOWN
+    bounded_local_doi: str = "not_attempted"
 
     @property
     def verified(self) -> bool:
@@ -55,6 +66,7 @@ class ExternalIdentityVerificationResult:
             "TitleVerification": self.title_verification,
             "ClaimedDOI": self.claimed_doi,
             "ExtractedDOIs": list(self.extracted_dois),
+            "BoundedLocalDOI": self.bounded_local_doi,
             "Reason": self.reason,
         }
 
@@ -222,6 +234,63 @@ class AuthorizedFullTextValidator:
             return None
 
     @staticmethod
+    def extract_pdf_bounded_pages_text(
+        path: Path,
+        page_limit: int = _BOUNDED_LOCAL_DOI_PAGE_LIMIT,
+    ) -> tuple[str, ...]:
+        """Return only the first bounded set of locally extractable PDF pages."""
+
+        try:
+            from pypdf import PdfReader  # type: ignore[import-not-found]
+
+            reader = PdfReader(str(path), strict=False)
+            limit = max(0, min(int(page_limit), len(reader.pages)))
+            return tuple(reader.pages[index].extract_text() or "" for index in range(limit))
+        except Exception:
+            return ()
+
+    @classmethod
+    def extract_bounded_local_article_dois(
+        cls,
+        path: Path,
+        *,
+        page_limit: int = _BOUNDED_LOCAL_DOI_PAGE_LIMIT,
+    ) -> tuple[str, ...]:
+        """Extract DOI candidates only from bounded article-identity blocks.
+
+        This is deliberately not a full-text DOI search.  It reads at most the
+        first three pages, stops at a references heading on each page, and
+        accepts a DOI only when its nearby text contains both a DOI label and a
+        bibliographic/article-identity marker.
+        """
+
+        candidates: set[str] = set()
+        bounded_pages = cls.extract_pdf_bounded_pages_text(path, page_limit)
+        for page_text in bounded_pages[: max(0, int(page_limit))]:
+            lines = (page_text or "").splitlines()
+            reference_started = False
+            for index, line in enumerate(lines):
+                if _REFERENCE_HEADING_RE.match(line):
+                    reference_started = True
+                    continue
+                if reference_started:
+                    continue
+                found = _DOI_CONTENT_RE.findall(line)
+                if not found:
+                    continue
+                context = "\n".join(lines[max(0, index - 4) : min(len(lines), index + 5)])
+                if not _DOI_LABEL_RE.search(context):
+                    continue
+                if not _ARTICLE_IDENTITY_MARKER_RE.search(context):
+                    continue
+                candidates.update(
+                    normalized
+                    for candidate in found
+                    if (normalized := normalize_doi(candidate)) != UNKNOWN
+                )
+        return tuple(sorted(candidates))
+
+    @staticmethod
     def _title_matches_extracted_text(
         title: str,
         extracted_text: str,
@@ -304,7 +373,7 @@ def verify_external_paper_identity(
             # A DOI-only or otherwise too-thin first page is weak title
             # extraction, not affirmative evidence of a different title.
             title_verification = "not_available"
-    extracted_dois = tuple(
+    first_page_dois = tuple(
         sorted(
             {
                 normalized
@@ -314,18 +383,33 @@ def verify_external_paper_identity(
         )
     )
 
+    bounded_local_doi = "not_attempted"
+    extracted_dois = first_page_dois
     if claimed_doi == UNKNOWN:
         doi_verification = DOIContentVerification.NOT_SUPPLIED
-    elif extracted_dois == (claimed_doi,):
+    elif first_page_dois == (claimed_doi,):
         doi_verification = DOIContentVerification.MATCHED
-    elif extracted_dois:
+        bounded_local_doi = "not_needed"
+    elif first_page_dois:
         doi_verification = DOIContentVerification.CONFLICT
+        bounded_local_doi = "not_attempted"
     else:
-        doi_verification = DOIContentVerification.NOT_AVAILABLE
+        bounded_dois = AuthorizedFullTextValidator.extract_bounded_local_article_dois(path)
+        extracted_dois = bounded_dois
+        if claimed_doi in bounded_dois and len(bounded_dois) == 1:
+            doi_verification = DOIContentVerification.MATCHED
+            bounded_local_doi = "matched"
+        elif bounded_dois:
+            doi_verification = DOIContentVerification.CONFLICT
+            bounded_local_doi = "conflict"
+        else:
+            doi_verification = DOIContentVerification.NOT_AVAILABLE
+            bounded_local_doi = "not_available"
 
     evidence = (
         f"DOIVerification={doi_verification.value}; "
-        f"TitleVerification={title_verification}"
+        f"TitleVerification={title_verification}; "
+        f"BoundedLocalDOI={bounded_local_doi}"
     )
     if not validation.passed:
         return ExternalIdentityVerificationResult(
@@ -335,6 +419,7 @@ def verify_external_paper_identity(
             claimed_doi,
             extracted_dois,
             f"External identity cannot be verified before structural validation passes; {evidence}",
+            bounded_local_doi,
         )
     if doi_verification == DOIContentVerification.CONFLICT:
         return ExternalIdentityVerificationResult(
@@ -344,6 +429,7 @@ def verify_external_paper_identity(
             claimed_doi,
             extracted_dois,
             f"PDF contains DOI evidence that conflicts with the supplied DOI; {evidence}",
+            bounded_local_doi,
         )
     if title_verification == "not_matched":
         return ExternalIdentityVerificationResult(
@@ -353,6 +439,7 @@ def verify_external_paper_identity(
             claimed_doi,
             extracted_dois,
             f"PDF first-page title evidence contradicts the supplied title; {evidence}",
+            bounded_local_doi,
         )
     if doi_verification == DOIContentVerification.MATCHED:
         return ExternalIdentityVerificationResult(
@@ -362,6 +449,7 @@ def verify_external_paper_identity(
             claimed_doi,
             extracted_dois,
             f"External identity verified by normalized DOI content; {evidence}",
+            bounded_local_doi,
         )
     if claimed_doi == UNKNOWN and title_verification == "matched":
         return ExternalIdentityVerificationResult(
@@ -371,6 +459,7 @@ def verify_external_paper_identity(
             claimed_doi,
             extracted_dois,
             f"External identity verified by normalized title content; {evidence}",
+            bounded_local_doi,
         )
     return ExternalIdentityVerificationResult(
         ExternalIdentityDecision.UNVERIFIED,
@@ -379,4 +468,5 @@ def verify_external_paper_identity(
         claimed_doi,
         extracted_dois,
         f"PDF content does not provide sufficient independent identity evidence; {evidence}",
+        bounded_local_doi,
     )
