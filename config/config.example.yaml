@@ -1,0 +1,43 @@
+project_name: HUNNU Research Harness
+institution: 湖南师范大学
+
+paths:
+  core_root: .
+  output_root: ../HUNNU-Research-Harness-Output
+  archive_root: ../HUNNU-Research-Harness-Output/downloads/authorized
+  downloads_watch:
+    - ../HUNNU-Research-Harness-Output/staging
+  dedicated_profile: C:/Users/<user>/ResearchHarness/chrome-profile
+  logs: ../HUNNU-Research-Harness-Output/logs
+  manifests: ../HUNNU-Research-Harness-Output/manifests
+  screenshots: ../HUNNU-Research-Harness-Output/screenshots
+  temp: ../HUNNU-Research-Harness-Output/temp
+  playwright_output: ../HUNNU-Research-Harness-Output/staging/playwright-output
+  library_root: ../HUNNU-Research-Harness-Output/library
+  library_papers: ../HUNNU-Research-Harness-Output/library/papers
+  library_notes: ../HUNNU-Research-Harness-Output/library/notes
+  library_catalog: ../HUNNU-Research-Harness-Output/library/catalog
+  library_import_staging: ../HUNNU-Research-Harness-Output/library/import_staging
+
+browser:
+  engine: playwright
+  headless: false
+  chrome_executable: C:/Program Files/Google/Chrome/Application/chrome.exe
+  connect_over_cdp_endpoint: null
+  allow_daily_profile: false
+  pdf_direct_download: true
+
+downloads:
+  stable_seconds: 2
+  poll_seconds: 0.5
+  timeout_seconds: 180
+  large_download_bytes: 524288000
+  preserve_source: true
+  make_archive_read_only: true
+
+institutional_safety:
+  manual_login_only: true
+  no_password_entry: true
+  no_cookie_export: true
+  no_captcha_bypass: true
+  no_mfa_automation: true
