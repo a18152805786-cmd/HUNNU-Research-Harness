@@ -12,7 +12,12 @@ from .pdf import PDFValidator
 
 _HTML_PREFIXES = (b"<!doctype html", b"<html", b"<?xml")
 _CAJ_SIGNATURES = (b"CAJ", b"HNLC", b"KDH")
-_DOI_CONTENT_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+_DOI_TOKEN_RE = re.compile(
+    r"(?<![\w])10\s{0,3}\.\s{0,3}\d{4,9}\s{0,3}/\s{0,3}"
+    r"[A-Z0-9]+(?:\s{0,3}[-._;()/:+]\s{0,3}[A-Z0-9]+)*",
+    re.IGNORECASE,
+)
+_DOI_SEPARATOR_CHARS = frozenset("-._;()/:+")
 _BOUNDED_LOCAL_DOI_PAGE_LIMIT = 3
 _REFERENCE_HEADING_RE = re.compile(
     r"(?i)^\s*(?:参考文献|文后参考文献|references?|bibliography)"
@@ -30,6 +35,75 @@ _TRAILING_BYLINE_RE = re.compile(
 _EXPLICIT_AUTHOR_LINE_RE = re.compile(
     r"(?im)^\s*(?:作\s*者|authors?)\s*[:：]\s*(?P<byline>[^\r\n]+)"
 )
+
+
+def _normalize_extracted_doi_token(value: str) -> str:
+    """Normalize whitespace only after a bounded DOI token was matched.
+
+    PDF text extraction may insert spaces around DOI punctuation.  The
+    whitespace removal is intentionally limited to the already matched token;
+    it is never applied to a complete line or context window.
+    """
+
+    compact = re.sub(r"\s+", "", value or "")
+    return normalize_doi(compact)
+
+
+def _extract_doi_candidates(text: str | None) -> tuple[str, ...]:
+    """Extract normal or extraction-spaced DOI tokens with strict boundaries."""
+
+    candidates = {
+        normalized
+        for match in _DOI_TOKEN_RE.finditer(text or "")
+        if (normalized := _normalize_extracted_doi_token(match.group(0))) != UNKNOWN
+    }
+    return tuple(sorted(candidates))
+
+
+def _spaced_doi_target_pattern(doi: str) -> re.Pattern[str] | None:
+    """Build a target-anchored pattern for one claimed DOI.
+
+    Every canonical DOI character must occur in order.  At most three
+    extraction-whitespace characters are accepted only adjacent to DOI
+    punctuation, matching the generic token grammar; whitespace cannot be
+    inserted between two alphanumeric DOI characters.  A
+    right-hand word character is not a boundary, so a claimed DOI cannot match
+    merely as the prefix of a longer DOI token.  Whitespace and ordinary
+    sentence delimiters are accepted after the exact token so labels, years,
+    or article numbers remain outside the match.
+    """
+
+    normalized = normalize_doi(doi)
+    if normalized == UNKNOWN:
+        return None
+    body_parts: list[str] = []
+    for index, character in enumerate(normalized):
+        body_parts.append(re.escape(character))
+        if index + 1 < len(normalized):
+            next_character = normalized[index + 1]
+            if character in _DOI_SEPARATOR_CHARS or next_character in _DOI_SEPARATOR_CHARS:
+                body_parts.append(r"\s{0,3}")
+    body = "".join(body_parts)
+    return re.compile(
+        r"(?<![\w])" + body + r"(?=$|[\s,，。；：!?！？、)\]\}>'\"])",
+        re.IGNORECASE,
+    )
+
+
+def _matches_spaced_doi_target(text: str | None, doi: str) -> bool:
+    pattern = _spaced_doi_target_pattern(doi)
+    return bool(pattern and pattern.search(text or ""))
+
+
+def _article_identity_text(text: str | None) -> str:
+    """Return text before a references heading for identity evidence only."""
+
+    lines: list[str] = []
+    for line in (text or "").splitlines():
+        if _REFERENCE_HEADING_RE.match(line):
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 class ExternalIdentityDecision(str, Enum):
@@ -255,16 +329,21 @@ class AuthorizedFullTextValidator:
         path: Path,
         *,
         page_limit: int = _BOUNDED_LOCAL_DOI_PAGE_LIMIT,
+        target_doi: str = UNKNOWN,
     ) -> tuple[str, ...]:
         """Extract DOI candidates only from bounded article-identity blocks.
 
         This is deliberately not a full-text DOI search.  It reads at most the
         first three pages, stops at a references heading on each page, and
         accepts a DOI only when its nearby text contains both a DOI label and a
-        bibliographic/article-identity marker.
+        bibliographic/article-identity marker.  ``target_doi`` is optional and
+        only helps recognize that exact claimed DOI when extraction whitespace
+        prevents the generic token extractor from seeing it; it never broadens
+        the page or context boundary.
         """
 
         candidates: set[str] = set()
+        normalized_target = normalize_doi(target_doi)
         bounded_pages = cls.extract_pdf_bounded_pages_text(path, page_limit)
         for page_text in bounded_pages[: max(0, int(page_limit))]:
             lines = (page_text or "").splitlines()
@@ -275,7 +354,9 @@ class AuthorizedFullTextValidator:
                     continue
                 if reference_started:
                     continue
-                found = _DOI_CONTENT_RE.findall(line)
+                found = set(_extract_doi_candidates(line))
+                if normalized_target != UNKNOWN and _matches_spaced_doi_target(line, normalized_target):
+                    found.add(normalized_target)
                 if not found:
                     continue
                 context = "\n".join(lines[max(0, index - 4) : min(len(lines), index + 5)])
@@ -283,11 +364,7 @@ class AuthorizedFullTextValidator:
                     continue
                 if not _ARTICLE_IDENTITY_MARKER_RE.search(context):
                     continue
-                candidates.update(
-                    normalized
-                    for candidate in found
-                    if (normalized := normalize_doi(candidate)) != UNKNOWN
-                )
+                candidates.update(found)
         return tuple(sorted(candidates))
 
     @staticmethod
@@ -365,7 +442,7 @@ def verify_external_paper_identity(
     first_page_text = AuthorizedFullTextValidator.extract_pdf_first_page_text(path)
     title_verification = validation.content_title_verification
     if title_verification == "not_matched":
-        non_doi_text = normalize_title(_DOI_CONTENT_RE.sub("", first_page_text or ""))
+        non_doi_text = normalize_title(_DOI_TOKEN_RE.sub("", first_page_text or ""))
         if (
             non_doi_text == UNKNOWN
             or len(non_doi_text.replace(" ", "")) < _MIN_EXPLICIT_TITLE_EVIDENCE_CHARS
@@ -373,15 +450,14 @@ def verify_external_paper_identity(
             # A DOI-only or otherwise too-thin first page is weak title
             # extraction, not affirmative evidence of a different title.
             title_verification = "not_available"
-    first_page_dois = tuple(
-        sorted(
-            {
-                normalized
-                for candidate in _DOI_CONTENT_RE.findall(first_page_text or "")
-                if (normalized := normalize_doi(candidate)) != UNKNOWN
-            }
-        )
-    )
+    article_identity_first_page = _article_identity_text(first_page_text)
+    first_page_doi_candidates = set(_extract_doi_candidates(article_identity_first_page))
+    if claimed_doi != UNKNOWN and _matches_spaced_doi_target(
+        article_identity_first_page,
+        claimed_doi,
+    ):
+        first_page_doi_candidates.add(claimed_doi)
+    first_page_dois = tuple(sorted(first_page_doi_candidates))
 
     bounded_local_doi = "not_attempted"
     extracted_dois = first_page_dois
@@ -394,7 +470,10 @@ def verify_external_paper_identity(
         doi_verification = DOIContentVerification.CONFLICT
         bounded_local_doi = "not_attempted"
     else:
-        bounded_dois = AuthorizedFullTextValidator.extract_bounded_local_article_dois(path)
+        bounded_dois = AuthorizedFullTextValidator.extract_bounded_local_article_dois(
+            path,
+            target_doi=claimed_doi,
+        )
         extracted_dois = bounded_dois
         if claimed_doi in bounded_dois and len(bounded_dois) == 1:
             doi_verification = DOIContentVerification.MATCHED

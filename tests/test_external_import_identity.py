@@ -100,12 +100,71 @@ class ExternalImportIdentityGateTests(unittest.TestCase):
         self.assertIn("DOIVerification=DOI_MATCH", result.reason)
         self.assertIn("BoundedLocalDOI=not_needed", result.reason)
 
+    def test_spaced_doi_on_real_1b7875_article_header_is_verified(self) -> None:
+        title = "企业数字化转型与供应链效率"
+        first_page = (
+            "统计与决策 2023 年第 18 期\n"
+            f"{title}\n"
+            "张树山，张佩雯，谷城\n"
+            "DOI: 10 . 13546 / j.cnki.tjyjc. 2023 . 18 . 032\n"
+        )
+        _, staged = self._stage_text("placeholder")
+
+        with patch.object(
+            AuthorizedFullTextValidator,
+            "extract_pdf_first_page_text",
+            return_value=first_page,
+        ):
+            result = self.importer.import_staged_pdf(
+                staged.staged_path,
+                self._metadata(
+                    title=title,
+                    doi="10.13546/j.cnki.tjyjc.2023.18.032",
+                    authors=("张树山", "张佩雯", "谷城"),
+                ),
+            )
+
+        self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
+        self.assertIn("DOIVerification=DOI_MATCH", result.reason)
+        self.assertIn("BoundedLocalDOI=not_needed", result.reason)
+
     def test_bounded_local_article_identity_doi_on_second_page_is_verified(self) -> None:
         article_title = "Levels of development of new quality productivity"
         _, staged = self._stage_text(TITLE_A)
         bounded_pages = (
             TITLE_A,
             f"Doi: {DOI_A}\nCitation Format: {article_title} [J]. Journal of Identity Safety",
+            "body text without identity DOI",
+        )
+
+        with (
+            patch.object(
+                AuthorizedFullTextValidator,
+                "extract_pdf_first_page_text",
+                return_value=TITLE_A,
+            ),
+            patch.object(
+                AuthorizedFullTextValidator,
+                "extract_pdf_bounded_pages_text",
+                return_value=bounded_pages,
+            ),
+        ):
+            result = self.importer.import_staged_pdf(
+                staged.staged_path,
+                self._metadata(doi=DOI_A),
+            )
+
+        self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
+        self.assertIn("DOIVerification=DOI_MATCH", result.reason)
+        self.assertIn("BoundedLocalDOI=matched", result.reason)
+
+    def test_spaced_bounded_article_identity_doi_is_verified(self) -> None:
+        article_title = "Levels of development of new quality productivity"
+        _, staged = self._stage_text(TITLE_A)
+        bounded_pages = (
+            TITLE_A,
+            "Doi: 10 . 1234 / paper-a\n"
+            f"Citation Format: {article_title} [J]. Journal of Identity Safety",
             "body text without identity DOI",
         )
 
@@ -161,6 +220,61 @@ class ExternalImportIdentityGateTests(unittest.TestCase):
         )
         self.assertIn("DOIVerification=DOI_NOT_AVAILABLE", result.reason)
         self.assertIn("BoundedLocalDOI=not_available", result.reason)
+
+    def test_reference_only_spaced_supplied_doi_remains_unverified(self) -> None:
+        _, staged = self._stage_text(TITLE_A)
+        bounded_pages = (
+            TITLE_A,
+            "References:\n[1] A cited paper. DOI: 10 . 1234 / paper-a",
+            "",
+        )
+
+        with (
+            patch.object(
+                AuthorizedFullTextValidator,
+                "extract_pdf_first_page_text",
+                return_value=TITLE_A,
+            ),
+            patch.object(
+                AuthorizedFullTextValidator,
+                "extract_pdf_bounded_pages_text",
+                return_value=bounded_pages,
+            ),
+        ):
+            result = self.importer.import_staged_pdf(
+                staged.staged_path,
+                self._metadata(doi=DOI_A),
+            )
+
+        self.assertEqual(
+            result.disposition,
+            LibraryDisposition.EXTERNAL_IDENTITY_UNVERIFIED,
+        )
+        self.assertIn("DOIVerification=DOI_NOT_AVAILABLE", result.reason)
+        self.assertIn("BoundedLocalDOI=not_available", result.reason)
+
+    def test_first_page_reference_only_spaced_doi_is_not_identity_evidence(self) -> None:
+        _, staged = self._stage_text(TITLE_A)
+        first_page = (
+            f"{TITLE_A}\nReferences:\n"
+            "[1] A cited paper. DOI: 10 . 1234 / paper-a"
+        )
+
+        with patch.object(
+            AuthorizedFullTextValidator,
+            "extract_pdf_first_page_text",
+            return_value=first_page,
+        ):
+            result = self.importer.import_staged_pdf(
+                staged.staged_path,
+                self._metadata(doi=DOI_A),
+            )
+
+        self.assertEqual(
+            result.disposition,
+            LibraryDisposition.EXTERNAL_IDENTITY_UNVERIFIED,
+        )
+        self.assertIn("DOIVerification=DOI_NOT_AVAILABLE", result.reason)
 
     def test_multiple_reference_dois_are_not_article_level_conflict(self) -> None:
         _, staged = self._stage_text(TITLE_A)
