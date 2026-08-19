@@ -4,7 +4,13 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from ...browser.transport import BrowserTransport
+from ...browser.authorized_file_capture import (
+    AcquisitionMethod,
+    AuthorizedFileCaptureResult,
+)
+from ...browser.commands import DownloadArtifact
+from ...browser.port import BrowserCommandPort, ensure_browser_command_port
+from ...browser.transport import BrowserTransportError
 from ..models import AccessDecision, LiteratureRecord, LiteratureSearchRequest, RunStatus
 
 
@@ -43,8 +49,24 @@ class LiteratureSourceAdapter(ABC):
     supports_unattended_download: bool = False
     supports_preflight: bool = False
 
-    def __init__(self, browser: BrowserTransport):
-        self.browser = browser
+    def __init__(self, browser: BrowserCommandPort | Any | None):
+        # ``None`` remains valid for parser-only/finalizer construction.  Any
+        # live adapter path is normalized here so source adapters only ever
+        # see the command port, including when an old v0.2.16 transport is
+        # supplied through the compatibility API.
+        if browser is None:
+            self.browser = None
+        else:
+            try:
+                self.browser = ensure_browser_command_port(browser)
+            except BrowserTransportError:
+                # Parser/preflight-only callers from v0.2.16 sometimes
+                # construct an adapter with a sentinel object and never enter
+                # live execution.  Preserve construction compatibility, but
+                # leave the sentinel untouched: the factory/broker validates
+                # the command port before any workflow is created, and a live
+                # method cannot silently fall back to it.
+                self.browser = browser
 
     @abstractmethod
     async def search(
@@ -77,3 +99,31 @@ class LiteratureSourceAdapter(ABC):
     @abstractmethod
     async def get_citation(self) -> dict[str, Any]:
         raise NotImplementedError
+
+
+def authorized_capture_result_from_artifact(
+    artifact: DownloadArtifact,
+) -> AuthorizedFileCaptureResult:
+    """Rehydrate legacy capture metadata without exposing browser objects.
+
+    The existing workflow records ``AuthorizedFileCaptureResult`` details.
+    The command layer transports those details as sanitized artifact metadata,
+    so this small compatibility conversion keeps the downstream record schema
+    stable while adapters remain page/locator/context free.
+    """
+
+    metadata = dict(artifact.metadata)
+    try:
+        method = AcquisitionMethod(str(metadata["AcquisitionMethod"]))
+        source_host = str(metadata["SourceHost"])
+        source_route = str(metadata["SourceRoute"])
+    except (KeyError, ValueError) as exc:
+        raise SourceUnavailable("Authorized browser artifact is missing capture provenance") from exc
+    return AuthorizedFileCaptureResult(
+        path=artifact.local_path,
+        acquisition_method=method,
+        source_host=source_host,
+        source_route=source_route,
+        download_event_emitted=bool(metadata.get("DownloadEventEmitted", False)),
+        authorized_pdf_response_captured=bool(metadata.get("AuthorizedPDFResponseCaptured", False)),
+    )

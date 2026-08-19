@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 
+from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
 from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
 from ..cnki_challenge import CNKIChallengeDetector, ChallengeDiagnostic, ChallengeState
@@ -201,14 +202,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 f"CaptchaDetected={detected}; CaptchaBypassAttempted=false"
             )
 
-    async def _inspect_live_challenge(self) -> ChallengeDiagnostic:
-        page = getattr(self.browser, "page", None)
-        if page is None:
-            raise SourceUnavailable("Browser page is unavailable")
+    async def _inspect_live_challenge(self, observation: Any) -> ChallengeDiagnostic:
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
         provenance = getattr(self.browser, "navigation_provenance", ())
         if isinstance(provenance, str):
             provenance = (provenance,)
-        diagnostic = await CNKIChallengeDetector.inspect_page(page, route_provenance=tuple(provenance or ()))
+        diagnostic = CNKIChallengeDetector.inspect_observation(
+            observation,
+            route_provenance=tuple(provenance or ()),
+        )
         self._last_challenge_diagnostic = diagnostic
         self.enforce_challenge_diagnostic(diagnostic)
         return diagnostic
@@ -468,15 +471,22 @@ class CNKIAdapter(LiteratureSourceAdapter):
         return matched, "Normalized title match" if matched else "Target title mismatch"
 
     async def _content(self) -> tuple[str, str]:
-        page = getattr(self.browser, "page", None)
-        if page is None:
-            raise SourceUnavailable("Browser page is unavailable")
-        await self._inspect_live_challenge()
-        return await page.content(), page.url
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        observation = await self.browser.execute(
+            ObserveCommand(
+                include_html=True,
+                text_probes=tuple(pattern.pattern for _, pattern in CNKIChallengeDetector.marker_patterns),
+            )
+        )
+        await self._inspect_live_challenge(observation)
+        return observation.require_html(), observation.url
 
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
         mode = "exact_title" if query in request.exact_titles else ("author" if query in request.authors else "keyword")
-        await self.browser.goto(self.build_search_url(query, mode=mode))
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(self.build_search_url(query, mode=mode)))
         html, current_url = await self._content()
         results = self.parse_search_results_html(
             html,
@@ -495,7 +505,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
             raise SourceLayoutChanged("Result URL is not a stable official CNKI detail page")
         self._expected_record = record
         self._detail_record = None
-        await self.browser.goto(target_url)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(target_url))
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         html, current_url = await self._content()
@@ -532,23 +544,23 @@ class CNKIAdapter(LiteratureSourceAdapter):
         if not matches:
             raise SourceLayoutChanged(f"CNKI target identity lock failed before download: {reason}")
         record.target_identity_confirmed = True
-        page = getattr(self.browser, "page", None)
-        downloads_dir = getattr(self.browser, "downloads_dir", None)
-        if page is None or downloads_dir is None:
-            raise SourceUnavailable("Browser download context is unavailable")
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
         label = access.download_locator
         if label in ("", UNKNOWN) or any(marker in label for marker in _REJECT_DOWNLOAD_LABELS):
             raise SourceLayoutChanged("No safe single-paper CNKI download control was locked")
         try:
-            locator = page.locator("a, button").filter(has_text=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I)).first
-            async with page.expect_download(timeout=45_000) as download_info:
-                await locator.click()
-            download = await download_info.value
             suffix = {FullTextFormat.PDF: ".pdf", FullTextFormat.CAJ: ".caj"}.get(access.full_text_format, ".bin")
-            target = Path(downloads_dir) / (download.suggested_filename or f"{record.paper_id}{suffix}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            await download.save_as(str(target))
-            return target
+            artifact = await self.browser.execute(
+                DownloadCommand(
+                    target=BrowserTarget(
+                        css="a, button",
+                        text_regex=rf"^\s*{re.escape(label)}\s*$",
+                    ),
+                    suggested_filename=f"{record.paper_id}{suffix}",
+                )
+            )
+            return artifact.local_path
         except Exception as exc:
             raise SourceUnavailable(
                 f"Authorized CNKI control did not produce a browser download: {type(exc).__name__}"

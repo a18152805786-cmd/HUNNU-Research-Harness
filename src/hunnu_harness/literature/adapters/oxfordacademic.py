@@ -7,11 +7,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
+from ...browser.commands import (
+    BrowserTarget,
+    DownloadCaptureSpec,
+    DownloadCommand,
+    NavigateCommand,
+    ObserveCommand,
+)
 from ...browser.authorized_file_capture import (
     AcquisitionMethod,
     AuthorizedFileCaptureResult,
-    AuthorizedFileCaptureUnavailable,
-    BrowserAuthorizedFileCapture,
 )
 from ...browser.manual_download_handoff import (
     ManualDownloadHandoff,
@@ -25,6 +30,7 @@ from .base import (
     SourceLayoutChanged,
     SourceUnavailable,
     SourceUserDownloadRequired,
+    authorized_capture_result_from_artifact,
 )
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
 from ..models import (
@@ -569,10 +575,10 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         )
 
     async def _content(self) -> tuple[str, str]:
-        page = getattr(self.browser, "page", None)
-        if page is None:
-            raise SourceUnavailable("Browser page is unavailable")
-        return await page.content(), str(page.url)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        observation = await self.browser.execute(ObserveCommand(include_html=True))
+        return observation.require_html(), observation.url
 
     def _gateway_navigation(self, relative_path: str, *, query: dict[str, str] | None = None) -> str:
         if not self._gateway_trusted() or self._institutional_route is None:
@@ -592,7 +598,9 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             if self._gateway_trusted()
             else f"{self.search_origin}/search-results?q={quote_plus(query)}"
         )
-        await self.browser.goto(search_url)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(search_url))
         html, current_url = await self._content()
         results = self.parse_search_results_html(
             html,
@@ -627,7 +635,9 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             raise SourceLayoutChanged("Result URL is not a trusted stable Oxford article page")
         self._expected_record = record
         self._detail_record = None
-        await self.browser.goto(target)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(target))
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         html, current_url = await self._content()
@@ -682,12 +692,13 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         )
 
     @staticmethod
-    def _native_pdf_viewer_opened(page: Any) -> bool:
-        candidates = [page]
-        context = getattr(page, "context", None)
-        candidates.extend(tuple(getattr(context, "pages", ()) or ()))
-        for candidate in candidates:
-            value = str(getattr(candidate, "url", ""))
+    def _native_pdf_viewer_opened(observation: Any) -> bool:
+        candidates = [str(getattr(observation, "url", ""))]
+        candidates.extend(
+            str(getattr(summary, "url", ""))
+            for summary in tuple(getattr(observation, "page_inventory", ()) or ())
+        )
+        for value in candidates:
             try:
                 if urlsplit(value).path.casefold().endswith(".pdf"):
                     return True
@@ -817,38 +828,41 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         record.research_chrome_direct_pdf_download_configured = (
             self._research_chrome_direct_pdf_download_configured
         )
-        page = getattr(self.browser, "page", None)
-        downloads_dir = getattr(self.browser, "downloads_dir", None)
-        if page is None or downloads_dir is None:
-            raise SourceUnavailable("Browser download context is unavailable")
-        locator = page.locator(access.download_locator).filter(
-            has_text=re.compile(r"^\s*(?:download\s+)?pdf\s*$", re.IGNORECASE)
-        ).first
-        capture = BrowserAuthorizedFileCapture(
-            Path(downloads_dir),
-            allow_outside_output_for_tests=self._allow_capture_outside_output_for_tests,
-        )
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
         source_route = "HUNNU_GATEWAY_TO_OXFORD" if self._gateway_trusted() else "OXFORD_DIRECT"
         provenance_host = self.hunnu_gateway_host if _host(access.download_url) == self.hunnu_gateway_host else self.official_host
         try:
-            result = await capture.capture_pdf(
-                page=page,
-                official_action=locator.click,
-                trusted_hosts=(
-                    (self.official_host, self.hunnu_gateway_host)
-                    if self._gateway_trusted()
-                    else (self.official_host,)
-                ),
-                response_url_is_expected=lambda value: self._response_matches_official_action(
-                    value, access.download_url
-                ),
-                controlled_filename=f"{record.paper_id}.pdf",
-                provenance_host=provenance_host,
-                source_route=source_route,
-                timeout_ms=self._capture_timeout_ms,
+            artifact = await self.browser.execute(
+                DownloadCommand(
+                    target=BrowserTarget(
+                        css=access.download_locator,
+                        text_regex=r"^\s*(?:download\s+)?pdf\s*$",
+                    ),
+                    suggested_filename=f"{record.paper_id}.pdf",
+                    timeout_ms=self._capture_timeout_ms,
+                    capture=DownloadCaptureSpec(
+                        trusted_hosts=(
+                            (self.official_host, self.hunnu_gateway_host)
+                            if self._gateway_trusted()
+                            else (self.official_host,)
+                        ),
+                        provenance_host=provenance_host,
+                        source_route=source_route,
+                        expected_url=access.download_url,
+                        allow_outside_output_for_tests=self._allow_capture_outside_output_for_tests,
+                    ),
+                )
             )
-        except AuthorizedFileCaptureUnavailable as exc:
-            if self._native_pdf_viewer_opened(page):
+            result = authorized_capture_result_from_artifact(artifact)
+        except Exception as exc:
+            try:
+                observation = await self.browser.execute(
+                    ObserveCommand(include_html=False, include_visible_text=False)
+                )
+            except Exception:
+                observation = None
+            if observation is not None and self._native_pdf_viewer_opened(observation):
                 state = self.arm_manual_download_handoff(
                     record,
                     access,

@@ -3,8 +3,9 @@
 This module does not launch a browser, create a profile, or reimplement any
 source adapter.  It validates a bounded request and delegates live literature
 work through the Harness-controlled adapter factory and execution broker.
-The browser transport remains caller-owned; the Python runtime currently
-accepts the existing local Playwright-shaped transport and has no Codex MCP
+The browser session remains caller-owned; the Python runtime accepts the
+backend-neutral BrowserCommandPort and wraps the old local Playwright-shaped
+transport only at the compatibility boundary.  It still has no Codex MCP
 bridge.
 """
 
@@ -19,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
+from .browser.port import BrowserCommandPort
 from .browser.transport import BrowserTransport
 from .literature.models import LiteratureRunResult, LiteratureSearchRequest, RunStatus
 from .literature.security import sanitize_value
@@ -32,7 +34,7 @@ from .literature.adapters import (
     SpringerLinkAdapter,
 )
 from .models import DownloadRequest
-from .paths import OUTPUT_ROOT, V0216_RUN_ROOT, require_output_path
+from .paths import OUTPUT_ROOT, V0217_RUN_ROOT, require_output_path
 from .workflows import run_cnrds_download
 
 if TYPE_CHECKING:
@@ -741,7 +743,7 @@ class AgentRequestRouter:
         self,
         plan: LiteratureSourcePlan,
         *,
-        browser: BrowserTransport | None = None,
+        browser: BrowserCommandPort | BrowserTransport | None = None,
         adapter: "LiteratureSourceAdapter | None" = None,
         run_root: Path,
         institutional_resolver: "InstitutionalAccessResolver | None" = None,
@@ -749,10 +751,11 @@ class AgentRequestRouter:
     ):
         """Execute one source plan through the registered source adapter.
 
-        The preferred path supplies an existing ``BrowserTransport`` and lets
-        Harness instantiate the adapter selected by ``plan.source``.  The
-        legacy ``adapter=`` path remains available only after strict registry,
-        source-name, and transport identity validation.
+        The preferred path supplies a ``BrowserCommandPort`` (or a v0.2.16
+        local transport that Harness wraps once) and lets Harness instantiate
+        the adapter selected by ``plan.source``.  The legacy ``adapter=`` path
+        remains available only after strict registry, source-name, and command
+        port identity validation.
         """
 
         return await self.adapter_execution_broker.execute(
@@ -820,7 +823,7 @@ class AgentRequestRouter:
 def write_dry_run_result(
     decision: AgentRoutingDecision,
     *,
-    run_root: Path = V0216_RUN_ROOT,
+    run_root: Path = V0217_RUN_ROOT,
 ) -> Path:
     """Persist a sanitized, no-network routing proof under the Output Root."""
 
@@ -847,7 +850,7 @@ def add_agent_route_arguments(parser: argparse.ArgumentParser) -> None:
     selector.add_argument("--request-json", type=Path, help="Structured Agent request JSON")
     selector.add_argument("--text", help="Natural-language research request")
     parser.add_argument("--dry-run", action="store_true", help="Write a sanitized no-network routing proof")
-    parser.add_argument("--run-root", type=Path, default=V0216_RUN_ROOT)
+    parser.add_argument("--run-root", type=Path, default=V0217_RUN_ROOT)
 
 
 def route_from_cli_args(args: argparse.Namespace) -> int:

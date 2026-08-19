@@ -7,14 +7,26 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
+from ...browser.commands import (
+    AuthenticatedFetchCommand,
+    BrowserTarget,
+    DownloadCaptureSpec,
+    DownloadCommand,
+    NavigateCommand,
+    ObserveCommand,
+)
 from ...browser.authorized_file_capture import (
     AcquisitionMethod,
     AuthorizedFileCaptureResult,
-    AuthorizedFileCaptureUnavailable,
-    BrowserAuthorizedFileCapture,
 )
 from ...paths import QUARANTINE_DIR
-from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
+from .base import (
+    LiteratureSourceAdapter,
+    SourceActionRequired,
+    SourceLayoutChanged,
+    SourceUnavailable,
+    authorized_capture_result_from_artifact,
+)
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
 from ..fulltext import AuthorizedFullTextValidator
 from ..models import (
@@ -538,13 +550,17 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
         )
 
     async def _content(self) -> tuple[str, str]:
-        page = getattr(self.browser, "page", None)
-        if page is None:
-            raise SourceUnavailable("Browser page is unavailable")
-        return await page.content(), page.url
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        observation = await self.browser.execute(ObserveCommand(include_html=True))
+        return observation.require_html(), observation.url
 
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
-        await self.browser.goto(f"{self.search_origin}/search?query={quote_plus(query)}")
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(
+            NavigateCommand(f"{self.search_origin}/search?query={quote_plus(query)}")
+        )
         html, current_url = await self._content()
         results = self.parse_search_results_html(
             html,
@@ -571,7 +587,9 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
         record.navigation_url = target
         self._expected_record = record
         self._detail_record = None
-        await self.browser.goto(target)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(target))
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         html, current_url = await self._content()
@@ -609,35 +627,34 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
         if not access.full_text_accessible or not access.authorized_access:
             raise PermissionError("FULLTEXT_NOT_AUTHORIZED")
         parsed = urlsplit(access.download_url)
-        page = getattr(self.browser, "page", None)
-        downloads_dir = getattr(self.browser, "downloads_dir", None)
-        if page is None or downloads_dir is None:
-            raise SourceUnavailable("Browser download context is unavailable")
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
         if self._gateway_trusted():
             if not record.target_identity_confirmed:
                 raise SourceLayoutChanged("Springer target identity is not confirmed")
             if not self._gateway_url_is_bound(access.download_url) or not _PDF_PATH.search(parsed.path):
                 raise SourceLayoutChanged("Institutional PDF URL is outside the bound Springer gateway")
-            locator = page.locator(access.download_locator).filter(
-                has_text=re.compile(r"^\s*download\s+pdf\s*$", re.IGNORECASE)
-            ).first
-            capture = BrowserAuthorizedFileCapture(
-                Path(downloads_dir),
-                allow_outside_output_for_tests=self._allow_capture_outside_output_for_tests,
-            )
             try:
-                result = await capture.capture_pdf(
-                    page=page,
-                    official_action=locator.click,
-                    trusted_hosts=(self.hunnu_gateway_host,),
-                    response_url_is_expected=lambda _: False,
-                    controlled_filename=f"{record.paper_id}.pdf",
-                    provenance_host=self.hunnu_gateway_host,
-                    source_route="HUNNU_GATEWAY_TO_SPRINGER",
-                    timeout_ms=self._capture_timeout_ms,
-                    require_download_event=True,
+                artifact = await self.browser.execute(
+                    DownloadCommand(
+                        target=BrowserTarget(
+                            css=access.download_locator,
+                            text_regex=r"^\s*download\s+pdf\s*$",
+                        ),
+                        suggested_filename=f"{record.paper_id}.pdf",
+                        timeout_ms=self._capture_timeout_ms,
+                        capture=DownloadCaptureSpec(
+                            trusted_hosts=(self.hunnu_gateway_host,),
+                            provenance_host=self.hunnu_gateway_host,
+                            source_route="HUNNU_GATEWAY_TO_SPRINGER",
+                            require_download_event=True,
+                            allow_response_capture=False,
+                            allow_outside_output_for_tests=self._allow_capture_outside_output_for_tests,
+                        ),
+                    )
                 )
-            except AuthorizedFileCaptureUnavailable as exc:
+                result = authorized_capture_result_from_artifact(artifact)
+            except Exception as exc:
                 raise SourceUnavailable(str(exc)) from exc
             if result.acquisition_method != AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT:
                 raise SourceUnavailable("Institutional Springer acquisition emitted no download event")
@@ -673,14 +690,17 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
         if parsed.hostname != "link.springer.com" or not _PDF_PATH.search(parsed.path):
             raise SourceLayoutChanged("Download URL is not a stable official Springer PDF path")
         try:
-            response = await page.context.request.get(access.download_url, timeout=45_000)
+            response = await self.browser.execute(
+                AuthenticatedFetchCommand(
+                    url=access.download_url,
+                    suggested_filename=Path(parsed.path).name or f"{record.paper_id}.pdf",
+                )
+            )
             if not response.ok:
                 raise SourceUnavailable(f"Official Springer PDF returned HTTP {response.status}")
-            payload = await response.body()
-            target = Path(downloads_dir) / (Path(parsed.path).name or f"{record.paper_id}.pdf")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(payload)
-            return target
+            if response.artifact is None:
+                raise SourceUnavailable("Official Springer PDF response produced no local artifact")
+            return response.artifact.local_path
         except SourceUnavailable:
             raise
         except Exception as exc:

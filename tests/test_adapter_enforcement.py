@@ -165,6 +165,13 @@ class AdapterResolutionTests(unittest.TestCase):
         with self.assertRaises(AdapterIdentityError):
             factory.validate_instance("CNKI", _CNKISubclass(transport), browser=transport)
 
+    def test_legacy_adapter_rejects_a_different_browser_binding(self) -> None:
+        factory = LiteratureAdapterFactory(LITERATURE_ADAPTER_REGISTRY)
+        adapter = CNKIAdapter(_FakeTransport())
+
+        with self.assertRaises(AdapterIdentityError):
+            factory.validate_instance("CNKI", adapter, browser=_FakeTransport())
+
     def test_source_normalization_is_used_for_resolution_and_identity(self) -> None:
         factory = LiteratureAdapterFactory(LITERATURE_ADAPTER_REGISTRY)
         adapter = factory.create(" CNKI ", browser=_FakeTransport())
