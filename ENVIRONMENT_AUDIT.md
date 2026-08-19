@@ -16,7 +16,7 @@
 | ChromeInstalled | true | `C:\Program Files\Google\Chrome\Application\chrome.exe` |
 | FDMDetected | true | Free Download Manager is installed and running |
 | PlaywrightMCPAlreadyInstalled | false | Not present in global npm packages before this task |
-| PlaywrightMCPInstalled | true | `npx --yes @playwright/mcp@latest --version` returned 0.0.79 |
+| PlaywrightMCPInstalled | true | Frozen v0.2.18 baseline: `npx --yes @playwright/mcp@0.0.79 --version` returned 0.0.79 |
 | PlaywrightMCPReachable | true | Local MCP server initialized over HTTP, returned `tools/list`, navigated to example.com, and emitted a download event |
 
 ## Existing browser and MCP state

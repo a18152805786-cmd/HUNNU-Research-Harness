@@ -45,15 +45,22 @@ class AuthenticatedFetchFailure(BrowserCommandError):
 class SessionHandle:
     """Harness-owned logical session identity.
 
-    v0.2.17 only needs a local executor identity.  It is not a claim about
-    MCP reconnect or cross-process lease semantics.
+    The value is a logical Harness identity.  ``generation`` is advanced by
+    a session broker when the underlying runtime mapping becomes uncertain;
+    it is not a native MCP or browser identifier.
     """
 
     value: str = "local"
+    generation: int = 0
 
     def __post_init__(self) -> None:
         if not str(self.value).strip():
             raise ValueError("SessionHandle.value must not be empty")
+        if self.generation < 0:
+            raise ValueError("SessionHandle.generation must be non-negative")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"SessionId": self.value, "Generation": self.generation}
 
 
 @dataclass(frozen=True)
@@ -61,18 +68,29 @@ class PageHandle:
     """Harness-owned logical page identity for one executor session."""
 
     value: str = "main"
+    session: SessionHandle | None = None
+    generation: int = 0
 
     def __post_init__(self) -> None:
         if not str(self.value).strip():
             raise ValueError("PageHandle.value must not be empty")
+        if self.generation < 0:
+            raise ValueError("PageHandle.generation must be non-negative")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "PageId": self.value,
+            "Session": self.session.as_dict() if self.session else None,
+            "Generation": self.generation,
+        }
 
 
 @dataclass(frozen=True)
 class BrowserTarget:
     """Serializable target description understood by a command executor.
 
-    Only the selector forms used by the current source adapters are present:
-    CSS plus an optional visible-text filter.  Raw Locator objects and Python
+    Only backend-neutral selector forms are present: CSS/text filters or an
+    observation-scoped accessibility ref. Raw Locator objects and Python
     callbacks are intentionally not representable.
     """
 
@@ -81,10 +99,15 @@ class BrowserTarget:
     text_regex: str | None = None
     exact_text: bool = False
     occurrence: int = 0
+    ref: str | None = None
+    observation_id: str | None = None
 
     def __post_init__(self) -> None:
-        if not any(value is not None and str(value).strip() for value in (self.css, self.text, self.text_regex)):
-            raise InvalidTarget("BrowserTarget requires css, text, or text_regex")
+        if not any(
+            value is not None and str(value).strip()
+            for value in (self.css, self.text, self.text_regex, self.ref)
+        ):
+            raise InvalidTarget("BrowserTarget requires css, text, text_regex, or ref")
         if self.css is not None and not str(self.css).strip():
             raise InvalidTarget("BrowserTarget.css must not be empty")
         if self.text is not None and not str(self.text).strip():
@@ -96,6 +119,14 @@ class BrowserTarget:
                 raise InvalidTarget("BrowserTarget.text_regex is not a valid regular expression") from exc
         if self.occurrence < 0:
             raise InvalidTarget("BrowserTarget.occurrence must be non-negative")
+        if self.observation_id is not None and not str(self.observation_id).strip():
+            raise InvalidTarget("BrowserTarget.observation_id must not be empty")
+        if self.ref is not None and not str(self.ref).strip():
+            raise InvalidTarget("BrowserTarget.ref must not be empty")
+        if self.ref is not None and any(value is not None for value in (self.css, self.text, self.text_regex)):
+            raise InvalidTarget("BrowserTarget.ref cannot be combined with CSS or text selectors")
+        if self.observation_id is not None and self.ref is None:
+            raise InvalidTarget("BrowserTarget.observation_id requires ref")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +135,8 @@ class BrowserTarget:
             "TextRegex": self.text_regex,
             "ExactText": self.exact_text,
             "Occurrence": self.occurrence,
+            "Ref": self.ref,
+            "ObservationId": self.observation_id,
         }
 
 

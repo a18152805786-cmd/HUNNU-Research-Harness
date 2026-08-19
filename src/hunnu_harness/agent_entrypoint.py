@@ -301,7 +301,11 @@ class AgentRoutingDecision:
                 "RunMultiSourcePreflight": self.run_multi_source_preflight,
                 "LiteratureExecutionEntryPoint": "AdapterExecutionBroker",
                 "DirectBrowserFallbackForLiterature": False,
-                "PlaywrightMCPTransportImplemented": False,
+                "MCPExecutorImplemented": True,
+                "BrowserSessionBrokerImplemented": True,
+                "PlaywrightMCPTransportImplemented": True,
+                "MCPTransportMode": "Agent-mediated typed MCP tool boundary; no Python Playwright object graph",
+                "AuthenticatedFetchMCP": False,
                 "PreflightCoordinator": (
                     "MultiSourcePreflightCoordinator"
                     if self.run_multi_source_preflight

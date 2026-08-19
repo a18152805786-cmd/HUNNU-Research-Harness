@@ -46,6 +46,25 @@ from .commands import (
 )
 from .local_executor import LocalPlaywrightExecutor
 from .port import BrowserCommandPort, ensure_browser_command_port, validate_browser_command_port
+from .mcp_executor import (
+    CallableMCPToolClient,
+    JsonLineMCPToolClient,
+    MCPConnectionError,
+    MCPExecutor,
+    MCPExecutorError,
+    MCPProtocolError,
+    MCPToolClient,
+    MCP_VERSION_BASELINE,
+    MCPUnsupportedCapability,
+    StaleObservationReference,
+)
+from .session_broker import (
+    BrowserSessionBroker,
+    LogicalPage,
+    SessionBrokerError,
+    SessionUnavailable,
+    StalePageHandle,
+)
 
 __all__ = [
     "PDF_DIRECT_DOWNLOAD_PREFERENCE",
@@ -92,4 +111,19 @@ __all__ = [
     "UnsupportedCommand",
     "ensure_browser_command_port",
     "validate_browser_command_port",
+    "CallableMCPToolClient",
+    "JsonLineMCPToolClient",
+    "MCPConnectionError",
+    "MCPExecutor",
+    "MCPExecutorError",
+    "MCPProtocolError",
+    "MCPToolClient",
+    "MCP_VERSION_BASELINE",
+    "MCPUnsupportedCapability",
+    "StaleObservationReference",
+    "BrowserSessionBroker",
+    "LogicalPage",
+    "SessionBrokerError",
+    "SessionUnavailable",
+    "StalePageHandle",
 ]
