@@ -1,16 +1,21 @@
-# Agent Integration and Global Routing (v0.2.8)
+# Agent Integration and Global Routing (Harness v0.2.16; routing schema v0.2.8)
 
 ## Purpose
 
-The Agent-facing entry point gives Codex a stable way to turn a bounded research-acquisition request into an existing Harness capability. It is a thin routing layer. It does not implement a new database adapter, start a browser, or bypass any authentication/security control.
+The Agent-facing entry point gives Codex a stable way to turn a bounded research-acquisition request into an existing Harness capability. It does not implement a new database adapter, start a browser, or bypass any authentication/security control. Live literature execution is adapter-first: the Harness resolves the adapter from the source plan before it constructs the existing workflow.
 
 ```text
 Agent request
   -> AgentRequestRouter
+  -> LiteratureSourcePlan
+  -> AdapterExecutionBroker -> LITERATURE_ADAPTER_REGISTRY
+  -> correct LiteratureSourceAdapter -> BrowserTransport
   -> existing LiteratureAcquisitionWorkflow / existing CNRDS workflow
   -> existing adapters, resolver, validation, SHA-256, manifest and audit
   -> Harness Output Root
 ```
+
+For Harness-managed literature acquisition, Adapter resolution comes before any Harness-managed publisher navigation.
 
 ## Stable entry point
 
@@ -51,15 +56,17 @@ For v0.1 data acquisition, use `TaskType="data_acquisition"` plus the existing C
 ## Routing behaviour
 
 - Literature sources are limited to the already implemented `CNKI`, `SpringerLink`, `ScienceDirect`, and `OxfordAcademic` adapters.
-- Oxford Academic reuses the verified HUNNU institutional resolver. The Agent first attempts unattended download with the exact existing Research Chrome profile, whose profile-local `plugins.always_open_pdf_externally` preference can be configured offline by `browser-configure-pdf-download`. Harness then clicks the identity-locked official PDF action and expects a normal Playwright download event before staging, validation, Target Identity Lock, SHA-256, manifest, and archive. No ordinary Chrome profile or system policy is changed. If this automatic path is unavailable, `ManualDownloadHandoff` remains a distinct human-in-the-loop fallback and must never be reported as `OxfordUnattendedDownloadReady=true`. Neither path replays a signed URL or automates Chrome's native PDF Viewer UI.
+- Oxford Academic requests are routed through `OxfordAcademicAdapter`, which owns the verified HUNNU institutional resolver, identity lock, authorized-download, validation, SHA-256, manifest, and archive rules when a compatible `BrowserTransport` exists. The Agent must not first navigate the publisher with Playwright MCP. `PlaywrightMCPTransportImplemented=false` in v0.2.16, so live MCP-backed adapter execution is not claimed or initiated; `ManualDownloadHandoff` remains a distinct human-in-the-loop fallback and must never be reported as `OxfordUnattendedDownloadReady=true`. Neither path replays a signed URL or automates Chrome's native PDF Viewer UI.
 - `PreferredSources="auto"` selects only those adapters and divides global candidate/download caps across selected sources. It never expands a user's cap.
 - A requested unsupported source returns `HarnessCapabilityAvailable=false` with `MissingCapability`; it does not fall back to an improvised browser/download workflow.
 - Requests above `MaxCandidates=30` or `MaxDownloads=10` enter `PlanningAndBudgetGate=true`. They require explicit user confirmation before live acquisition.
-- `WriteObsidian=true`, browser-first full-text reading, and requests carrying authentication material are rejected by the entry point.
+- `WriteObsidian=true`, online-first full-text reading, and requests carrying authentication material are rejected by the entry point.
 
 ## Live invocation boundary
 
-The dry-run CLI intentionally has no live-browser mode. A caller that has already selected the dedicated, user-authenticated Playwright MCP page may pass its existing supported adapter to `AgentRequestRouter.invoke_literature()`. That method delegates to the existing `LiteratureAcquisitionWorkflow`; it does not create a browser/profile or replace the Adapter, Institutional Access Resolver, identity lock, download validator, SHA-256, manifest, or audit pipeline.
+The dry-run CLI intentionally has no live-browser mode. The preferred live API is `AgentRequestRouter.invoke_literature(plan, browser=browser_transport, run_root=...)`. Harness resolves `plan.Source` through `LITERATURE_ADAPTER_REGISTRY`, validates the adapter identity and transport contract, constructs the correct adapter, and only then constructs `LiteratureAcquisitionWorkflow`. A legacy `adapter=` argument is retained for compatibility and tests, but it must be the exact registered class for the plan source (`type(adapter) is expected_type`), must already be bound to the supplied/validated transport, and must not be a subclass substitution. Source values are stripped before registry lookup and identity comparison. Missing or invalid resolution fails closed; no raw browser fallback is available. Do not begin a Harness-managed literature run by directly calling `browser_navigate`, `browser_click`, or another publisher browser operation.
+
+The Python runtime's `BrowserTransport` contract is intentionally small and matches the existing local Playwright backend. `PlaywrightMCPTransportImplemented=false` in v0.2.16: the runtime does not implement a Python bridge for Codex Playwright MCP. The dedicated Research Chrome / Playwright MCP surface remains a user-controlled surface for manual/diagnostic browser work and existing manual-authentication workflows; it must not be called directly as a substitute for the adapter execution broker. A stable MCP transport is a separate Phase B task.
 
 Likewise, `AgentRequestRouter.invoke_data()` delegates only to the existing guarded CNRDS workflow and Download Manager.
 
@@ -90,7 +97,7 @@ UnattendedExecutionRequested=true
 RunMultiSourcePreflight=true
 ```
 
-The caller builds a `SourceCapabilityRegistry` from the existing Adapter registry and supplies handlers backed by the dedicated Playwright MCP pages. `MultiSourcePreflightCoordinator` performs a dynamic-N authentication/reachability sweep, one batched manual-action gate, affected-source-only resume, and one current-session authorized download with validation and Target Identity Lock per source.
+The caller builds a `SourceCapabilityRegistry` from the existing Adapter registry and supplies source-matched handlers. User-controlled Playwright MCP pages may remain available for manual action, but they are not `BrowserTransport` instances and do not become a direct entry point into formal acquisition. `MultiSourcePreflightCoordinator` performs a dynamic-N authentication/reachability sweep, one batched manual-action gate, affected-source-only resume, and one current-session authorized download with validation and Target Identity Lock per source. `LiteratureAdapterPreflightHandler` rejects a handler whose adapter identity does not match the preflight source.
 
 The Coordinator contains no source-specific branches. A future Adapter joins by registering its capabilities and a preflight handler. An existing local PDF or manual download handoff is not current-session unattended readiness evidence.
 

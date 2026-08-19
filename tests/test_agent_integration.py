@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from hunnu_harness.agent_entrypoint import (
     AgentRequestRouter,
@@ -16,7 +16,8 @@ from hunnu_harness.agent_entrypoint import (
 )
 from hunnu_harness.cli import build_parser as build_harness_parser
 from hunnu_harness.literature.security import scan_text_for_sensitive_leaks
-from hunnu_harness.paths import CORE_ROOT, OUTPUT_ROOT, TEMP_DIR, V025_RUN_ROOT, is_within
+from hunnu_harness.literature.adapters.cnki import CNKIAdapter
+from hunnu_harness.paths import CORE_ROOT, OUTPUT_ROOT, TEMP_DIR, V0216_RUN_ROOT, is_within
 
 
 class AgentIntentRoutingTests(unittest.TestCase):
@@ -168,9 +169,9 @@ class AgentEntrypointAndOutputTests(unittest.TestCase):
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         self.router = AgentRequestRouter()
 
-    def test_v025_run_root_is_inside_output_root_and_outside_core(self) -> None:
-        self.assertTrue(is_within(V025_RUN_ROOT, OUTPUT_ROOT))
-        self.assertFalse(is_within(V025_RUN_ROOT, CORE_ROOT))
+    def test_v0216_run_root_is_inside_output_root_and_outside_core(self) -> None:
+        self.assertTrue(is_within(V0216_RUN_ROOT, OUTPUT_ROOT))
+        self.assertFalse(is_within(V0216_RUN_ROOT, CORE_ROOT))
 
     def test_pytest_cache_is_configured_outside_the_core_root(self) -> None:
         config = (CORE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -185,7 +186,7 @@ class AgentEntrypointAndOutputTests(unittest.TestCase):
                 "MaxDownloads": 0,
             }
         )
-        with tempfile.TemporaryDirectory(prefix="v025-agent-", dir=TEMP_DIR) as temporary:
+        with tempfile.TemporaryDirectory(prefix="v0216-agent-", dir=TEMP_DIR) as temporary:
             path = write_dry_run_result(decision, run_root=Path(temporary) / "run")
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertTrue(is_within(path, OUTPUT_ROOT))
@@ -203,7 +204,7 @@ class AgentEntrypointAndOutputTests(unittest.TestCase):
             write_dry_run_result(decision, run_root=CORE_ROOT / "runs" / "forbidden-agent-run")
 
     def test_root_cli_exposes_stable_agent_route_command(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="v025-agent-cli-", dir=TEMP_DIR) as temporary:
+        with tempfile.TemporaryDirectory(prefix="v0216-agent-cli-", dir=TEMP_DIR) as temporary:
             request_path = Path(temporary) / "request.json"
             request_path.write_text(
                 json.dumps(
@@ -253,8 +254,15 @@ class AgentDelegationTests(unittest.TestCase):
             }
         )
         plan = decision.literature_plans[0]
-        adapter = object()
-        with tempfile.TemporaryDirectory(prefix="v025-delegate-lit-", dir=TEMP_DIR) as temporary:
+        browser = MagicMock()
+        browser.goto = AsyncMock()
+        browser.downloads_dir = TEMP_DIR / "agent-delegation-downloads"
+        browser.page = MagicMock()
+        browser.page.url = "about:blank"
+        browser.page.content = AsyncMock(return_value="<html></html>")
+        browser.page.context = MagicMock()
+        adapter = CNKIAdapter(browser)
+        with tempfile.TemporaryDirectory(prefix="v0216-delegate-lit-", dir=TEMP_DIR) as temporary:
             run_root = Path(temporary) / "run"
             with patch("hunnu_harness.agent_entrypoint.LiteratureAcquisitionWorkflow") as workflow_type:
                 workflow_type.return_value.run = AsyncMock(return_value="delegated-literature-result")

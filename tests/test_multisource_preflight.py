@@ -13,6 +13,7 @@ from hunnu_harness.agent_entrypoint import (
     SOURCE_CAPABILITY_REGISTRY,
 )
 from hunnu_harness.literature.adapters.base import SourceActionRequired
+from hunnu_harness.literature.adapters.oxfordacademic import OxfordAcademicAdapter
 from hunnu_harness.literature.models import (
     AccessType,
     DownloadManifestEntry,
@@ -667,7 +668,7 @@ class RegistryAndAgentIntegrationTests(unittest.TestCase):
                 return LiteratureRunResult(status=RunStatus.SUCCESS, records=[], downloads=[entry])
 
             handler = LiteratureAdapterPreflightHandler(
-                adapter=object(),
+                adapter=OxfordAcademicAdapter(object()),
                 request=request,
                 authentication_probe=auth,
             )

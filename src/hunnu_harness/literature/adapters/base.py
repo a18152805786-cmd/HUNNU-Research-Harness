@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from ...browser.transport import BrowserTransport
 from ..models import AccessDecision, LiteratureRecord, LiteratureSearchRequest, RunStatus
 
 
@@ -42,7 +43,7 @@ class LiteratureSourceAdapter(ABC):
     supports_unattended_download: bool = False
     supports_preflight: bool = False
 
-    def __init__(self, browser: Any):
+    def __init__(self, browser: BrowserTransport):
         self.browser = browser
 
     @abstractmethod
