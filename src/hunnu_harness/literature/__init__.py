@@ -48,6 +48,12 @@ from .metadata_correction import (
     BibliographicCorrectionResult,
     BibliographicMetadataCorrector,
 )
+from .execution import (
+    AdapterExecutionBroker,
+    AdapterIdentityError,
+    AdapterResolutionError,
+    LiteratureAdapterFactory,
+)
 
 __all__ = [
     "AccessDecision",
@@ -84,4 +90,8 @@ __all__ = [
     "BibliographicCorrection",
     "BibliographicCorrectionResult",
     "BibliographicMetadataCorrector",
+    "AdapterExecutionBroker",
+    "AdapterIdentityError",
+    "AdapterResolutionError",
+    "LiteratureAdapterFactory",
 ]

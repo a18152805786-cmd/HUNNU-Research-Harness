@@ -1,10 +1,11 @@
-"""Stable, thin agent-facing request routing for HUNNU Research Harness.
+"""Stable agent-facing routing and adapter-first execution for Harness.
 
-This module deliberately does not launch a browser, create a profile, or
-reimplement any source adapter.  It validates a bounded research request and
-delegates live work only to the existing Harness workflows supplied by the
-caller.  The caller is therefore responsible for using the dedicated,
-user-authenticated Playwright MCP surface required by ``AGENTS.md``.
+This module does not launch a browser, create a profile, or reimplement any
+source adapter.  It validates a bounded request and delegates live literature
+work through the Harness-controlled adapter factory and execution broker.
+The browser transport remains caller-owned; the Python runtime currently
+accepts the existing local Playwright-shaped transport and has no Codex MCP
+bridge.
 """
 
 from __future__ import annotations
@@ -18,10 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
+from .browser.transport import BrowserTransport
 from .literature.models import LiteratureRunResult, LiteratureSearchRequest, RunStatus
 from .literature.security import sanitize_value
 from .literature.workflow import LiteratureAcquisitionWorkflow
 from .literature.preflight import SourceCapabilityRegistry
+from .literature.execution import AdapterExecutionBroker, LiteratureAdapterFactory
 from .literature.adapters import (
     CNKIAdapter,
     OxfordAcademicAdapter,
@@ -29,7 +32,7 @@ from .literature.adapters import (
     SpringerLinkAdapter,
 )
 from .models import DownloadRequest
-from .paths import OUTPUT_ROOT, V025_RUN_ROOT, require_output_path
+from .paths import OUTPUT_ROOT, V0216_RUN_ROOT, require_output_path
 from .workflows import run_cnrds_download
 
 if TYPE_CHECKING:
@@ -206,7 +209,8 @@ class LiteratureSourcePlan:
             "Source": self.source,
             "MaxCandidates": self.max_candidates,
             "MaxDownloads": self.max_downloads,
-            "InvocationTarget": "LiteratureAcquisitionWorkflow(existing adapter)",
+            "InvocationTarget": "AdapterExecutionBroker -> LiteratureAcquisitionWorkflow",
+            "AdapterResolution": "LITERATURE_ADAPTER_REGISTRY[Source]",
             "InstitutionalResolver": "HUNNUInstitutionalAccessResolver(existing fallback)",
             "Request": self.request.as_dict(),
         }
@@ -293,6 +297,9 @@ class AgentRoutingDecision:
                 "NetworkAcquisitionPerformed": self.network_acquisition_performed,
                 "UnattendedExecutionRequested": self.unattended_execution_requested,
                 "RunMultiSourcePreflight": self.run_multi_source_preflight,
+                "LiteratureExecutionEntryPoint": "AdapterExecutionBroker",
+                "DirectBrowserFallbackForLiterature": False,
+                "PlaywrightMCPTransportImplemented": False,
                 "PreflightCoordinator": (
                     "MultiSourcePreflightCoordinator"
                     if self.run_multi_source_preflight
@@ -327,7 +334,20 @@ class AgentRoutingDecision:
 
 
 class AgentRequestRouter:
-    """Route a bounded agent request to existing Harness capabilities only."""
+    """Route bounded requests and enforce Harness-controlled literature execution."""
+
+    def __init__(
+        self,
+        *,
+        adapter_factory: LiteratureAdapterFactory | None = None,
+        adapter_registry: Mapping[str, type[Any]] | None = None,
+    ) -> None:
+        if adapter_factory is not None and adapter_registry is not None:
+            raise ValueError("Pass adapter_factory or adapter_registry, not both")
+        self.adapter_factory = adapter_factory or LiteratureAdapterFactory(
+            adapter_registry or LITERATURE_ADAPTER_REGISTRY
+        )
+        self.adapter_execution_broker = AdapterExecutionBroker(self.adapter_factory)
 
     def route(self, request: Mapping[str, Any] | str) -> AgentRoutingDecision:
         payload: Mapping[str, Any] = {"Query": request} if isinstance(request, str) else request
@@ -721,24 +741,29 @@ class AgentRequestRouter:
         self,
         plan: LiteratureSourcePlan,
         *,
-        adapter: "LiteratureSourceAdapter",
+        browser: BrowserTransport | None = None,
+        adapter: "LiteratureSourceAdapter | None" = None,
         run_root: Path,
         institutional_resolver: "InstitutionalAccessResolver | None" = None,
         institutional_trigger: "InstitutionalResolutionTrigger | None" = None,
     ):
-        """Delegate one approved source plan to the existing literature workflow.
+        """Execute one source plan through the registered source adapter.
 
-        No browser is created here.  The caller must pass an existing supported
-        adapter backed by the dedicated, user-authenticated Playwright MCP page.
+        The preferred path supplies an existing ``BrowserTransport`` and lets
+        Harness instantiate the adapter selected by ``plan.source``.  The
+        legacy ``adapter=`` path remains available only after strict registry,
+        source-name, and transport identity validation.
         """
 
-        workflow = LiteratureAcquisitionWorkflow(
-            adapter,
-            run_root=require_output_path(Path(run_root), label="Agent literature run"),
+        return await self.adapter_execution_broker.execute(
+            plan,
+            browser=browser,
+            adapter=adapter,
+            run_root=run_root,
+            workflow_factory=LiteratureAcquisitionWorkflow,
             institutional_resolver=institutional_resolver,
             institutional_trigger=institutional_trigger,
         )
-        return await workflow.run(plan.request)
 
     @staticmethod
     def describe_literature_result(result: LiteratureRunResult) -> dict[str, Any]:
@@ -795,7 +820,7 @@ class AgentRequestRouter:
 def write_dry_run_result(
     decision: AgentRoutingDecision,
     *,
-    run_root: Path = V025_RUN_ROOT,
+    run_root: Path = V0216_RUN_ROOT,
 ) -> Path:
     """Persist a sanitized, no-network routing proof under the Output Root."""
 
@@ -822,7 +847,7 @@ def add_agent_route_arguments(parser: argparse.ArgumentParser) -> None:
     selector.add_argument("--request-json", type=Path, help="Structured Agent request JSON")
     selector.add_argument("--text", help="Natural-language research request")
     parser.add_argument("--dry-run", action="store_true", help="Write a sanitized no-network routing proof")
-    parser.add_argument("--run-root", type=Path, default=V025_RUN_ROOT)
+    parser.add_argument("--run-root", type=Path, default=V0216_RUN_ROOT)
 
 
 def route_from_cli_args(args: argparse.Namespace) -> int:

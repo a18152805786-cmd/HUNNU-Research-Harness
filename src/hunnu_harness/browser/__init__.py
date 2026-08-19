@@ -18,6 +18,7 @@ from .manual_download_handoff import (
     ManualDownloadHandoffState,
     ManualDownloadHandoffTimeout,
 )
+from .transport import BrowserPage, BrowserTransport, BrowserTransportError, validate_browser_transport
 
 __all__ = [
     "PDF_DIRECT_DOWNLOAD_PREFERENCE",
@@ -33,4 +34,8 @@ __all__ = [
     "ManualDownloadHandoffResult",
     "ManualDownloadHandoffState",
     "ManualDownloadHandoffTimeout",
+    "BrowserPage",
+    "BrowserTransport",
+    "BrowserTransportError",
+    "validate_browser_transport",
 ]

@@ -1,4 +1,4 @@
-# Global Paper Library / Personal Literature Corpus (v0.2.12)
+# Global Paper Library / Personal Literature Corpus (library protocol v0.2.12)
 
 ## Boundary
 

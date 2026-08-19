@@ -1,4 +1,4 @@
-# HUNNU Research Harness v0.2.12
+# HUNNU Research Harness v0.2.16
 
 湖南师范大学数字资源研究自动化 Harness。它把“人工完成学校认证”和“登录后的研究操作”明确分开：Harness 可以识别页面、进入 CNRDS CNFS、选择研究条件、触发合法下载并归档原始文件；它不会输入密码、验证码或 MFA，也不会导出 cookie。
 
@@ -113,6 +113,7 @@ codex mcp list
 - 已打开的日常 Chrome 标签页自动接管尚未作为默认路径启用；v0.1 优先使用专用 profile。Chrome Extension/CDP 接管需要单独验证和人工完成扩展操作。
 - CNRDS 动态页面的所有真实字段选择器尚未在本地公开网页上完成端到端验证。
 - 万方、RESSET、EPS 等尚未实现的来源不能静默退回临时浏览器流程；需先报告缺失能力并获得用户授权后才可扩展。
+- Agent 文献 live execution 的 Python `BrowserTransport` → Codex Playwright MCP bridge 尚未实现；必须先经 `AdapterExecutionBroker`，不能用裸 MCP 浏览器操作替代 adapter。
 - FDM 接管下载的兼容性尚未启用；建议专用 profile 使用浏览器原生下载，以便 Harness 可靠识别下载链路。
 
 `browser-start` 当前是一次安全的 profile 启动/状态检查命令，会在输出状态后关闭浏览器；长期运行和 Codex 操作优先由已登记的 Playwright MCP 进程负责。Python API 仍提供 `research_browser.start()`、`status()`、`stop()`，供后续服务化封装使用。

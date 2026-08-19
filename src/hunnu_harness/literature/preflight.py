@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from ..paths import V028_RUN_ROOT, require_output_path
-from .adapters.base import SourceActionRequired, SourceUserDownloadRequired
+from .adapters.base import LiteratureSourceAdapter, SourceActionRequired, SourceUserDownloadRequired
 from .models import LiteratureRunResult, LiteratureSearchRequest, RunStatus, UNKNOWN
 from .security import sanitize_value
 from .workflow import LiteratureAcquisitionWorkflow
@@ -76,6 +76,11 @@ class SourcePreflightCapabilities:
 
     @classmethod
     def from_adapter_type(cls, source: str, adapter_type: type[Any]) -> "SourcePreflightCapabilities":
+        if getattr(adapter_type, "name", None) != source:
+            raise ValueError(
+                "Source capability and adapter identity do not match: "
+                f"source={source!r}, adapter_name={getattr(adapter_type, 'name', None)!r}"
+            )
         return cls(
             source=source,
             supports_search=bool(getattr(adapter_type, "supports_search", True)),
@@ -324,6 +329,8 @@ class LiteratureAdapterPreflightHandler:
         institutional_trigger: Any = None,
         research_candidate: bool = True,
     ) -> None:
+        if not isinstance(adapter, LiteratureSourceAdapter):
+            raise TypeError("LiteratureAdapterPreflightHandler requires a LiteratureSourceAdapter")
         self.adapter = adapter
         self.request = request
         self.authentication_probe = authentication_probe
@@ -337,6 +344,11 @@ class LiteratureAdapterPreflightHandler:
         return await self.authentication_probe(context)
 
     async def download_preflight(self, context: SourcePreflightContext) -> SourcePreflightResult:
+        if getattr(self.adapter, "name", None) != context.source:
+            raise ValueError(
+                "Preflight adapter/source identity mismatch: "
+                f"context_source={context.source!r}, adapter_name={getattr(self.adapter, 'name', None)!r}"
+            )
         request = replace(
             self.request,
             max_search_results=1,
