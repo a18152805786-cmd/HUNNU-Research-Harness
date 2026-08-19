@@ -1,12 +1,45 @@
 # Phase B — Playwright MCP Transport Architecture Design
 
-Status: v0.2.17 local command-layer implementation update; MCP executor remains design-only.
+Status: v0.2.18 command/Broker/MCP-executor implementation update; publisher
+acceptance and authenticated response capture remain outside this release.
+
+Verified runtime baseline: `HarnessBaseline=v0.2.18` with
+`@playwright/mcp@0.0.79`. The package is explicitly pinned in the Codex MCP
+configuration. Future MCP changes require a controlled compatibility probe and
+Harness regression before accepting a new baseline.
+
+## v0.2.18 implementation status
+
+The current implementation adds the first vertical MCP execution boundary:
+
+- `BrowserSessionBrokerImplemented=true`
+- `MCPExecutorImplemented=true`
+- `HarnessLogicalSessionIdentity=true`
+- `HarnessLogicalPageIdentity=true`
+- `GenerationInvalidation=true`
+- `MCPToolClient` is an allow-listed host-mediated tool-call protocol;
+  Python does not launch or attach a second browser.
+- `MCPNavigate/Observe/Click/Download` are translated to the verified
+  `browser_navigate`, `browser_snapshot`, `browser_find`, `browser_click`,
+  and `browser_tabs` surface.
+- Structured MCP observations deliberately return `html=None`; no full HTML
+  is fabricated. Authenticated response-body capture remains unsupported and
+  fails closed.
+- Generic click/download events are materialized as Harness-owned
+  `DownloadArtifact` values after approved-root filesystem validation and
+  SHA-256 hashing.
+
+The controlled-page runtime evidence for this release is recorded in the
+v0.2.18 review package and test results. The historical v0.2.17 design facts
+below remain useful context but are no longer the current implementation
+status.
 
 This document is an architecture audit and implementation record. v0.2.17
-implements only the backend-neutral command/observation boundary, the local
-Playwright executor, and the four adapter migrations. It does not implement
-PlaywrightMCPTransport, launch a browser, modify a profile, or perform a
-four-publisher smoke test.
+implemented the backend-neutral command/observation boundary, the local
+Playwright executor, and the four adapter migrations. v0.2.18 adds the
+Agent-mediated MCP command executor and logical session broker; it does not
+launch a second browser, modify a profile, or perform a four-publisher smoke
+test.
 
 ## Current release and scope
 
@@ -131,9 +164,9 @@ general-purpose adapter bridge.
 
 The current MCP registration in the local Codex configuration starts Chrome
 with the dedicated Research Chrome profile and an OutputRoot staging
-directory, but the package is registered as @playwright/mcp@latest. This
-configuration establishes intent, not a version-pinned or runtime-verified
-session/download contract.
+directory. For the frozen v0.2.18 baseline, the package is explicitly
+registered as `@playwright/mcp@0.0.79`, matching the runtime and tool/download
+semantics used by the controlled verification.
 
 ## Adapter browser dependency inventory
 
@@ -753,7 +786,7 @@ CompletedInV0217:
 - command-layer, adapter-migration, and regression tests;
 - version, Agent policy, and architecture documentation.
 
-FilesLikelyToChangeForMCP (future implementation, not changed in v0.2.17):
+HistoricalFilesLikelyToChangeForMCP (v0.2.17 planning snapshot):
 
 - a new session broker and MCP/Agent executor integration module;
 - a version-pinned MCP capability/configuration record;
@@ -777,7 +810,7 @@ NewModulesImplementedInV0217:
 - LocalPlaywrightExecutor;
 - Harness-owned DownloadArtifact model and result validation boundary.
 
-NewModulesNeededForMCP:
+HistoricalNewModulesNeededForMCP:
 
 - BrowserSessionBroker with operation/continuation state;
 - MCP/Agent command executor or bridge.
@@ -811,23 +844,24 @@ dependencies, not by the adapter registry or Phase A broker.
 
 ## Version proposal
 
-RecommendedNextImplementationVersion=v0.2.18
+RecommendedNextImplementationVersion=v0.2.19
 
 RecommendedImplementationPhases:
 
 1. v0.2.17 — completed: define and test the command/observation contract; add
    a local Playwright command executor; migrate the four adapters; do not
    connect live MCP.
-2. v0.2.18 — implement the MCP/Agent session broker and executor, including
-   operation IDs, page identity, challenge continuation, and a verified
-   DownloadObservation/artifact contract on a controllable test page.
+2. v0.2.18 — completed the MCP/Agent session broker and executor, logical
+   generation/page identity, and a verified generic DownloadArtifact contract
+   on a controllable test page. Authenticated response capture remains closed.
 3. v0.2.19 — run staged Research Chrome and publisher acceptance, beginning
    with one source at a time and only then the four-source dynamic-N route.
 
-The v0.2.17 local command-layer items are implemented in the current working
-tree; the MCP items remain design proposals.
+The v0.2.17 local command-layer items and the v0.2.18 generic MCP vertical
+slice are implemented in the current working tree. Publisher acceptance and
+authenticated response capture remain future work.
 
-## Open questions and architecture blockers
+## Historical v0.2.17 audit snapshot and superseded gates
 
 ArchitectureBlockers:
 
@@ -837,8 +871,9 @@ ArchitectureBlockers:
    not formally verified.
 3. The current tool surface does not provide a safe direct equivalent for
    page.content() or the Springer authenticated response-body artifact path.
-4. The MCP package is configured as @playwright/mcp@latest rather than a
-   tested, recorded version.
+4. Historical v0.2.17 gate item: the MCP package was configured as
+   @playwright/mcp@latest rather than a tested, recorded version. The v0.2.18
+   freeze resolves this item by pinning @playwright/mcp@0.0.79.
 5. Snapshot target-reference lifetime and page identity across navigation,
    popup, disconnect, and resume are not yet specified.
 
@@ -873,10 +908,10 @@ The current design audit records these gates:
 | G7_NoFakePlaywrightObjectGraph | PASS (design) | Object emulation is explicitly rejected |
 | G8_TestStrategyDefined | PASS (design) | Four test levels and no-live-publisher sequencing are specified |
 
-MCP executor/session-broker implementation must not start until G3 and G4 are
-resolved, and the content-observation and MCP-version questions are either
-resolved or explicitly reflected in the selected adapter capabilities. This
-restriction does not block the completed local command-layer work in v0.2.17.
+The preceding G3/G4 table records the pre-implementation v0.2.17 audit. Its
+"do not start" rule is superseded by the current v0.2.18 controlled generic
+vertical slice; the remaining limitations are represented as explicit MCP
+capabilities and fail-closed errors.
 
 ## Final design decision
 
@@ -894,14 +929,16 @@ The recommended Phase B boundary is:
 
 This keeps adapter-first enforcement in the Harness, keeps publisher logic in
 the adapters, preserves the existing login-state policy, supports manual
-resume, and gives Harness ownership of download validation. It does not claim
-that the MCP bridge is implemented today.
+resume, and gives Harness ownership of download validation. The v0.2.18
+implementation realizes this boundary through an allow-listed host-mediated
+MCP tool client without simulating Python Playwright objects.
 
-PhaseBImplementationStarted=true (local command layer only)
+PhaseBImplementationStarted=true
 BrowserCommandLayerImplemented=true
-MCPExecutorImplemented=false
-BrowserSessionBrokerImplemented=false
-PlaywrightMCPTransportImplemented=false
+MCPExecutorImplemented=true
+BrowserSessionBrokerImplemented=true
+PlaywrightMCPTransportImplemented=true (typed host-mediated MCP boundary; not a Python object transport)
+MCPAuthenticatedFetchImplemented=false
 LiveFourSiteSmokeTestReady=false
 
 

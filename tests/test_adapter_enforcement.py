@@ -329,7 +329,7 @@ class AgentPolicyDocumentationTests(unittest.TestCase):
                     "Adapter resolution comes before any Harness-managed publisher navigation.",
                     content,
                 )
-                self.assertIn("PlaywrightMCPTransportImplemented=false", content)
+                self.assertIn("MCPExecutor", content)
                 self.assertIn("manual/diagnostic browser work", content)
                 for phrase in forbidden_phrases:
                     self.assertNotIn(phrase, content)

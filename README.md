@@ -67,7 +67,7 @@ Harness 运行产物默认保存在项目内部：
 Codex MCP（安装/配置一次即可）：
 
 ```powershell
-codex mcp add playwright npx "@playwright/mcp@latest"
+codex mcp add playwright npx "@playwright/mcp@0.0.79"
 codex mcp list
 ```
 

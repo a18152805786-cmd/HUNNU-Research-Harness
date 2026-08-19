@@ -1,5 +1,12 @@
 # Phase B Gate Closure — G3/G4 Runtime Capability Verification
 
+> Historical v0.2.16 gate-closure evidence. The v0.2.18 implementation now
+> consumes the verified generic MCP tool/download facts through
+> `BrowserSessionBroker` and `MCPExecutor`; the environment and process facts
+> below remain a dated runtime snapshot, not a claim that authenticated
+> response capture or four-site acceptance is complete. The v0.2.18 freeze
+> pins the verified MCP runtime to `@playwright/mcp@0.0.79`.
+
 Verification date: 2026-08-19
 
 This is a read-only runtime capability report. The probe used a controlled
@@ -35,13 +42,13 @@ Evidence labels:
     MCPPackage=@playwright/mcp
     MCPVersion=0.0.79
     MCPVersionKnown=true
-    MCPInstallSource=npx --yes @playwright/mcp@latest
+    MCPInstallSource=npx --yes @playwright/mcp@0.0.79
     MCPExecutable=C:\Users\<user>\AppData\Local\npm-cache\_npx\9833c18b2d85bc59\node_modules\@playwright\mcp\cli.js
     MCPConfiguration=C:\Users\<user>\.codex\config.toml
 
 MCPVersion is VERIFIED_RUNTIME from the package.json used by the running
-cli.js. The configuration remains unpinned because it asks npx for
-@playwright/mcp@latest; the current cached runtime resolved to 0.0.79.
+cli.js. The v0.2.18 freeze pins the configuration to
+@playwright/mcp@0.0.79, matching the verified runtime.
 
 The observed tool surface includes browser_navigate, browser_click,
 browser_snapshot, browser_type, browser_fill_form, browser_wait_for,
@@ -312,7 +319,9 @@ Remaining blockers:
 5. decide whether Springer authenticated response acquisition is supported by a
    safe capability or is rejected for the MCP backend;
 6. choose a safe, bounded page-content observation contract;
-7. pin the MCP package version before relying on tool semantics.
+7. Historical gate item resolved by v0.2.18: pin the MCP package version
+   before relying on tool semantics; future changes require an explicit
+   compatibility probe and Harness regression.
 
 No production implementation should begin under this gate result. The probe
 does not authorize BrowserCommandPort, BrowserSessionBroker, or
