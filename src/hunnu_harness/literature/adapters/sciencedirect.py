@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit
 
+from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
 from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
 from ..models import (
     AccessDecision,
@@ -365,10 +366,10 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         )
 
     async def _content(self) -> tuple[str, str]:
-        page = getattr(self.browser, "page", None)
-        if page is None:
-            raise SourceUnavailable("Browser page is unavailable")
-        return await page.content(), page.url
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        observation = await self.browser.execute(ObserveCommand(include_html=True))
+        return observation.require_html(), observation.url
 
     async def search(
         self,
@@ -376,7 +377,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         request: LiteratureSearchRequest,
     ) -> list[LiteratureRecord]:
         url = f"{self.search_origin}/search?qs={quote_plus(query)}"
-        await self.browser.goto(url)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(url))
         html, current_url = await self._content()
         results = self.parse_search_results_html(
             html,
@@ -392,7 +395,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         parsed = urlsplit(record.source_page)
         if parsed.hostname not in {"www.sciencedirect.com", "sciencedirect.com"} or not _ARTICLE_PATH.search(parsed.path):
             raise SourceLayoutChanged("Result URL is not a stable ScienceDirect article page")
-        await self.browser.goto(record.source_page)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        await self.browser.execute(NavigateCommand(record.source_page))
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         html, current_url = await self._content()
@@ -409,18 +414,19 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
         if not access.full_text_accessible or not access.authorized_access:
             raise PermissionError("FULLTEXT_NOT_AUTHORIZED")
-        page = getattr(self.browser, "page", None)
-        downloads_dir = getattr(self.browser, "downloads_dir", None)
-        if page is None or downloads_dir is None:
-            raise SourceUnavailable("Browser download context is unavailable")
-        locator = page.locator(access.download_locator).filter(has_text=re.compile(r"(?:view|download).*pdf", re.I)).first
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
         try:
-            async with page.expect_download(timeout=45_000) as download_info:
-                await locator.click()
-            download = await download_info.value
-            target = Path(downloads_dir) / (download.suggested_filename or f"{record.paper_id}.pdf")
-            await download.save_as(str(target))
-            return target
+            artifact = await self.browser.execute(
+                DownloadCommand(
+                    target=BrowserTarget(
+                        css=access.download_locator,
+                        text_regex=r"(?:view|download).*pdf",
+                    ),
+                    suggested_filename=f"{record.paper_id}.pdf",
+                )
+            )
+            return artifact.local_path
         except Exception as exc:
             raise SourceUnavailable(f"Authorized PDF control did not produce a browser download: {type(exc).__name__}") from exc
 

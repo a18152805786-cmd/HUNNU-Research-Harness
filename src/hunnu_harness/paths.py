@@ -48,9 +48,10 @@ LIBRARY_IMPORT_STAGING_DIR = LIBRARY_ROOT / "import_staging"
 
 V023_RUN_ROOT = RUNS_ROOT / "Harness_V023_Output_Root_Separation"
 V024_RUN_ROOT = RUNS_ROOT / "Harness_V024_CNKI_Challenge_Detection_Hardening"
-# Retained as a historical artifact location; current Agent dry-runs use V0216.
+# Retained as a historical artifact location.
 V025_RUN_ROOT = RUNS_ROOT / "Harness_V025_Agent_Integration_Global_Routing"
 V0216_RUN_ROOT = RUNS_ROOT / "Harness_V0216_Agent_Adapter_First_Enforcement"
+V0217_RUN_ROOT = RUNS_ROOT / "Harness_V0217_Browser_Command_Layer"
 V026_RUN_ROOT = RUNS_ROOT / "Harness_V026_Oxford_Academic_Adapter"
 V027_RUN_ROOT = RUNS_ROOT / "Harness_V027_Oxford_Unattended_PDF_Download"
 V028_RUN_ROOT = RUNS_ROOT / "Harness_V028_MultiSource_Preflight_Coordinator"

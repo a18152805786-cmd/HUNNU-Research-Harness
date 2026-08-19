@@ -10,6 +10,8 @@ from html.parser import HTMLParser
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
 
+from ..browser.commands import NavigateCommand, ObserveCommand
+from ..browser.port import ensure_browser_command_port
 from .adapters.base import (
     LiteratureSourceAdapter,
     SourceActionRequired,
@@ -321,7 +323,8 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         portal_url: str = HUNNU_OFFICIAL_PORTAL,
         library_url: str = HUNNU_LIBRARY_HOME,
     ) -> None:
-        self.browser = getattr(browser, "backend", browser)
+        backend = getattr(browser, "backend", browser)
+        self.browser = ensure_browser_command_port(backend)
         self.portal_url = sanitize_url(portal_url)
         self.library_url = sanitize_url(library_url)
         if not _is_hunnu_domain(_hostname(self.portal_url)):
@@ -613,14 +616,13 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         return best[0], True
 
     async def _snapshot_after_goto(self, url: str) -> tuple[str, str, str]:
-        await self.browser.goto(url)
-        page = getattr(self.browser, "page", None)
-        if page is None:
-            raise SourceUnavailable("Browser page is unavailable for institutional routing")
-        html = await page.content()
-        current_url = str(page.url)
-        title_method = getattr(page, "title", None)
-        title = await title_method() if callable(title_method) else self._parse(html).title
+        await self.browser.execute(NavigateCommand(url))
+        observation = await self.browser.execute(
+            ObserveCommand(include_html=True, include_visible_text=False)
+        )
+        html = observation.require_html()
+        current_url = observation.url
+        title = observation.title or self._parse(html).title
         self.detect_manual_authentication(html, url=current_url)
         return html, current_url, title
 

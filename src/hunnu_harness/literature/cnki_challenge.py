@@ -413,6 +413,13 @@ class CNKIChallengeDetector:
         route_provenance: Sequence[str] = (),
         business_flow_blocked: bool = False,
     ) -> ChallengeDiagnostic:
+        """Compatibility-only direct-page inspection for legacy callers.
+
+        Migrated source-adapter execution uses ``inspect_observation`` below;
+        this method remains for existing detector tests and local callers
+        that still own a Python Playwright page.
+        """
+
         errors: list[str] = []
         inspection_complete = True
         context = getattr(page, "context", None)
@@ -561,6 +568,123 @@ class CNKIChallengeDetector:
         return classify_challenge(
             node_evidence,
             frames=frame_evidence,
+            page_inventory=inventory,
+            target_page_confirmed=target_confirmed,
+            target_page_index=target.page_index if target else None,
+            target_page_identity_basis=basis,
+            route_provenance=route_provenance,
+            blocking_evidence=business_flow_blocked,
+            inspection_complete=inspection_complete,
+            errors=errors,
+        )
+
+    @classmethod
+    def inspect_observation(
+        cls,
+        observation: Any,
+        *,
+        route_provenance: Sequence[str] = (),
+        business_flow_blocked: bool = False,
+    ) -> ChallengeDiagnostic:
+        """Classify a structured command-layer observation.
+
+        This is the command-boundary equivalent of ``inspect_page``.  It
+        consumes only sanitized page summaries and bounded visibility probes;
+        it never receives a Playwright page, locator, context, or callback.
+        Missing probe evidence is deliberately classified as uncertain so the
+        adapter pauses for manual action instead of attempting a bypass.
+        """
+
+        current_url = str(getattr(observation, "url", "unknown"))
+        current_title = str(getattr(observation, "title", ""))
+        raw_inventory = tuple(getattr(observation, "page_inventory", ()) or ())
+        inventory = tuple(
+            PageIdentityEvidence(
+                int(getattr(item, "index", index)),
+                str(getattr(item, "title", "")),
+                str(getattr(item, "url", "unknown")),
+            )
+            for index, item in enumerate(raw_inventory)
+        )
+        if not inventory:
+            inventory = (PageIdentityEvidence(0, current_title, current_url),)
+
+        errors: list[str] = []
+        target: PageIdentityEvidence | None = None
+        basis: tuple[str, ...] = ()
+        target_confirmed = False
+        try:
+            target, basis = identify_cnki_target_page(
+                inventory,
+                current_url=current_url,
+                current_title=current_title,
+                route_provenance=route_provenance,
+            )
+            target_confirmed = True
+        except TargetPageIdentityError as exc:
+            errors.append(str(exc))
+
+        raw_nodes = tuple(getattr(observation, "target_observations", ()) or ())
+        nodes: list[ChallengeNodeEvidence] = []
+        for item in raw_nodes:
+            render_complete = bool(getattr(item, "inspection_complete", True))
+            nodes.append(
+                ChallengeNodeEvidence(
+                    marker=str(getattr(item, "marker", "unknown")),
+                    frame_index=int(getattr(item, "frame_index", 0)),
+                    frame_name=str(getattr(item, "frame_name", "")),
+                    frame_url=str(getattr(item, "frame_url", "unknown")),
+                    playwright_visible=getattr(item, "playwright_visible", None),
+                    bounding_box=ChallengeBoundingBox.from_mapping(getattr(item, "bounding_box", None)),
+                    client_rect=ChallengeBoundingBox.from_mapping(getattr(item, "client_rect", None)),
+                    display=getattr(item, "display", None),
+                    visibility=getattr(item, "visibility", None),
+                    opacity=getattr(item, "opacity", None),
+                    pointer_events=getattr(item, "pointer_events", None),
+                    aria_hidden=getattr(item, "aria_hidden", None),
+                    client_width=getattr(item, "client_width", None),
+                    client_height=getattr(item, "client_height", None),
+                    viewport_width=float(getattr(item, "viewport_width", 0)),
+                    viewport_height=float(getattr(item, "viewport_height", 0)),
+                    frame_viewport_visible=getattr(item, "frame_viewport_visible", None),
+                    inspection_complete=render_complete,
+                    blocking_overlay=bool(getattr(item, "blocking_overlay", False)),
+                )
+            )
+            if not render_complete:
+                errors.append("structured challenge visibility probe was incomplete")
+
+        frames: list[ChallengeFrameEvidence] = []
+        frame_indexes = sorted({node.frame_index for node in nodes} or {0})
+        for frame_index in frame_indexes:
+            frame_nodes = [node for node in nodes if node.frame_index == frame_index]
+            frame = frame_nodes[0] if frame_nodes else None
+            frames.append(
+                ChallengeFrameEvidence(
+                    frame_index=frame_index,
+                    frame_name=frame.frame_name if frame else "",
+                    frame_url=frame.frame_url if frame else current_url,
+                    playwright_visible=(
+                        any(node.playwright_visible is True for node in frame_nodes)
+                        if frame_nodes
+                        else None
+                    ),
+                    viewport_visible=(
+                        any(node.frame_viewport_visible is True for node in frame_nodes)
+                        if frame_nodes
+                        else None
+                    ),
+                    bounding_box_present=any(node.bounding_box is not None for node in frame_nodes),
+                    challenge_node_count=len(frame_nodes),
+                )
+            )
+
+        inspection_complete = bool(getattr(observation, "inspection_complete", True))
+        if not inspection_complete:
+            errors.append("browser observation was incomplete")
+        return classify_challenge(
+            nodes,
+            frames=frames,
             page_inventory=inventory,
             target_page_confirmed=target_confirmed,
             target_page_index=target.page_index if target else None,

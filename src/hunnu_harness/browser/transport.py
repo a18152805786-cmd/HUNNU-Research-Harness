@@ -1,11 +1,9 @@
-"""Small browser boundary consumed by literature source adapters.
+"""Legacy local Playwright-shaped compatibility input.
 
-The adapters currently use a deliberately narrow Python Playwright-shaped
-surface: navigation is owned by the transport, while the page handle exposes
-the source-specific DOM and download primitives already used by the existing
-adapters.  This is a contract boundary, not an MCP bridge.  A Codex
-Playwright MCP page is not accepted here unless a separately implemented
-Python transport adapts it to this contract.
+The formal v0.2.17 adapter boundary is ``BrowserCommandPort``.  This module
+retains the previous Python-Playwright-shaped contract only so the Harness can
+wrap an existing local backend in ``LocalPlaywrightExecutor`` during the
+transition.  It is not an MCP bridge and is not a formal adapter surface.
 """
 
 from __future__ import annotations
@@ -36,11 +34,12 @@ class BrowserPage(Protocol):
 
 @runtime_checkable
 class BrowserTransport(Protocol):
-    """Transport supplied to a Harness-controlled literature adapter.
+    """Legacy transport accepted only at the Harness compatibility boundary.
 
     ``page`` intentionally remains an opaque, Playwright-compatible page
-    handle.  The protocol does not expose a second browser API or attempt to
-    model the entire Playwright surface.
+    handle.  Adapters must not receive this object graph on the v0.2.17 path;
+    ``LocalPlaywrightExecutor`` is responsible for translating it into typed
+    commands and observations.
     """
 
     page: BrowserPage

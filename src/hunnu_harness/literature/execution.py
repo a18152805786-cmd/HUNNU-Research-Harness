@@ -6,7 +6,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
 
-from ..browser.transport import BrowserTransport, validate_browser_transport
+from ..browser.port import (
+    BrowserCommandPort,
+    ensure_browser_command_port,
+    validate_browser_command_port,
+)
+from ..browser.transport import BrowserTransport
 from ..paths import require_output_path
 from .adapters.base import LiteratureSourceAdapter
 
@@ -63,7 +68,7 @@ class LiteratureAdapterFactory:
         source: str,
         adapter: LiteratureSourceAdapter,
         *,
-        browser: BrowserTransport | None = None,
+        browser: BrowserCommandPort | BrowserTransport | None = None,
     ) -> LiteratureSourceAdapter:
         """Validate a legacy adapter injection against the exact registry type.
 
@@ -85,23 +90,30 @@ class LiteratureAdapterFactory:
                 f"{getattr(adapter, 'name', None)!r} does not match source {canonical_source!r}"
             )
 
-        adapter_browser = validate_browser_transport(getattr(adapter, "browser", None))
-        if browser is not None and adapter_browser is not browser:
-            raise AdapterIdentityError(
-                "Caller-supplied adapter is bound to a different BrowserTransport than the execution request"
-            )
+        adapter_browser = validate_browser_command_port(getattr(adapter, "browser", None))
+        if browser is not None:
+            request_browser = ensure_browser_command_port(browser)
+            same_binding = adapter_browser is request_browser
+            if not same_binding:
+                bound_to = getattr(adapter_browser, "bound_to", None)
+                same_binding = callable(bound_to) and bool(bound_to(browser))
+            if not same_binding:
+                raise AdapterIdentityError(
+                    "Caller-supplied adapter is bound to a different BrowserCommandPort "
+                    "than the execution request"
+                )
         return adapter
 
     def create(
         self,
         source: str,
         *,
-        browser: BrowserTransport | None,
+        browser: BrowserCommandPort | BrowserTransport | None,
         adapter_kwargs: Mapping[str, Any] | None = None,
     ) -> LiteratureSourceAdapter:
         canonical_source = self._normalize_source(source)
         adapter_type = self.resolve_type(canonical_source)
-        transport = validate_browser_transport(browser)
+        transport = ensure_browser_command_port(browser)
         try:
             adapter = adapter_type(transport, **dict(adapter_kwargs or {}))
         except Exception as exc:
@@ -122,7 +134,7 @@ class AdapterExecutionBroker:
         self,
         plan: Any,
         *,
-        browser: BrowserTransport | None,
+        browser: BrowserCommandPort | BrowserTransport | None,
         adapter: LiteratureSourceAdapter | None,
         run_root: Path,
         workflow_factory: Callable[..., Any],
