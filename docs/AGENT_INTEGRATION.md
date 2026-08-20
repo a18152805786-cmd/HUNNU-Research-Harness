@@ -1,4 +1,4 @@
-# Agent Integration and Global Routing (Harness v0.2.18; routing schema v0.2.8)
+# Agent Integration and Global Routing (Harness v0.2.19; routing schema v0.2.9)
 
 ## Purpose
 
@@ -51,6 +51,39 @@ The result reports intent detection, selected existing sources, exact per-source
   "WriteObsidian": false
 }
 ```
+
+## Public Official Web source
+
+`TaskType=official_web` routes to the separate registered chain
+`OfficialWebExecutionBroker -> PublicOfficialWebAdapter -> BrowserCommandPort`.
+It does not enter `LiteratureAcquisitionWorkflow`, download papers, or perform
+institutional access. An explicit `AllowedDomains` list is mandatory. Initial
+URLs and final redirect destinations must remain within that allowlist.
+
+Configured `OfficialDomainClaims` record the official domain plus the declared
+journal/sponsor/publisher relationship. A matching claim is
+`OFFICIAL_CONFIRMED`; an allowlisted domain without a configured relationship
+is only `OFFICIAL_PROBABLE`; title text alone never proves officiality. Login,
+CAPTCHA/security challenges, access restrictions, paywalls, non-HTML content,
+and out-of-allowlist redirects stop the run. The adapter uses only typed
+`Navigate` and `Observe` browser commands.
+
+Discovery and evidence fetch remain separate phases. Candidate discovery may
+produce an explicit URL, but evidence is admitted only after a fresh
+OfficialWeb fetch validates its allowlist, final URL, configured relationship,
+content type, and access state.
+
+## Bounded multi-batch budgets
+
+The single-batch `MaxDownloads` and `MaxDownloadsPerRun` maximum remains 25.
+An explicit `TotalDownloadBudget` may exceed 25 only when
+`BoundedBatchPlanner` creates a `MultiBatchPlan`. Every batch remains at or
+below 25, candidate/download totals are preserved, retries are finite
+(`MaxRetries` 0-3), and the coordinator rejects any batch or aggregate result
+that exceeds its budget. Automatic retry requires an explicit retryable error
+with a committed-download count; unknown exceptions stop the batch because
+their commit state cannot be audited. Optional `QuotaGroups` are an additive extension
+point. Routing/dry-run planning does not execute the batches.
 
 For v0.1 data acquisition, use `TaskType="data_acquisition"` plus the existing CNRDS fields: `Database`, `Module`, and `Table`; optional bounded query fields include `Stocks`, `DateStart`, `DateEnd`, `Fields`, and `OutputFormat`.
 

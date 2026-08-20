@@ -1,4 +1,4 @@
-# HUNNU Research Harness v0.2.16
+# HUNNU Research Harness v0.2.19
 
 湖南师范大学数字资源研究自动化 Harness。它把“人工完成学校认证”和“登录后的研究操作”明确分开：Harness 可以识别页面、进入 CNRDS CNFS、选择研究条件、触发合法下载并归档原始文件；它不会输入密码、验证码或 MFA，也不会导出 cookie。
 
@@ -12,6 +12,8 @@
 - Agent Integration：`agent-route` 为 Agent 提供稳定的结构化请求路由与无网络 dry-run；详见 [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md)。
 - Multi-source preflight：显式无人值守的多来源请求先动态扫查全部计划来源、批量汇总人工认证 Gate，并要求每来源完成一次本会话授权下载、文件验证与 Target Identity Lock 后才签发 `UnattendedRunClearance=true`。
 - Global Paper Library：在既有 run archive、Target Identity Lock、文件验证和 SHA-256 之后，把全文以现有 PaperID 纳入 `Output Root/library/`。JSONL 是 catalog source of truth，CSV 是人工查看投影；同一作品的不同 SHA-256 作为不同文件版本保留，绝不覆盖主版本。
+- OfficialWeb：通过正式 `OfficialWebExecutionBroker -> PublicOfficialWebAdapter -> BrowserCommandPort` 路径获取公开官方网页证据。请求必须提供 `AllowedDomains`；跳转出 allowlist、登录、CAPTCHA、安全挑战、付费墙或非 HTML 内容均 fail closed。它不下载论文，也不替代 CNKI/出版社 adapter。
+- Bounded multi-batch research：单批下载硬上限仍为 25；显式 `TotalDownloadBudget` 可由 planner 拆成多个受控批次，并保留总候选/下载预算、有限重试和可选 quota group 扩展点。规划不会自动执行下载。
 
 Global Library 与受控 external import 的正式契约见 [docs/GLOBAL_PAPER_LIBRARY.md](docs/GLOBAL_PAPER_LIBRARY.md)。外部工具只能显式 COPY 单个候选到 staging，再提交 claimed metadata；Harness 会先用本地 PDF 首页面内容独立核验 DOI/title，无法验证或存在冲突时进入 review。Harness 不提供全盘扫描、MOVE、DELETE、联网身份补全或静默覆盖入口。
 
@@ -107,6 +109,48 @@ codex mcp list
 - 不修改原始研究数据，不覆盖 raw 文件。
 - 不自动运行回归、构造研究变量或修改论文。
 - 不把学校授权数据提交到 Git。
+
+## OfficialWeb 公开证据
+
+`OfficialWeb` 只处理公开、无需登录的期刊、主办方、出版社、投稿系统公开页、征稿/投稿须知、栏目、公告与正式访谈页面。它不是通用爬虫，也不使用 `requests`、临时 Playwright 脚本或 `curl` 绕过 Harness。
+
+结构化请求必须给出显式证据 URL 和任务级域名 allowlist。`OfficialDomainClaims` 用配置的官方域名及主办/出版关系把结果分为 `OFFICIAL_CONFIRMED`、`OFFICIAL_PROBABLE` 或 `UNVERIFIED`；标题本身从不构成官方性证明。候选 URL discovery 与 evidence fetch 是两个概念阶段，只有重新通过 allowlist、最终跳转域名和 officiality 检查的页面才能进入证据。
+
+```json
+{
+  "TaskType": "official_web",
+  "Query": "查找期刊投稿须知",
+  "URLs": ["https://journal.example.edu/submission"],
+  "AllowedDomains": ["journal.example.edu", "sponsor.example.edu"],
+  "OfficialDomainClaims": [
+    {
+      "Domain": "journal.example.edu",
+      "SourceType": "JournalOfficialWebsite",
+      "Relationship": "configured journal-owned domain"
+    }
+  ]
+}
+```
+
+## Bounded Multi-Batch
+
+`MaxDownloads`/`MaxDownloadsPerRun` 继续限制单批最多 25。较大的正式目标必须显式声明总预算，由 `BoundedBatchPlanner` 拆批；`BoundedBatchCoordinator` 拒绝批次或累计结果超预算，并将每批重试限制在 `MaxRetries + 1` 次。只有带明确已提交下载数的 `RetryableBatchError` 才会自动重试；未知异常立即停止该批，避免无法核算的重复下载。
+
+```json
+{
+  "TaskType": "literature_search",
+  "Query": "bounded candidate pool",
+  "PreferredSources": ["CNKI"],
+  "MaxCandidates": 80,
+  "MaxDownloads": 25,
+  "TotalCandidateBudget": 80,
+  "TotalDownloadBudget": 36,
+  "PerBatchDownloadBudget": 25,
+  "MaxRetries": 1
+}
+```
+
+该请求只生成两个下载预算为 `18 + 18` 的批次计划，并进入既有 planning/budget gate；不会自动下载 36 篇。
 
 ## 当前尚未实现
 

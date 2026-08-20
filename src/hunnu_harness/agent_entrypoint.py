@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from .browser.port import BrowserCommandPort
 from .browser.transport import BrowserTransport
+from .batching import BoundedBatchPlanner, MultiBatchPlan, PER_BATCH_MAX_DOWNLOADS
 from .literature.models import LiteratureRunResult, LiteratureSearchRequest, RunStatus
 from .literature.security import sanitize_value
 from .literature.workflow import LiteratureAcquisitionWorkflow
@@ -34,6 +35,11 @@ from .literature.adapters import (
     SpringerLinkAdapter,
 )
 from .models import DownloadRequest
+from .official_web import (
+    OFFICIAL_WEB_ADAPTER_REGISTRY,
+    OfficialWebExecutionBroker,
+    OfficialWebRequest,
+)
 from .paths import OUTPUT_ROOT, V0217_RUN_ROOT, require_output_path
 from .workflows import run_cnrds_download
 
@@ -57,6 +63,7 @@ SOURCE_CAPABILITY_REGISTRY = SourceCapabilityRegistry.from_adapter_registry(
     LITERATURE_ADAPTER_REGISTRY
 )
 SUPPORTED_DATA_SOURCES = ("CNRDS",)
+SUPPORTED_OFFICIAL_WEB_SOURCES = ("OfficialWeb",)
 DEFAULT_MAX_CANDIDATES = 30
 DEFAULT_MAX_DOWNLOADS = 0
 HIGH_COST_CANDIDATE_THRESHOLD = 30
@@ -153,6 +160,11 @@ def _source_name(value: str) -> str | None:
         "oxfordjournalscollection": "OxfordAcademic",
         "oxforduniversitypress": "OxfordAcademic",
         "oup": "OxfordAcademic",
+        "officialweb": "OfficialWeb",
+        "officialwebsite": "OfficialWeb",
+        "publicofficialweb": "OfficialWeb",
+        "官方网站": "OfficialWeb",
+        "官方网页": "OfficialWeb",
         "cnrds": "CNRDS",
         "cnfs": "CNRDS",
     }
@@ -233,6 +245,8 @@ class AgentRoutingDecision:
     selected_sources: tuple[str, ...] = ()
     literature_plans: tuple[LiteratureSourcePlan, ...] = ()
     data_request: DownloadRequest | None = None
+    official_web_request: OfficialWebRequest | None = None
+    multi_batch_plan: MultiBatchPlan | None = None
     planning_and_budget_gate: bool = False
     estimated_candidates: int = 0
     estimated_downloads: int = 0
@@ -269,7 +283,7 @@ class AgentRoutingDecision:
             }
         return sanitize_value(
             {
-                "SchemaVersion": "0.2.8",
+                "SchemaVersion": "0.2.9",
                 "TaskType": self.task_type,
                 "Status": self.status,
                 "OriginalResearchRequest": self.original_request,
@@ -283,6 +297,30 @@ class AgentRoutingDecision:
                 "SelectedSources": list(self.selected_sources),
                 "LiteraturePlans": [plan.as_dict() for plan in self.literature_plans],
                 "DataRequest": data_request,
+                "OfficialWebRequest": (
+                    {
+                        "Source": "OfficialWeb",
+                        "URLs": list(self.official_web_request.urls),
+                        "AllowedDomains": list(self.official_web_request.allowed_domains),
+                        "OfficialDomainClaims": [
+                            {
+                                "Domain": claim.domain,
+                                "SourceType": claim.source_type,
+                                "Relationship": claim.relationship,
+                            }
+                            for claim in self.official_web_request.official_domain_claims
+                        ],
+                        "AllowDiscovery": self.official_web_request.allow_discovery,
+                        "MaxPages": self.official_web_request.max_pages,
+                        "InvocationTarget": "OfficialWebExecutionBroker -> PublicOfficialWebAdapter",
+                        "BrowserExecution": "BrowserCommandPort Navigate/Observe",
+                    }
+                    if self.official_web_request is not None
+                    else None
+                ),
+                "MultiBatchPlan": (
+                    self.multi_batch_plan.as_dict() if self.multi_batch_plan is not None else None
+                ),
                 "OutputRoot": str(OUTPUT_ROOT),
                 "PlanningAndBudgetGate": self.planning_and_budget_gate,
                 "EstimatedSources": len(self.selected_sources),
@@ -301,6 +339,7 @@ class AgentRoutingDecision:
                 "RunMultiSourcePreflight": self.run_multi_source_preflight,
                 "LiteratureExecutionEntryPoint": "AdapterExecutionBroker",
                 "DirectBrowserFallbackForLiterature": False,
+                "DirectTemporaryCrawlerAdded": False,
                 "MCPExecutorImplemented": True,
                 "BrowserSessionBrokerImplemented": True,
                 "PlaywrightMCPTransportImplemented": True,
@@ -354,6 +393,9 @@ class AgentRequestRouter:
             adapter_registry or LITERATURE_ADAPTER_REGISTRY
         )
         self.adapter_execution_broker = AdapterExecutionBroker(self.adapter_factory)
+        self.official_web_execution_broker = OfficialWebExecutionBroker(
+            OFFICIAL_WEB_ADAPTER_REGISTRY
+        )
 
     def route(self, request: Mapping[str, Any] | str) -> AgentRoutingDecision:
         payload: Mapping[str, Any] = {"Query": request} if isinstance(request, str) else request
@@ -383,6 +425,8 @@ class AgentRequestRouter:
 
         if task_type == "LiteratureAcquisition":
             return self._route_literature(payload, original)
+        if task_type == "OfficialWebAcquisition":
+            return self._route_official_web(payload, original)
         if task_type == "DataAcquisition":
             return self._route_data(payload, original)
         if task_type == "Unsupported":
@@ -405,9 +449,17 @@ class AgentRequestRouter:
     @staticmethod
     def _classify_task(payload: Mapping[str, Any], original: str, explicit_task: str) -> str:
         literature_types = {"literature", "literaturesearch", "literatureacquisition", "papersearch"}
+        official_web_types = {
+            "officialweb",
+            "officialwebacquisition",
+            "publicofficialweb",
+            "officialwebsite",
+        }
         data_types = {"data", "dataacquisition", "researchdata", "researchdataacquisition"}
         if explicit_task in literature_types:
             return "LiteratureAcquisition"
+        if explicit_task in official_web_types:
+            return "OfficialWebAcquisition"
         if explicit_task in data_types:
             return "DataAcquisition"
         if explicit_task not in {"", "auto"}:
@@ -417,6 +469,8 @@ class AgentRequestRouter:
         known_sources = {_source_name(value) for value in source_values}
         if known_sources & set(SUPPORTED_LITERATURE_SOURCES):
             return "LiteratureAcquisition"
+        if known_sources & set(SUPPORTED_OFFICIAL_WEB_SOURCES):
+            return "OfficialWebAcquisition"
         if "CNRDS" in known_sources:
             return "DataAcquisition"
 
@@ -463,6 +517,41 @@ class AgentRequestRouter:
         if any(marker in lowered for marker in data_markers):
             return "DataAcquisition"
         return "NonAcquisition"
+
+    @staticmethod
+    def _route_official_web(
+        payload: Mapping[str, Any], original: str
+    ) -> AgentRoutingDecision:
+        try:
+            request = OfficialWebRequest.from_mapping(payload)
+        except (TypeError, ValueError) as exc:
+            return AgentRoutingDecision(
+                task_type="OfficialWebAcquisition",
+                status="INVALID_REQUEST",
+                original_request=original,
+                research_acquisition_intent_detected=True,
+                harness_selected=True,
+                harness_capability_available=True,
+                correct_router_selected=True,
+                missing_request_details=str(exc),
+            )
+        return AgentRoutingDecision(
+            task_type="OfficialWebAcquisition",
+            status="ROUTED",
+            original_request=original,
+            research_acquisition_intent_detected=True,
+            harness_selected=True,
+            harness_capability_available=True,
+            request_validated=True,
+            correct_router_selected=True,
+            missing_capability="unknown",
+            selected_sources=("OfficialWeb",),
+            official_web_request=request,
+            estimated_candidates=len(request.urls),
+            estimated_high_cost_risk="Low",
+            authorized_full_text_only=True,
+            screening_first=True,
+        )
 
     def _route_literature(self, payload: Mapping[str, Any], original: str) -> AgentRoutingDecision:
         if not original:
@@ -516,6 +605,67 @@ class AgentRequestRouter:
                     label="MaxDownloads",
                 )
             effective_downloads = min(max_downloads, max_candidates)
+            total_download_value = _field(
+                payload,
+                "TotalDownloadBudget",
+                "TotalRequestedDownloads",
+                default=None,
+            )
+            total_candidate_value = _field(
+                payload, "TotalCandidateBudget", default=max_candidates
+            )
+            multi_batch_plan = None
+            if total_download_value is not None:
+                total_download_budget = _bounded_int(
+                    total_download_value,
+                    default=effective_downloads,
+                    minimum=0,
+                    maximum=500,
+                    label="TotalDownloadBudget",
+                )
+                total_candidate_budget = _bounded_int(
+                    total_candidate_value,
+                    default=max_candidates,
+                    minimum=1,
+                    maximum=2000,
+                    label="TotalCandidateBudget",
+                )
+                per_batch_download_budget = _bounded_int(
+                    _field(
+                        payload,
+                        "PerBatchDownloadBudget",
+                        default=PER_BATCH_MAX_DOWNLOADS,
+                    ),
+                    default=PER_BATCH_MAX_DOWNLOADS,
+                    minimum=1,
+                    maximum=PER_BATCH_MAX_DOWNLOADS,
+                    label="PerBatchDownloadBudget",
+                )
+                per_batch_candidate_budget = _bounded_int(
+                    _field(payload, "PerBatchCandidateBudget", default=200),
+                    default=200,
+                    minimum=1,
+                    maximum=200,
+                    label="PerBatchCandidateBudget",
+                )
+                max_retries = _bounded_int(
+                    _field(payload, "MaxRetries", default=1),
+                    default=1,
+                    minimum=0,
+                    maximum=3,
+                    label="MaxRetries",
+                )
+                raw_quotas = _field(payload, "QuotaGroups", default=None)
+                if raw_quotas is not None and not isinstance(raw_quotas, Mapping):
+                    raise ValueError("QuotaGroups must be an object mapping group names to quotas")
+                multi_batch_plan = BoundedBatchPlanner().plan(
+                    total_candidate_budget=total_candidate_budget,
+                    total_download_budget=total_download_budget,
+                    per_batch_candidate_budget=per_batch_candidate_budget,
+                    per_batch_download_budget=per_batch_download_budget,
+                    max_retries=max_retries,
+                    quota_groups=raw_quotas,
+                )
             languages = _normalize_languages(
                 _field(payload, "Languages", "PreferredLanguages", default=None),
                 original,
@@ -578,7 +728,20 @@ class AgentRequestRouter:
             for source in source_selection
             if candidate_budgets.get(source, 0) > 0
         )
-        high_cost = max_candidates > HIGH_COST_CANDIDATE_THRESHOLD or max_downloads > HIGH_COST_DOWNLOAD_THRESHOLD
+        total_estimated_downloads = (
+            multi_batch_plan.total_download_budget
+            if multi_batch_plan is not None
+            else max_downloads
+        )
+        total_estimated_candidates = (
+            multi_batch_plan.total_candidate_budget
+            if multi_batch_plan is not None
+            else max_candidates
+        )
+        high_cost = (
+            total_estimated_candidates > HIGH_COST_CANDIDATE_THRESHOLD
+            or total_estimated_downloads > HIGH_COST_DOWNLOAD_THRESHOLD
+        )
         unattended_requested = _boolean(
             _field(payload, "UnattendedExecutionRequested", default=None),
             default=any(
@@ -608,10 +771,11 @@ class AgentRequestRouter:
             missing_capability="unknown",
             selected_sources=tuple(plan.source for plan in plans),
             literature_plans=plans,
+            multi_batch_plan=multi_batch_plan,
             planning_and_budget_gate=high_cost,
-            estimated_candidates=sum(plan.max_candidates for plan in plans),
-            estimated_downloads=sum(plan.max_downloads for plan in plans),
-            estimated_local_files_to_read=sum(plan.max_downloads for plan in plans),
+            estimated_candidates=total_estimated_candidates,
+            estimated_downloads=total_estimated_downloads,
+            estimated_local_files_to_read=total_estimated_downloads,
             estimated_high_cost_risk="High" if high_cost else "Low",
             full_text_reading_mode="LocalFile",
             authorized_full_text_only=True,
@@ -770,6 +934,25 @@ class AgentRequestRouter:
             workflow_factory=LiteratureAcquisitionWorkflow,
             institutional_resolver=institutional_resolver,
             institutional_trigger=institutional_trigger,
+        )
+
+    async def invoke_official_web(
+        self,
+        decision: AgentRoutingDecision,
+        *,
+        browser: BrowserCommandPort | BrowserTransport,
+    ):
+        """Execute a routed public-official-web request through its registry."""
+
+        if (
+            decision.task_type != "OfficialWebAcquisition"
+            or not decision.is_routable
+            or decision.official_web_request is None
+        ):
+            raise ValueError("A validated, routable OfficialWeb decision is required")
+        return await self.official_web_execution_broker.execute(
+            decision.official_web_request,
+            browser=browser,
         )
 
     @staticmethod
