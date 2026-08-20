@@ -4,7 +4,9 @@ import json
 import re
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+from hunnu_harness.browser.commands import BrowserPageSummary
 from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceLayoutChanged
 from hunnu_harness.literature.adapters.cnki import CNKIAdapter
 from hunnu_harness.literature.cnki_challenge import (
@@ -181,6 +183,55 @@ class CNKIPageIdentityTests(unittest.TestCase):
                 current_url="https://kns.cnki.net/kns8s/search?kw=current",
                 current_title="检索-中国知网",
             )
+
+    def test_broker_runtime_index_disambiguates_same_sanitized_cnki_identity(self) -> None:
+        pages = (
+            PageIdentityEvidence(1, "检索-中国知网", "https://kns.cnki.net/kns8s/search?kw=one"),
+            PageIdentityEvidence(2, "检索-中国知网", "https://kns.cnki.net/kns8s/search?kw=two"),
+        )
+
+        selected, basis = identify_cnki_target_page(
+            pages,
+            current_url="https://kns.cnki.net/kns8s/search?kw=current",
+            current_title="检索-中国知网",
+            current_index=2,
+        )
+
+        self.assertEqual(selected.page_index, 2)
+        self.assertIn("broker-runtime-index-correlated", basis)
+
+    def test_broker_runtime_index_cannot_override_cnki_url_title_identity(self) -> None:
+        pages = (
+            PageIdentityEvidence(1, "检索-中国知网", "https://kns.cnki.net/kns8s/search?kw=one"),
+            PageIdentityEvidence(2, "Springer", "https://link.springer.com/search?query=test"),
+        )
+
+        with self.assertRaises(TargetPageIdentityError):
+            identify_cnki_target_page(
+                pages,
+                current_url="https://kns.cnki.net/kns8s/search?kw=current",
+                current_title="检索-中国知网",
+                current_index=2,
+            )
+
+    def test_structured_observation_uses_broker_index_for_duplicate_cnki_tabs(self) -> None:
+        observation = SimpleNamespace(
+            url="https://kns.cnki.net/kns8s/search?kw=two",
+            title="检索-中国知网",
+            page_inventory=(
+                BrowserPageSummary(1, "检索-中国知网", "https://kns.cnki.net/kns8s/search?kw=one"),
+                BrowserPageSummary(2, "检索-中国知网", "https://kns.cnki.net/kns8s/search?kw=two"),
+            ),
+            target_observations=(),
+            inspection_complete=True,
+            metadata={"RuntimeTabIndex": 2},
+        )
+
+        diagnostic = CNKIChallengeDetector.inspect_observation(observation)
+
+        self.assertTrue(diagnostic.target_page_confirmed)
+        self.assertEqual(diagnostic.target_page_index, 2)
+        self.assertIn("broker-runtime-index-correlated", diagnostic.target_page_identity_basis)
 
     def test_route_provenance_is_preserved_in_diagnostic(self) -> None:
         route = ("HUNNU Official Portal", "Library / Database Navigation", "CNKI")

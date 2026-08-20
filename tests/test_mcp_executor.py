@@ -19,6 +19,7 @@ from hunnu_harness.browser import (
     NavigateCommand,
     ObservationUnavailable,
     ObserveCommand,
+    PageAffinityAmbiguous,
     SessionUnavailable,
     StalePageHandle,
     StaleObservationReference,
@@ -85,6 +86,31 @@ class _FakeMCPClient:
                 )
             return _result("### Page\n- Page URL: http://controlled.test/\n- Page Title: Controlled")
         raise AssertionError(f"Unexpected MCP tool: {tool} {arguments}")
+
+
+class _SourceAffinityMCPClient(_FakeMCPClient):
+    def __init__(self, pages: list[tuple[str, str]], *, current: int) -> None:
+        super().__init__()
+        self.pages = list(pages)
+        self.current = current
+
+    async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((tool, dict(arguments)))
+        if tool == "browser_tabs":
+            if arguments.get("action") == "select":
+                self.current = int(arguments["index"])
+            rows = [
+                f"- {index}: {'(current) ' if index == self.current else ''}[{title}]({url})"
+                for index, (title, url) in enumerate(self.pages)
+            ]
+            return _result("### Result\n" + "\n".join(rows))
+        if tool == "browser_snapshot":
+            title, url = self.pages[self.current]
+            return _result(
+                f"### Page\n- Page URL: {url}\n- Page Title: {title}\n"
+                "### Snapshot\n- main [ref=e1]"
+            )
+        return await super().call(tool, arguments)
 
 
 class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -591,6 +617,174 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BrowserSessionBrokerTests(unittest.IsolatedAsyncioTestCase):
+    async def _affinity_broker(
+        self,
+        temporary: str,
+        pages: list[tuple[str, str]],
+        *,
+        current: int,
+    ) -> tuple[BrowserSessionBroker, _SourceAffinityMCPClient]:
+        client = _SourceAffinityMCPClient(pages, current=current)
+        broker = BrowserSessionBroker(
+            MCPExecutor(client, downloads_dir=Path(temporary)),
+            session_id="source-affinity-session",
+        )
+        await broker.enumerate_pages()
+        return broker, client
+
+    async def test_source_affinity_selects_cnki_when_springer_is_active(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, client = await self._affinity_broker(
+                temporary,
+                [
+                    ("Springer", "https://link.springer.com/search?query=test"),
+                    ("CNKI", "https://kns.cnki.net/kns8s/defaultresult/index"),
+                ],
+                current=0,
+            )
+
+            observation = await broker.select_source_page(
+                source="CNKI",
+                source_origin="https://kns.cnki.net",
+            )
+
+            self.assertIsNotNone(observation)
+            self.assertEqual(observation.url, "https://kns.cnki.net/kns8s/defaultresult/index")
+            self.assertIn(("browser_tabs", {"action": "select", "index": 1}), client.calls)
+
+    async def test_source_affinity_selects_springer_when_cnki_is_active(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, _client = await self._affinity_broker(
+                temporary,
+                [
+                    ("CNKI", "https://kns.cnki.net/kns8s/defaultresult/index"),
+                    ("Springer", "https://link.springer.com/search?query=test"),
+                ],
+                current=0,
+            )
+
+            observation = await broker.select_source_page(
+                source="SpringerLink",
+                source_origin="https://link.springer.com",
+            )
+
+            self.assertIsNotNone(observation)
+            self.assertEqual(observation.url, "https://link.springer.com/search?query=test")
+
+    async def test_source_affinity_selects_unique_match_from_unrelated_active_page(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, _client = await self._affinity_broker(
+                temporary,
+                [
+                    ("Unrelated", "https://example.test/"),
+                    ("Target", "https://target.test/business"),
+                ],
+                current=0,
+            )
+
+            observation = await broker.select_source_page(
+                source="TargetSource",
+                source_origin="https://target.test",
+            )
+
+            self.assertIsNotNone(observation)
+            self.assertEqual(observation.url, "https://target.test/business")
+
+    async def test_source_affinity_no_match_preserves_safe_adapter_navigation_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, client = await self._affinity_broker(
+                temporary,
+                [("Unrelated", "https://example.test/")],
+                current=0,
+            )
+            before = broker.page_handle
+
+            observation = await broker.select_source_page(
+                source="MissingSource",
+                source_origin="https://missing.test",
+            )
+
+            self.assertIsNone(observation)
+            self.assertEqual(broker.page_handle, before)
+            self.assertFalse(
+                any(
+                    tool == "browser_tabs" and arguments.get("action") == "select"
+                    for tool, arguments in client.calls
+                )
+            )
+
+    async def test_source_affinity_multiple_inactive_matches_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, client = await self._affinity_broker(
+                temporary,
+                [
+                    ("Unrelated", "https://example.test/"),
+                    ("Target one", "https://target.test/one"),
+                    ("Target two", "https://target.test/two"),
+                ],
+                current=0,
+            )
+
+            with self.assertRaises(PageAffinityAmbiguous):
+                await broker.select_source_page(
+                    source="TargetSource",
+                    source_origin="https://target.test",
+                )
+            self.assertFalse(
+                any(
+                    tool == "browser_tabs" and arguments.get("action") == "select"
+                    for tool, arguments in client.calls
+                )
+            )
+
+    async def test_source_affinity_multiple_matches_reuse_active_compatible_page(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, _client = await self._affinity_broker(
+                temporary,
+                [
+                    ("Target current", "https://target.test/current"),
+                    ("Target other", "https://target.test/other"),
+                ],
+                current=0,
+            )
+
+            observation = await broker.select_source_page(
+                source="TargetSource",
+                source_origin="https://target.test",
+            )
+
+            self.assertIsNotNone(observation)
+            self.assertEqual(observation.url, "https://target.test/current")
+
+    async def test_source_affinity_reuses_known_binding_after_switching_sources(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-source-affinity-") as temporary:
+            broker, client = await self._affinity_broker(
+                temporary,
+                [
+                    ("Target owned", "https://target.test/owned"),
+                    ("Target other", "https://target.test/other"),
+                    ("Other source", "https://other.test/business"),
+                ],
+                current=0,
+            )
+            owned = await broker.select_source_page(
+                source="TargetSource",
+                source_origin="https://target.test",
+            )
+            pages = await broker.enumerate_pages()
+            other = next(page for page in pages if page.summary.url.startswith("https://other.test"))
+            await broker.select_page(other.handle)
+
+            rebound = await broker.select_source_page(
+                source="TargetSource",
+                source_origin="https://target.test",
+            )
+
+            self.assertIsNotNone(owned)
+            self.assertIsNotNone(rebound)
+            self.assertEqual(rebound.url, "https://target.test/owned")
+            self.assertIn(("browser_tabs", {"action": "select", "index": 0}), client.calls)
+
     async def test_broker_exposes_command_port_and_logical_page_handles(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-broker-") as temporary:
             client = _FakeMCPClient()

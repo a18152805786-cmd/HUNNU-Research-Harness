@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 from .commands import (
     BrowserActionResult,
@@ -40,6 +41,10 @@ class SessionUnavailable(SessionBrokerError):
 
 class StalePageHandle(SessionBrokerError):
     """A page handle belongs to an older generation or another session."""
+
+
+class PageAffinityAmbiguous(SessionBrokerError):
+    """The broker cannot bind a source to one compatible existing page."""
 
 
 @runtime_checkable
@@ -102,6 +107,7 @@ class BrowserSessionBroker:
             generation=self._generation,
         )
         self._bindings: dict[str, _PageBinding] = {}
+        self._source_page_bindings: dict[str, str] = {}
         self._active_page_id = self._page_handle.value
         self._state = "uninitialized"
         self._invalid_reason = ""
@@ -278,6 +284,69 @@ class BrowserSessionBroker:
             raise SessionBrokerError("MCP page selection did not return an observation")
         return self._decorate_result(result, binding)
 
+    async def select_source_page(
+        self,
+        *,
+        source: str,
+        source_origin: str,
+    ) -> BrowserObservation | None:
+        """Select one existing page compatible with a resolved source.
+
+        Source resolution remains owned by the literature execution broker.
+        This method only applies the resolved adapter's declared search origin
+        to the current page inventory.  A unique compatible page is reused; a
+        currently active compatible page resolves an otherwise duplicate
+        inventory; and an ambiguous inactive set fails closed.  When no
+        compatible page exists, ``None`` preserves the existing safe behavior
+        where the adapter's first typed navigation initializes the source on
+        the current page.
+        """
+
+        requested_source = str(source).strip()
+        parsed_origin = urlsplit(str(source_origin).strip())
+        origin_host = (parsed_origin.hostname or "").casefold().rstrip(".")
+        if not requested_source or parsed_origin.scheme not in {"http", "https"} or not origin_host:
+            raise SessionBrokerError("Source page affinity requires a named source and HTTP(S) origin")
+
+        pages = await self.enumerate_pages()
+        compatible = tuple(
+            page
+            for page in pages
+            if self._source_host_compatible(page.summary.url, origin_host)
+        )
+        if not compatible:
+            return None
+        source_key = requested_source.casefold()
+        owned_page_id = self._source_page_bindings.get(source_key)
+        owned = tuple(page for page in compatible if page.handle.value == owned_page_id)
+        if len(owned) == 1:
+            selected = owned[0]
+        elif len(compatible) == 1:
+            selected = compatible[0]
+        else:
+            active = tuple(page for page in compatible if page.active)
+            if len(active) != 1:
+                raise PageAffinityAmbiguous(
+                    f"Source page affinity is ambiguous for {requested_source!r}: "
+                    f"{len(compatible)} compatible inactive pages"
+                )
+            selected = active[0]
+
+        observation = await self.select_page(selected.handle)
+        if not self._source_host_compatible(observation.url, origin_host):
+            raise PageAffinityAmbiguous(
+                f"Selected page no longer matches the resolved source {requested_source!r}"
+            )
+        self._source_page_bindings[source_key] = selected.handle.value
+        return observation
+
+    @staticmethod
+    def _source_host_compatible(page_url: str, origin_host: str) -> bool:
+        page_host = (urlsplit(str(page_url)).hostname or "").casefold().rstrip(".")
+        return bool(page_host) and (
+            page_host == origin_host or page_host.endswith(f".{origin_host}")
+        )
+
     async def rebind(self) -> tuple[LogicalPage, ...]:
         """Explicitly establish a new mapping after invalidation.
 
@@ -306,6 +375,7 @@ class BrowserSessionBroker:
         )
         self._active_page_id = self._page_handle.value
         self._bindings = {}
+        self._source_page_bindings = {}
         self._invalid_reason = str(reason).strip() or "unknown"
         self._state = "uncertain"
 
@@ -417,6 +487,7 @@ __all__ = [
     "BrowserSessionBroker",
     "LogicalPage",
     "MCPRuntimeExecutor",
+    "PageAffinityAmbiguous",
     "SessionBrokerError",
     "SessionUnavailable",
     "StalePageHandle",

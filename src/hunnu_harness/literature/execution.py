@@ -159,6 +159,14 @@ class AdapterExecutionBroker:
                 browser=browser,
             )
 
+        source_origin = str(getattr(type(resolved), "search_origin", "")).strip()
+        select_source_page = getattr(resolved.browser, "select_source_page", None)
+        if source_origin and callable(select_source_page):
+            await select_source_page(
+                source=str(plan.source).strip(),
+                source_origin=source_origin,
+            )
+
         workflow = workflow_factory(
             resolved,
             run_root=require_output_path(Path(run_root), label="Agent literature run"),

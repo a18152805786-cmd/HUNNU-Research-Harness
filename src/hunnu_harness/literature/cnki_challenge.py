@@ -300,9 +300,16 @@ def identify_cnki_target_page(
     *,
     current_url: str,
     current_title: str,
+    current_index: int | None = None,
     route_provenance: Sequence[str] = (),
 ) -> tuple[PageIdentityEvidence, tuple[str, ...]]:
-    """Lock the active CNKI page by identity, never by tab number alone."""
+    """Lock the active CNKI page by identity, never by tab number alone.
+
+    A broker-provided runtime index may disambiguate otherwise identical
+    sanitized URL/title evidence only within the same fresh observation.  It
+    is never sufficient without the existing official-host, URL, and title
+    checks.
+    """
 
     candidates = [page for page in pages if _is_cnki_target_page(page)]
     current_stable_url = _stable_runtime_url(current_url)
@@ -313,15 +320,36 @@ def identify_cnki_target_page(
         if page.stable_url == current_stable_url
         and re.sub(r"\s+", " ", page.title).strip().casefold() == current_title_normalized
     ]
+    runtime_index_used = False
+    if current_index is not None:
+        indexed_current = [page for page in exact_current if page.page_index == current_index]
+        if len(indexed_current) != 1:
+            raise TargetPageIdentityError(
+                "TargetPageIdentity=uncertain; broker runtime index conflicts with current CNKI URL/title"
+            )
+        exact_current = indexed_current
+        runtime_index_used = True
     if len(exact_current) != 1:
         raise TargetPageIdentityError(
             "TargetPageIdentity=uncertain; expected one current CNKI page locked by stable URL and title"
         )
-    if len([page for page in candidates if page.stable_url == current_stable_url and page.title == exact_current[0].title]) > 1:
+    if (
+        not runtime_index_used
+        and len(
+            [
+                page
+                for page in candidates
+                if page.stable_url == current_stable_url and page.title == exact_current[0].title
+            ]
+        )
+        > 1
+    ):
         raise TargetPageIdentityError(
             "TargetPageIdentity=uncertain; duplicate CNKI pages share the same stable URL and title"
         )
     basis = ["official-cnki-domain-or-HUNNU-gateway", "current-stable-url", "current-page-title"]
+    if runtime_index_used:
+        basis.append("broker-runtime-index-correlated")
     if route_provenance:
         basis.append("navigation-provenance")
     return exact_current[0], tuple(basis)
@@ -613,11 +641,16 @@ class CNKIChallengeDetector:
         target: PageIdentityEvidence | None = None
         basis: tuple[str, ...] = ()
         target_confirmed = False
+        metadata = getattr(observation, "metadata", {})
+        runtime_index = metadata.get("RuntimeTabIndex") if isinstance(metadata, Mapping) else None
+        if isinstance(runtime_index, bool) or not isinstance(runtime_index, int) or runtime_index < 0:
+            runtime_index = None
         try:
             target, basis = identify_cnki_target_page(
                 inventory,
                 current_url=current_url,
                 current_title=current_title,
+                current_index=runtime_index,
                 route_provenance=route_provenance,
             )
             target_confirmed = True

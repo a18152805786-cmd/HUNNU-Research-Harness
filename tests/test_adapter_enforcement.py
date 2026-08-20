@@ -15,6 +15,7 @@ from hunnu_harness.browser.transport import (
     BrowserTransport,
     BrowserTransportError,
 )
+from hunnu_harness.browser.commands import BrowserActionResult, PageHandle, SessionHandle
 from hunnu_harness.literature.adapters import (
     CNKIAdapter,
     LiteratureSourceAdapter,
@@ -116,6 +117,25 @@ class _BrokenAdapter(_TracingAdapter):
 
 class _CNKISubclass(CNKIAdapter):
     pass
+
+
+class _AffinityCommandPort:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.downloads_dir = TEMP_DIR / "adapter-affinity-downloads"
+        self.session = SessionHandle("adapter-affinity-session", 0)
+        self.page_handle = PageHandle("adapter-affinity-page", session=self.session, generation=0)
+
+    async def execute(self, command) -> BrowserActionResult:
+        self.events.append(f"browser.execute:{command.kind}")
+        return BrowserActionResult(action=command.kind, success=True)
+
+    async def select_source_page(self, *, source: str, source_origin: str) -> None:
+        self.events.append(f"affinity.select:{source}:{source_origin}")
+
+
+class _AffinityTracingAdapter(_TracingAdapter):
+    search_origin = "https://target-source.test"
 
 
 def _request() -> LiteratureSearchRequest:
@@ -310,6 +330,52 @@ class AdapterFirstExecutionTests(unittest.TestCase):
         self.assertEqual(
             events,
             ["adapter.init", "workflow.init", "workflow.run", "adapter.search", "browser.goto"],
+        )
+
+    def test_execution_binds_resolved_source_page_before_workflow_entry(self) -> None:
+        events: list[str] = []
+        port = _AffinityCommandPort(events)
+        router = AgentRequestRouter(
+            adapter_factory=LiteratureAdapterFactory({"CNKI": _AffinityTracingAdapter})
+        )
+        decision = router.route(
+            {
+                "TaskType": "literature_search",
+                "Query": "source affinity",
+                "PreferredSources": "CNKI",
+                "MaxCandidates": 1,
+                "MaxDownloads": 0,
+            }
+        )
+
+        class _Workflow:
+            def __init__(self, adapter, **_kwargs) -> None:
+                events.append("workflow.init")
+                self.adapter = adapter
+
+            async def run(self, _request) -> str:
+                events.append("workflow.run")
+                return "executed"
+
+        with tempfile.TemporaryDirectory(prefix="adapter-affinity-", dir=TEMP_DIR) as temporary:
+            with patch("hunnu_harness.agent_entrypoint.LiteratureAcquisitionWorkflow", _Workflow):
+                result = asyncio.run(
+                    router.invoke_literature(
+                        decision.literature_plans[0],
+                        browser=port,
+                        run_root=Path(temporary) / "run",
+                    )
+                )
+
+        self.assertEqual(result, "executed")
+        self.assertEqual(
+            events,
+            [
+                "adapter.init",
+                "affinity.select:CNKI:https://target-source.test",
+                "workflow.init",
+                "workflow.run",
+            ],
         )
 
 

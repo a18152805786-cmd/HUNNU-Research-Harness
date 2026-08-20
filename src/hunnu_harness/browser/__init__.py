@@ -61,6 +61,7 @@ from .mcp_executor import (
 from .session_broker import (
     BrowserSessionBroker,
     LogicalPage,
+    PageAffinityAmbiguous,
     SessionBrokerError,
     SessionUnavailable,
     StalePageHandle,
@@ -123,6 +124,7 @@ __all__ = [
     "StaleObservationReference",
     "BrowserSessionBroker",
     "LogicalPage",
+    "PageAffinityAmbiguous",
     "SessionBrokerError",
     "SessionUnavailable",
     "StalePageHandle",
