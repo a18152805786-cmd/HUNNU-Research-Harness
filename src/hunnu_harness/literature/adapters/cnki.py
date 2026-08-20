@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import html as html_lib
 import json
 import re
+import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
+from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlsplit
 
 from ...browser.commands import (
     BrowserTarget,
@@ -42,6 +44,54 @@ _INSTITUTIONAL_ACCESS_MARKERS = (
     "湖南师范大学",
     "hunan normal university",
 )
+_CNKI_DASH_CHARS = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
+_CNKI_DASH_SPACE_RE = re.compile(rf"\s*([{_CNKI_DASH_CHARS}])\s*")
+
+
+def _decode_cnki_form_query_value(value: str) -> str:
+    """Decode a CNKI URL/form value before it enters bibliographic logic.
+
+    ``+`` is a space only at this explicit ``application/x-www-form-urlencoded``
+    boundary. This helper must not be applied to a title read from the page.
+    """
+
+    return html_lib.unescape(unquote_plus(str(value)))
+
+
+def _canonicalize_cnki_exact_query(value: str) -> str:
+    """Canonicalize plain text used to build a CNKI exact-title query.
+
+    This is deliberately a query-input operation, not a URL decoder. It
+    removes only nonsemantic whitespace adjacent to the dash forms observed
+    in CNKI titles, so ``quote_plus`` cannot turn that layout difference into
+    a literal ``+`` in CNKI's search box.
+    """
+
+    text = html_lib.unescape(unicodedata.normalize("NFKC", str(value)))
+    text = re.sub(r"\s+", " ", text).strip()
+    return _CNKI_DASH_SPACE_RE.sub(r"\1", text)
+
+
+def _canonicalize_cnki_title_identity(value: str) -> str:
+    """Normalize a page-observed bibliographic title without fuzzy matching.
+
+    A literal ``+`` remains a literal ``+`` here. Query/form decoding must
+    happen in ``_decode_cnki_form_query_value`` before this helper is called
+    when the input is known to be encoded query data.
+    """
+
+    text = html_lib.unescape(unicodedata.normalize("NFKC", str(value)))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = _CNKI_DASH_SPACE_RE.sub(r"\1", text)
+    return text.casefold()
+
+
+def _cnki_known(value: str) -> bool:
+    return bool(value and value != UNKNOWN)
+
+
+def _cnki_authors_identity(authors: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_canonicalize_cnki_title_identity(author) for author in authors if _cnki_known(author))
 
 
 def _is_cnki_host(hostname: str | None) -> bool:
@@ -153,13 +203,30 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         super().__init__()
         self.blocks: dict[str, list[str]] = defaultdict(list)
         self.author_links: list[str] = []
+        self.institution_login_status = False
+        self.authenticated_institution_labels: list[str] = []
         self._capture_stack: list[tuple[str, str, list[str]]] = []
+        self._hidden_element_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
         attributes = {key.casefold(): (value or "") for key, value in attrs}
         lowered = tag.casefold()
         classes = set(attributes.get("class", "").casefold().split())
+        style = re.sub(r"\s+", "", attributes.get("style", "").casefold())
+        if (
+            "hidden" in attributes
+            or attributes.get("aria-hidden", "").casefold() == "true"
+            or "display:none" in style
+            or "visibility:hidden" in style
+        ):
+            self._hidden_element_tags.append(lowered)
+        if "ecp_header_login_status1" in classes:
+            self.institution_login_status = True
+        if "ecp_header_unitname" in classes:
+            label = re.sub(r"\s+", " ", attributes.get("title", "")).strip()
+            if label and "display:none" not in style and "visibility:hidden" not in style:
+                self.authenticated_institution_labels.append(label)
         key = ""
         if lowered == "h1":
             key = "title"
@@ -176,6 +243,8 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
 
     def handle_data(self, data: str) -> None:
         super().handle_data(data)
+        if self._hidden_element_tags:
+            return
         for _, _, parts in self._capture_stack:
             parts.append(data)
 
@@ -187,6 +256,10 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
                 if author:
                     self.author_links.append(author)
         super().handle_endtag(tag)
+        for index in range(len(self._hidden_element_tags) - 1, -1, -1):
+            if self._hidden_element_tags[index] == lowered:
+                del self._hidden_element_tags[index]
+                break
         if self._capture_stack and self._capture_stack[-1][0] == lowered:
             _, key, parts = self._capture_stack.pop()
             value = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -252,6 +325,14 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 "BrowserReadyForManualAction=true"
             )
         login_url = any(marker in url.casefold() for marker in ("/login", "passport.cnki", "cas.", "carsi", "webvpn"))
+        institution_authenticated = (
+            parser.institution_login_status
+            and bool(parser.authenticated_institution_labels)
+            and normal_business_evidence
+            and not login_url
+        )
+        if institution_authenticated:
+            return
         blocking_login = any(
             marker in haystack
             for marker in ("统一身份认证", "请登录", "登录已失效", "重新登录", "短信验证", "二次认证")
@@ -298,7 +379,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
     @classmethod
     def build_search_url(cls, query: str, *, mode: str = "keyword") -> str:
         order = {"exact_title": "TI", "title": "TI", "author": "AU", "keyword": "SU"}.get(mode, "SU")
-        return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={quote_plus(query)}"
+        query_value = _canonicalize_cnki_exact_query(query) if mode in {"exact_title", "title"} else query
+        return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={quote_plus(query_value)}"
 
     @classmethod
     def parse_search_results_html(
@@ -812,13 +894,29 @@ class CNKIAdapter(LiteratureSourceAdapter):
 
     @staticmethod
     def identity_matches(search_record: LiteratureRecord, detail_record: LiteratureRecord) -> tuple[bool, str]:
+        title_matches = _canonicalize_cnki_title_identity(search_record.title) == _canonicalize_cnki_title_identity(
+            detail_record.title
+        )
+        if not title_matches:
+            return False, "Target title mismatch"
+        if search_record.authors and detail_record.authors:
+            if _cnki_authors_identity(search_record.authors) != _cnki_authors_identity(detail_record.authors):
+                return False, "Author mismatch"
+        if _cnki_known(search_record.year) and _cnki_known(detail_record.year):
+            if str(search_record.year) != str(detail_record.year):
+                return False, "Year mismatch"
+        if _cnki_known(search_record.journal) and _cnki_known(detail_record.journal):
+            if _canonicalize_cnki_title_identity(search_record.journal) != _canonicalize_cnki_title_identity(
+                detail_record.journal
+            ):
+                return False, "Journal mismatch"
         if search_record.doi != UNKNOWN and detail_record.doi != UNKNOWN:
             return (search_record.doi == detail_record.doi, "DOI exact match" if search_record.doi == detail_record.doi else "DOI mismatch")
         if search_record.stable_identifier != UNKNOWN and detail_record.stable_identifier != UNKNOWN:
             if search_record.stable_identifier == detail_record.stable_identifier:
                 return True, "Stable identifier match"
-        matched = normalize_title(search_record.title) == normalize_title(detail_record.title)
-        return matched, "Normalized title match" if matched else "Target title mismatch"
+            return False, "Stable identifier mismatch"
+        return True, "Normalized title match"
 
     @staticmethod
     def _search_input(query: str, request: LiteratureSearchRequest) -> tuple[str, str]:
@@ -827,7 +925,10 @@ class CNKIAdapter(LiteratureSourceAdapter):
         if author_match:
             return "author", author_match.group(1).strip()
         unwrapped = raw[1:-1].strip() if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"') else raw
-        if any(normalize_title(unwrapped) == normalize_title(title) for title in request.exact_titles):
+        if any(
+            _canonicalize_cnki_title_identity(unwrapped) == _canonicalize_cnki_title_identity(title)
+            for title in request.exact_titles
+        ):
             return "exact_title", unwrapped
         if any(unwrapped == author for author in request.authors):
             return "author", unwrapped
@@ -880,8 +981,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
             max_results=parse_limit,
         )
         if mode == "exact_title":
-            wanted = normalize_title(search_term)
-            results = [record for record in results if normalize_title(record.title) == wanted]
+            wanted = _canonicalize_cnki_title_identity(search_term)
+            results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
         results = results[:result_limit]
         if not results and content_kind == "snapshot" and "共找到" not in content:
             content_kind, content, current_url = await self._content()
@@ -893,8 +994,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 max_results=parse_limit,
             )
             if mode == "exact_title":
-                wanted = normalize_title(search_term)
-                results = [record for record in results if normalize_title(record.title) == wanted]
+                wanted = _canonicalize_cnki_title_identity(search_term)
+                results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
             results = results[:result_limit]
         if not results and not _is_cnki_host(urlsplit(current_url).hostname):
             raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
@@ -913,7 +1014,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
         # Reusing one after screening can return a genuine CNKI 404 even though
         # the record still exists.  Refresh the exact-title result page and
         # click its newly observed link instead of replaying the stale URL.
-        await self.browser.execute(NavigateCommand(self.build_search_url(record.title, mode="exact_title")))
+        exact_title_query = _canonicalize_cnki_exact_query(record.title)
+        await self.browser.execute(NavigateCommand(self.build_search_url(exact_title_query, mode="exact_title")))
         content_kind, content, current_url = await self._content()
         parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
         fresh_records = parser(
@@ -937,9 +1039,14 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
         if fresh_record is None:
             raise SourceLayoutChanged("CNKI exact-title refresh could not relock the requested result")
+        # CNKI's HTML result parser can preserve nonsemantic whitespace beside
+        # a dash while the accessibility label exposes the same title without
+        # it.  Use the restricted exact-query canonical form for the click
+        # target too; the multi-field identity lock above remains authoritative.
+        click_title = _canonicalize_cnki_exact_query(fresh_record.title)
         await self.browser.execute(
             ClickCommand(
-                BrowserTarget(text=fresh_record.title, exact_text=True),
+                BrowserTarget(text=click_title, exact_text=True),
                 follow_new_page=True,
                 close_origin_when_sole_page=True,
             )

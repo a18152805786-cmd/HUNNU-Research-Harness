@@ -50,7 +50,7 @@
 
 37. Adapter resolution comes before any Harness-managed publisher navigation. For a Harness-managed request, the resolved adapter owns source-specific official-site and institutional-route decisions once a compatible `BrowserCommandPort` exists. v0.2.18 adds `BrowserSessionBroker` and `MCPExecutor`: the broker owns logical session/page identity and the executor is the only allow-listed typed MCP tool-call boundary. The Python runtime still does not launch or attach a second browser; a host must supply an `MCPToolClient` for the existing dedicated Playwright MCP session. Raw MCP tools are not a literature fallback. Manual authentication, CAPTCHA, MFA, CAS, and WebVPN gates remain user-only stops under Rules 1–2 and 22–25.
 
-## Agent-facing Harness entry point (Harness v0.2.19; routing schema v0.2.9)
+## Agent-facing Harness entry point (Harness v0.2.20; routing schema v0.2.9)
 
 This section defines **how** an Agent calls Harness after global routing has selected it. It does not replace the safety rules above.
 
@@ -95,7 +95,7 @@ This section defines **how** an Agent calls Harness after global routing has sel
 58. Historical literature runs are not migrated automatically. Any future migration starts with a bounded dry-run inventory, uses verified COPY rather than MOVE, verifies equal source/destination SHA-256, and preserves the original run artifacts.
 59. External metadata is a claimed identity, not a trusted identity. Before `stable_paper_id()` and reconciliation, `library-import` must independently verify normalized DOI/title evidence from the local PDF. DOI/title conflict or unavailable evidence fails closed before any managed-file or catalog commit; no network identity lookup or OCR fallback is permitted by this gate.
 
-## OfficialWeb and bounded multi-batch (v0.2.19)
+## OfficialWeb and bounded multi-batch (v0.2.20)
 
 60. Public official-page evidence must route through `OfficialWebExecutionBroker` and the registered `PublicOfficialWebAdapter` before typed `Navigate`/`Observe` browser commands. `AllowedDomains` is mandatory; both initial and final redirect hosts must remain allowlisted. Officiality requires configured domain and journal/sponsor/publisher relationship evidence; a page title alone is insufficient.
 61. `OfficialWeb` is public evidence only. It must stop at login, CAPTCHA, security challenge, paywall/access restriction, non-HTML content, or an unverified redirect. It does not perform CNKI/publisher full-text downloads or HUNNU institutional access.

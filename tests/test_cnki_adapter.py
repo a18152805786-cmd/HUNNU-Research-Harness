@@ -19,7 +19,11 @@ from hunnu_harness.browser.commands import (
     SessionHandle,
 )
 from hunnu_harness.literature.adapters.base import SourceActionRequired
-from hunnu_harness.literature.adapters.cnki import CNKIAdapter
+from hunnu_harness.literature.adapters.cnki import (
+    CNKIAdapter,
+    _canonicalize_cnki_title_identity,
+    _decode_cnki_form_query_value,
+)
 from hunnu_harness.literature.cnki_challenge import ChallengeState
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.adapters.springerlink import SpringerLinkAdapter
@@ -81,6 +85,69 @@ class CNKIParserTests(unittest.TestCase):
         self.assertIn("korder=TI", CNKIAdapter.build_search_url("人工智能漂洗", mode="exact_title"))
         self.assertIn("korder=AU", CNKIAdapter.build_search_url("张三", mode="author"))
         self.assertIn("korder=SU", CNKIAdapter.build_search_url("盈余管理", mode="keyword"))
+
+    def test_exact_title_relock_decodes_form_plus_before_identity_comparison(self) -> None:
+        requested = "全球价值链升级——基于中国上市公司的实证研究"
+        serialized = "全球价值链升级+——+基于中国上市公司的实证研究"
+        observed = "全球价值链升级——基于中国上市公司的实证研究"
+        self.assertEqual(_decode_cnki_form_query_value(serialized), "全球价值链升级 —— 基于中国上市公司的实证研究")
+        self.assertEqual(_canonicalize_cnki_title_identity(observed), _canonicalize_cnki_title_identity(requested))
+        search = LiteratureRecord(paper_id="search", title=requested)
+        detail = LiteratureRecord(paper_id="detail", title=observed)
+        self.assertTrue(CNKIAdapter.identity_matches(search, detail)[0])
+
+    def test_exact_title_query_removes_only_dash_adjacent_spaces(self) -> None:
+        spaced = "A —— B"
+        compact = "A——B"
+        self.assertEqual(
+            _canonicalize_cnki_title_identity(spaced),
+            _canonicalize_cnki_title_identity(compact),
+        )
+        url = CNKIAdapter.build_search_url(spaced, mode="exact_title")
+        self.assertNotIn("+%E2%80%94", url)
+
+    def test_form_plus_between_words_is_decoded_at_the_query_boundary(self) -> None:
+        self.assertEqual(_decode_cnki_form_query_value("A+B"), "A B")
+        self.assertEqual(
+            _canonicalize_cnki_title_identity(_decode_cnki_form_query_value("A+B")),
+            _canonicalize_cnki_title_identity("A B"),
+        )
+
+    def test_literal_plus_in_bibliographic_title_is_preserved(self) -> None:
+        literal = "C++相关研究"
+        without_plus = "C  相关研究"
+        self.assertEqual(_canonicalize_cnki_title_identity(literal), "c++相关研究")
+        self.assertNotEqual(
+            _canonicalize_cnki_title_identity(literal),
+            _canonicalize_cnki_title_identity(without_plus),
+        )
+        self.assertIn("%2B%2B", CNKIAdapter.build_search_url(literal, mode="exact_title").upper())
+
+    def test_exact_title_relock_rejects_subtitle_mismatch(self) -> None:
+        left = LiteratureRecord(paper_id="left", title="A——基于中国上市公司的研究")
+        right = LiteratureRecord(paper_id="right", title="A——基于中国制造业企业的研究")
+        self.assertFalse(CNKIAdapter.identity_matches(left, right)[0])
+
+    def test_exact_title_relock_rejects_author_mismatch(self) -> None:
+        left = LiteratureRecord(paper_id="left", title="A", authors=("张三",), year="2025")
+        right = LiteratureRecord(paper_id="right", title="A", authors=("李四",), year="2025")
+        matched, reason = CNKIAdapter.identity_matches(left, right)
+        self.assertFalse(matched)
+        self.assertEqual(reason, "Author mismatch")
+
+    def test_exact_title_relock_rejects_year_mismatch(self) -> None:
+        left = LiteratureRecord(paper_id="left", title="A", authors=("张三",), year="2025")
+        right = LiteratureRecord(paper_id="right", title="A", authors=("张三",), year="2024")
+        matched, reason = CNKIAdapter.identity_matches(left, right)
+        self.assertFalse(matched)
+        self.assertEqual(reason, "Year mismatch")
+
+    def test_existing_cnki_exact_title_fixture_identity_remains_locked(self) -> None:
+        search = CNKIAdapter.parse_search_results_html(
+            fixture("cnki_search.html"), query="人工智能漂洗", max_results=1
+        )[0]
+        detail = CNKIAdapter.parse_article_html(fixture("cnki_article_pdf.html"), source_url=ARTICLE_URL)
+        self.assertTrue(CNKIAdapter.identity_matches(search, detail)[0])
 
     def test_structured_snapshot_search_is_bounded_and_deduplicated(self) -> None:
         records = CNKIAdapter.parse_search_results_snapshot(
@@ -161,6 +228,18 @@ class CNKIParserTests(unittest.TestCase):
         self.assertIn("媒体监督", record.abstract)
         self.assertIn("AI漂洗", record.keywords)
 
+    def test_hidden_cnki_title_ui_marker_is_not_bibliographic_text(self) -> None:
+        html = fixture("cnki_article_live_structure.html").replace(
+            "<h1>投贷联动、媒体监督与科技企业AI漂洗</h1>",
+            '<h1>投贷联动、媒体监督与科技企业AI漂洗'
+            '<span id="corr-video" style="display: none">附视频</span></h1>',
+        )
+        record = CNKIAdapter.parse_article_html(
+            html,
+            source_url="https://kns.cnki.net/kcms2/article/abstract?v=redacted",
+        )
+        self.assertEqual(record.title, "投贷联动、媒体监督与科技企业AI漂洗")
+
     def test_pdf_access_requires_enabled_single_paper_control(self) -> None:
         decision = CNKIAdapter.check_fulltext_access_html(fixture("cnki_article_pdf.html"), source_url=ARTICLE_URL)
         self.assertTrue(decision.authorized_access)
@@ -220,6 +299,78 @@ class CNKIParserTests(unittest.TestCase):
                 "《财经科学》2026年第2期\n投贷联动、媒体监督与科技企业 AI 漂洗\n李媛媛 崔梦萦",
             )
         )
+
+
+class CNKIAuthenticationClassificationTests(unittest.TestCase):
+    @staticmethod
+    def authenticated_header(*, extra_body: str = "") -> str:
+        return f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <header class="ecp_header_login_area">
+            <div class="ecp_header_login_status ecp_header_login_status1">
+              <div class="ecp_header_unitName" title="湖南师范大学" style="display: inline-block;">
+                湖南师范大学
+              </div>
+              <div class="ecp_header_personal_loginbg">个人登录</div>
+            </div>
+          </header>
+          <main><section aria-label="检索结果">学术期刊 检索结果</section></main>
+          {extra_body}
+        </body></html>
+        """
+
+    def test_institution_authenticated_with_personal_login_entry_is_allowed(self) -> None:
+        html = self.authenticated_header(
+            extra_body='<div style="display:none"><p>请登录个人账号使用。</p></div>'
+        )
+        CNKIAdapter.detect_interruption(
+            html,
+            url="https://kns.cnki.net/kns8s/defaultresult/index?korder=TI&kw=test",
+        )
+
+    def test_explicit_login_requirement_without_institution_authentication_stops(self) -> None:
+        html = "<html><head><title>CNKI 登录</title></head><body><main>请登录后下载全文</main></body></html>"
+        with self.assertRaisesRegex(SourceActionRequired, "manual authentication required"):
+            CNKIAdapter.detect_interruption(html, url="https://kns.cnki.net/login")
+
+    def test_authenticated_page_with_dormant_personal_login_ui_is_allowed(self) -> None:
+        html = self.authenticated_header(
+            extra_body="""
+              <div class="ecp_personalLoginBox" style="display:none">个人登录 请登录个人账号使用</div>
+              <div class="verification-component" style="position:absolute;top:-1000000px">安全验证 验证码</div>
+            """
+        )
+        CNKIAdapter.detect_interruption(
+            html,
+            url="https://kns.cnki.net/kns8s/defaultresult/index?korder=TI&kw=test",
+        )
+
+    def test_active_security_challenge_still_precedes_institution_authentication(self) -> None:
+        html = self.authenticated_header(extra_body="<h1>安全验证</h1><p>请完成滑块验证码后继续。</p>")
+        html = html.replace("学术期刊 检索结果", "")
+        with self.assertRaisesRegex(SourceActionRequired, "CAPTCHA or security verification"):
+            CNKIAdapter.detect_interruption(html, url="https://kns.cnki.net/security-check")
+
+    def test_unrelated_institution_name_does_not_authenticate(self) -> None:
+        html = """
+        <html><head><title>CNKI</title></head><body>
+          <article>历史合作机构包括湖南师范大学。</article>
+          <main>请登录后继续</main>
+        </body></html>
+        """
+        with self.assertRaisesRegex(SourceActionRequired, "manual authentication required"):
+            CNKIAdapter.detect_interruption(html, url="https://kns.cnki.net/account")
+
+    def test_existing_cnki_challenge_fixtures_keep_their_behavior(self) -> None:
+        CNKIAdapter.detect_interruption(
+            fixture("cnki_dormant_challenge.html"),
+            url="https://kns.cnki.net/kns8s/search?kw=test",
+        )
+        with self.assertRaisesRegex(SourceActionRequired, "CAPTCHA or security verification"):
+            CNKIAdapter.detect_interruption(
+                fixture("cnki_security_challenge.html"),
+                url="https://kns.cnki.net/security-check",
+            )
 
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):

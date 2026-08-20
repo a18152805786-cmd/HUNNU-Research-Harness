@@ -47,6 +47,15 @@ from .commands import (
 MCP_VERSION_BASELINE = "0.0.79"
 
 
+# This is intentionally a fixed, read-only observation expression.  The
+# Harness does not expose arbitrary page evaluation to adapters; it asks the
+# already-running MCP page only for the rendered document HTML required by
+# the existing BrowserObservation contract.
+_FULL_HTML_OBSERVATION_FUNCTION = (
+    "() => document.documentElement ? document.documentElement.outerHTML : ''"
+)
+
+
 MCP_TOOL_ALLOWLIST = frozenset(
     {
         "browser_click",
@@ -54,6 +63,7 @@ MCP_TOOL_ALLOWLIST = frozenset(
         "browser_navigate",
         "browser_snapshot",
         "browser_tabs",
+        "browser_evaluate",
     }
 )
 
@@ -341,10 +351,6 @@ class MCPExecutor:
         page: PageHandle,
         generation: int,
     ) -> BrowserObservation:
-        if command.include_html:
-            raise ObservationUnavailable(
-                "Playwright MCP exposes a structured accessibility snapshot, not full HTML"
-            )
         probe_requested = bool(command.text_probes)
         reply = await self._call_tool(
             "browser_snapshot",
@@ -353,6 +359,24 @@ class MCPExecutor:
                 "depth": 12 if probe_requested else 10,
             },
         )
+        html: str | None = None
+        if command.include_html:
+            try:
+                html_reply = await self._call_tool(
+                    "browser_evaluate",
+                    {"function": _FULL_HTML_OBSERVATION_FUNCTION},
+                )
+            except MCPUnsupportedCapability as exc:
+                # Preserve the adapter's existing structured-snapshot fallback
+                # when a host predates the fixed read-only observation bridge.
+                raise ObservationUnavailable(
+                    "Playwright MCP host does not expose the fixed full-HTML observation bridge"
+                ) from exc
+            html = self._parse_evaluated_html(html_reply.text)
+            if html is None:
+                raise ObservationUnavailable(
+                    "Playwright MCP returned no usable full-HTML observation"
+                )
         url, title = self._page_info(reply.text)
         target_observations, probes_complete, probes_truncated = self._parse_probe_observations(
             reply.text,
@@ -377,23 +401,45 @@ class MCPExecutor:
             generation=generation,
             url=self._last_page_url,
             title=self._last_page_title,
-            html=None,
+            html=html,
             visible_text=None,
             structured_content=reply.text,
             target_observations=target_observations,
             inspection_complete=probes_complete,
             metadata={
                 "Backend": "MCPExecutor",
-                "MCPTool": "browser_snapshot",
+                "MCPTool": "browser_snapshot+browser_evaluate" if html is not None else "browser_snapshot",
                 "ObservationId": observation_id,
                 "SnapshotRefCount": len(refs),
                 "SnapshotRefsScope": "single-observation-and-generation",
-                "FullHTML": False,
+                "FullHTML": html is not None,
                 "TextProbeCount": len(command.text_probes),
                 "ProbeObservationCount": len(target_observations),
                 "ProbeMatchesTruncated": probes_truncated,
             },
         )
+
+    @staticmethod
+    def _parse_evaluated_html(text: str) -> str | None:
+        """Extract the JSON-encoded result from Playwright MCP evaluate output."""
+
+        result_marker = "### Result"
+        code_marker = "### Ran Playwright code"
+        if result_marker not in text:
+            return None
+        payload = text.split(result_marker, 1)[1]
+        if code_marker in payload:
+            payload = payload.split(code_marker, 1)[0]
+        payload = payload.strip()
+        if not payload:
+            return None
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            value = payload
+        if not isinstance(value, str):
+            return None
+        return value
 
     @staticmethod
     def _parse_probe_observations(

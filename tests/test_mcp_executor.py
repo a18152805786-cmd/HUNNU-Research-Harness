@@ -52,6 +52,12 @@ class _FakeMCPClient:
                 "### Page\n- Page URL: "
                 f"{arguments['url']}\n- Page Title: Controlled"
             )
+        if tool == "browser_evaluate":
+            return _result(
+                '### Result\n"<html><head><title>Controlled</title></head>'
+                '<body><main>controlled</main></body></html>"\n'
+                "### Ran Playwright code\n"
+            )
         if tool == "browser_snapshot":
             status = "clicked" if self.clicked else "not clicked"
             return _result(
@@ -98,8 +104,18 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
                 "browser_snapshot",
             ])
 
-            with self.assertRaises(ObservationUnavailable):
-                await executor.execute(ObserveCommand(include_html=True))
+            observed = await executor.execute(ObserveCommand(include_html=True))
+            self.assertEqual(
+                observed.require_html(),
+                "<html><head><title>Controlled</title></head>"
+                "<body><main>controlled</main></body></html>",
+            )
+            self.assertTrue(observed.metadata["FullHTML"])
+            self.assertEqual(client.calls[-1][0], "browser_evaluate")
+            self.assertEqual(
+                client.calls[-1][1]["function"],
+                "() => document.documentElement ? document.documentElement.outerHTML : ''",
+            )
 
     async def test_text_probe_geometry_preserves_far_offscreen_evidence(self) -> None:
         class _ProbeClient(_FakeMCPClient):
