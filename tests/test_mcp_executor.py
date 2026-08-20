@@ -101,6 +101,37 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ObservationUnavailable):
                 await executor.execute(ObserveCommand(include_html=True))
 
+    async def test_text_probe_geometry_preserves_far_offscreen_evidence(self) -> None:
+        class _ProbeClient(_FakeMCPClient):
+            async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                if tool == "browser_snapshot":
+                    self.calls.append((tool, dict(arguments)))
+                    return _result(
+                        "### Page\n- Page URL: https://controlled.test/results\n"
+                        "- Page Title: Controlled\n### Snapshot\n"
+                        "- generic [ref=e1] [box=0,0,1200,800]\n"
+                        "  - generic [ref=e2] [box=15,-999985,188,18]: dormant marker"
+                    )
+                return await super().call(tool, arguments)
+
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
+            client = _ProbeClient()
+            executor = MCPExecutor(client, downloads_dir=Path(temporary))
+            observation = await executor.execute(
+                ObserveCommand(
+                    include_html=False,
+                    include_visible_text=False,
+                    text_probes=(r"dormant marker",),
+                )
+            )
+            self.assertTrue(client.calls[-1][1]["boxes"])
+            self.assertEqual(len(observation.target_observations), 1)
+            evidence = observation.target_observations[0]
+            self.assertEqual(evidence.bounding_box["y"], -999985.0)
+            self.assertIsNone(evidence.playwright_visible)
+            self.assertTrue(evidence.inspection_complete)
+            self.assertTrue(observation.inspection_complete)
+
     async def test_text_target_is_resolved_to_short_lived_mcp_ref(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
             client = _FakeMCPClient()
@@ -111,6 +142,156 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.calls[-2][0], "browser_find")
             self.assertEqual(client.calls[-1][0], "browser_click")
             self.assertEqual(client.calls[-1][1]["target"], "e3")
+
+    async def test_find_context_selects_matching_leaf_instead_of_ancestor(self) -> None:
+        class _PathClient(_FakeMCPClient):
+            async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                if tool == "browser_find":
+                    self.calls.append((tool, dict(arguments)))
+                    return _result(
+                        "### Result\n"
+                        "- generic [ref=e1]\n"
+                        "  - textbox \"Search\" [ref=e2]: Target paper\n"
+                        "  - main [ref=e3]\n"
+                        "    - table [ref=e4]\n"
+                        "      - row [ref=e5]\n"
+                        '        - link "Target paper" [ref=e9] [cursor=pointer]\n'
+                    )
+                return await super().call(tool, arguments)
+
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
+            client = _PathClient()
+            executor = MCPExecutor(client, downloads_dir=Path(temporary))
+            await executor.execute(
+                ClickCommand(BrowserTarget(text="Target paper", exact_text=True))
+            )
+            find_call = next(call for call in client.calls if call[0] == "browser_find")
+            self.assertEqual(find_call[1], {"text": "Target paper"})
+            self.assertEqual(client.calls[-1][0], "browser_click")
+            self.assertEqual(client.calls[-1][1]["target"], "e9")
+
+    async def test_follow_new_page_can_close_a_sole_origin_without_losing_binding(self) -> None:
+        class _PopupClient(_FakeMCPClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pages = [("Search", "http://controlled.test/search")]
+                self.current = 0
+
+            async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append((tool, dict(arguments)))
+                if tool == "browser_tabs":
+                    action = arguments.get("action")
+                    if action == "select":
+                        self.current = int(arguments["index"])
+                    elif action == "close":
+                        closed = int(arguments["index"])
+                        self.pages.pop(closed)
+                        self.current = min(self.current - (self.current > closed), len(self.pages) - 1)
+                    rows = [
+                        f"- {index}: {'(current) ' if index == self.current else ''}"
+                        f"[{title}]({url})"
+                        for index, (title, url) in enumerate(self.pages)
+                    ]
+                    return _result("### Result\n" + "\n".join(rows))
+                if tool == "browser_find":
+                    return _result(
+                        "### Result\n"
+                        "- generic [ref=e1]\n"
+                        '  - link "Target paper" [ref=e9]'
+                    )
+                if tool == "browser_click":
+                    self.pages.append(("Detail", "http://controlled.test/detail"))
+                    self.current = len(self.pages) - 1
+                    return _result(
+                        "### Page\n"
+                        "- Page URL: http://controlled.test/detail\n"
+                        "- Page Title: Detail"
+                    )
+                if tool == "browser_snapshot":
+                    title, url = self.pages[self.current]
+                    return _result(
+                        f"### Page\n- Page URL: {url}\n- Page Title: {title}\n"
+                        "### Snapshot\n- main [ref=e20]"
+                    )
+                raise AssertionError(f"Unexpected MCP tool: {tool} {arguments}")
+
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
+            client = _PopupClient()
+            broker = BrowserSessionBroker(
+                MCPExecutor(client, downloads_dir=Path(temporary)),
+                session_id="follow-popup",
+            )
+            original = (await broker.enumerate_pages())[0]
+            result = await broker.execute(
+                ClickCommand(
+                    BrowserTarget(text="Target paper", exact_text=True),
+                    follow_new_page=True,
+                    close_origin_when_sole_page=True,
+                )
+            )
+            self.assertEqual(result.page, original.handle)
+            self.assertEqual(result.runtime_tab_index, 0)
+            observation = await broker.execute(
+                ObserveCommand(include_html=False, include_visible_text=False)
+            )
+            self.assertEqual(observation.url, "http://controlled.test/detail")
+            self.assertEqual(observation.page_inventory[0].url, "http://controlled.test/detail")
+            pages = await broker.enumerate_pages()
+            self.assertEqual(len(pages), 1)
+            self.assertTrue(any(item.active and item.handle == original.handle for item in pages))
+            self.assertTrue(any(call[1].get("action") == "close" for call in client.calls))
+
+    async def test_navigation_refreshes_broker_inventory_before_identity_checks(self) -> None:
+        class _NavigationClient(_FakeMCPClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.url = "http://controlled.test/origin"
+
+            async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append((tool, dict(arguments)))
+                if tool == "browser_tabs":
+                    return _result(
+                        "### Result\n"
+                        f"- 0: (current) [Controlled]({self.url})"
+                    )
+                if tool == "browser_navigate":
+                    self.url = str(arguments["url"])
+                    return _result(
+                        "### Page\n"
+                        f"- Page URL: {self.url}\n- Page Title: Controlled"
+                    )
+                if tool == "browser_snapshot":
+                    return _result(
+                        "### Page\n"
+                        f"- Page URL: {self.url}\n- Page Title: Controlled\n"
+                        "### Snapshot\n- main [ref=e20]"
+                    )
+                raise AssertionError(f"Unexpected MCP tool: {tool} {arguments}")
+
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-broker-nav-") as temporary:
+            client = _NavigationClient()
+            broker = BrowserSessionBroker(
+                MCPExecutor(client, downloads_dir=Path(temporary)),
+                session_id="navigate-refresh",
+            )
+            original = (await broker.enumerate_pages())[0]
+            navigated = await broker.execute(
+                NavigateCommand("http://controlled.test/search")
+            )
+            self.assertEqual(navigated.page, original.handle)
+            self.assertEqual(navigated.url, "http://controlled.test/search")
+            self.assertEqual(
+                navigated.page_inventory[0].url,
+                "http://controlled.test/search",
+            )
+            observed = await broker.execute(
+                ObserveCommand(include_html=False, include_visible_text=False)
+            )
+            self.assertEqual(observed.url, "http://controlled.test/search")
+            self.assertEqual(
+                observed.page_inventory[0].url,
+                "http://controlled.test/search",
+            )
 
     async def test_download_path_is_materialized_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
@@ -132,6 +313,42 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(artifact.sha256, hashlib.sha256(payload).hexdigest())
             self.assertTrue(artifact.artifact_id.startswith("artifact-"))
             self.assertEqual(artifact.metadata["CompletionSignal"], "downloaded-event+filesystem")
+
+    async def test_pending_download_event_is_bounded_to_one_changed_named_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-pending-") as temporary:
+            root = Path(temporary)
+            payload = b"pending-download-artifact\n"
+
+            class _PendingDownloadClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+
+                        async def complete() -> None:
+                            await asyncio.sleep(0.15)
+                            (root / "Target-paper.pdf").write_bytes(payload)
+
+                        asyncio.create_task(complete())
+                        return _result("### Events\n- Downloading file Target_paper.pdf ...")
+                    return await super().call(tool, arguments)
+
+            executor = MCPExecutor(
+                _PendingDownloadClient(root),
+                downloads_dir=root,
+                max_download_wait_seconds=2.0,
+            )
+            artifact = await executor.execute(
+                DownloadCommand(
+                    target=BrowserTarget(text="Download probe", exact_text=True),
+                    suggested_filename="target.pdf",
+                )
+            )
+            self.assertEqual(artifact.local_path, (root / "Target-paper.pdf").resolve())
+            self.assertEqual(artifact.sha256, hashlib.sha256(payload).hexdigest())
+            self.assertEqual(
+                artifact.metadata["CompletionSignal"],
+                "downloading-event+bounded-directory-watch",
+            )
 
     async def test_missing_download_artifact_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:

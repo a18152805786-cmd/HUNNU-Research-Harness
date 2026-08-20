@@ -401,6 +401,16 @@ class LocalPlaywrightExecutor:
         return first if first is not None else locator
 
     async def _click(self, command: ClickCommand) -> BrowserActionResult:
+        context = self._context or getattr(self._page, "context", None)
+        before_pages: tuple[Any, ...] = ()
+        if command.follow_new_page:
+            pages_value = getattr(context, "pages", None) if context is not None else None
+            if pages_value is None:
+                raise UnsupportedCommand(
+                    "Local browser cannot inspect pages required by follow_new_page"
+                )
+            pages_value = pages_value() if callable(pages_value) else pages_value
+            before_pages = tuple(await _maybe_await(pages_value))
         locator = self._resolve_locator(command.target)
         click = getattr(locator, "click", None)
         if not callable(click):
@@ -409,6 +419,28 @@ class LocalPlaywrightExecutor:
             await _maybe_await(click())
         except Exception as exc:
             raise BrowserCommandError(f"Local browser click failed: {type(exc).__name__}") from exc
+        if command.follow_new_page:
+            pages_value = getattr(context, "pages", ())
+            pages_value = pages_value() if callable(pages_value) else pages_value
+            after_pages = tuple(await _maybe_await(pages_value))
+            new_pages = tuple(
+                candidate
+                for candidate in after_pages
+                if all(candidate is not existing for existing in before_pages)
+            )
+            if len(new_pages) > 1:
+                raise BrowserCommandError(
+                    "Local browser click opened multiple pages; refusing to guess the target page"
+                )
+            if new_pages:
+                self._page = new_pages[0]
+                if command.close_origin_when_sole_page and len(before_pages) == 1:
+                    close = getattr(before_pages[0], "close", None)
+                    if not callable(close):
+                        raise UnsupportedCommand(
+                            "Local browser origin page cannot be closed after followed click"
+                        )
+                    await _maybe_await(close())
         self._generation += 1
         return BrowserActionResult(
             session=self.session,

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 
-from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
+from ...browser.commands import (
+    BrowserTarget,
+    ClickCommand,
+    DownloadCommand,
+    NavigateCommand,
+    ObservationUnavailable,
+    ObserveCommand,
+)
 from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
 from ..cnki_challenge import CNKIChallengeDetector, ChallengeDiagnostic, ChallengeState
@@ -27,6 +35,13 @@ from ..security import sanitize_url
 _DETAIL_PATH_MARKERS = ("/article/abstract", "/detail/detail.aspx", "/kcms/detail/")
 _REJECT_DOWNLOAD_LABELS = ("批量下载", "多篇下载", "相关推荐", "参考文献下载", "整本下载")
 _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "download pdf", "download caj")
+_INSTITUTIONAL_ACCESS_MARKERS = (
+    "当前机构已获得全文访问权限",
+    "机构已获得全文访问权限",
+    "institutional access",
+    "湖南师范大学",
+    "hunan normal university",
+)
 
 
 def _is_cnki_host(hostname: str | None) -> bool:
@@ -65,6 +80,70 @@ def _split_keywords(value: str) -> tuple[str, ...]:
     if value == UNKNOWN:
         return ()
     return tuple(dict.fromkeys(item.strip() for item in re.split(r"[;,；，]+", value) if item.strip()))
+
+
+def _snapshot_unquote(value: str | None) -> str:
+    if value is None:
+        return ""
+    try:
+        return str(json.loads(f'"{value}"'))
+    except (TypeError, json.JSONDecodeError):
+        return value.replace(r'\"', '"').replace(r"\\", "\\")
+
+
+def _snapshot_links(snapshot: str) -> list[tuple[str, str, int, str]]:
+    """Return labelled links from an MCP accessibility snapshot.
+
+    Each tuple contains ``(label, url, line_index, link_line)``.  Unlabelled
+    author links are resolved from the nearby ``text:`` child without exposing
+    or evaluating the live DOM.
+    """
+
+    link_pattern = re.compile(
+        r'^\s*-\s*link(?:\s+"(?P<label>(?:\\.|[^"])*)")?'
+        r'(?:\s+\[[^\]]+\])*\s*:\s*$'
+    )
+    url_pattern = re.compile(r"^\s*-\s*/url:\s*(?P<url>\S.*?)\s*$")
+    text_pattern = re.compile(r"^\s*-\s*text:\s*(?P<text>.+?)\s*$")
+    lines = snapshot.splitlines()
+    links: list[tuple[str, str, int, str]] = []
+    for index, line in enumerate(lines):
+        match = link_pattern.match(line)
+        if not match:
+            continue
+        url = ""
+        url_index = index
+        for candidate_index in range(index + 1, min(index + 4, len(lines))):
+            url_match = url_pattern.match(lines[candidate_index])
+            if url_match:
+                url = url_match.group("url").strip()
+                url_index = candidate_index
+                break
+        if not url:
+            continue
+        label = _snapshot_unquote(match.group("label")).strip()
+        if not label:
+            for candidate_index in range(url_index + 1, min(url_index + 5, len(lines))):
+                text_match = text_pattern.match(lines[candidate_index])
+                if text_match:
+                    label = text_match.group("text").strip().strip('"')
+                    break
+        links.append((re.sub(r"\s+", " ", label).strip(), url, index, line))
+    return links
+
+
+def _snapshot_node_text(line: str) -> str:
+    text_match = re.match(r"^\s*-\s*text:\s*(.+?)\s*$", line)
+    if text_match:
+        return text_match.group(1).strip().strip('"')
+    suffix_match = re.search(r"\](?::\s*(.+?))\s*$", line)
+    if suffix_match:
+        return suffix_match.group(1).strip().strip('"')
+    labelled_match = re.match(
+        r'^\s*-\s*(?:generic|paragraph|heading|cell)\s+"(?P<label>(?:\\.|[^"])*)"',
+        line,
+    )
+    return _snapshot_unquote(labelled_match.group("label")).strip() if labelled_match else ""
 
 
 class _CNKIHTMLParser(_ScienceDirectHTMLParser):
@@ -265,6 +344,76 @@ class CNKIAdapter(LiteratureSourceAdapter):
         return records
 
     @classmethod
+    def parse_search_results_snapshot(
+        cls,
+        snapshot: str,
+        *,
+        query: str,
+        source_url: str = "https://kns.cnki.net/kns8s/defaultresult/index",
+        max_results: int = 30,
+    ) -> list[LiteratureRecord]:
+        """Parse bounded CNKI result links from an MCP accessibility snapshot."""
+
+        records: list[LiteratureRecord] = []
+        seen: set[str] = set()
+        lines = snapshot.splitlines()
+        title_headers = tuple(
+            index
+            for index, line in enumerate(lines)
+            if re.search(r'^\s*-\s*columnheader\s+"题名"', line)
+        )
+        if not title_headers:
+            return records
+        result_start = title_headers[-1]
+        result_end = next(
+            (
+                index
+                for index in range(result_start + 1, len(lines))
+                if re.match(r"^\s*-\s*contentinfo\b", lines[index])
+            ),
+            len(lines),
+        )
+        for title, href, line_index, _link_line in _snapshot_links(snapshot):
+            if not (result_start < line_index < result_end):
+                continue
+            absolute = urljoin(source_url, href)
+            parsed = urlsplit(absolute)
+            if not _is_cnki_host(parsed.hostname) or not any(
+                marker in parsed.path.casefold() for marker in _DETAIL_PATH_MARKERS
+            ):
+                continue
+            title = re.sub(r"\s+", " ", title).strip()
+            if (
+                not title
+                or title.isdigit()
+                or any(label in title for label in _REJECT_DOWNLOAD_LABELS)
+                or "anchor=citnet" in parsed.query.casefold()
+            ):
+                continue
+            stable_identifier = _stable_identifier(absolute)
+            identity = stable_identifier if stable_identifier != UNKNOWN else normalize_title(title)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            paper_id = stable_paper_id(title=title)
+            records.append(
+                LiteratureRecord(
+                    paper_id=paper_id,
+                    title=title,
+                    language="zh" if re.search(r"[\u3400-\u9fff]", title) else UNKNOWN,
+                    source_database=cls.name,
+                    source_page=sanitize_url(absolute),
+                    navigation_url=absolute,
+                    stable_identifier=stable_identifier,
+                    search_query=query,
+                    canonical_paper_id=paper_id,
+                )
+            )
+            if len(records) >= max_results:
+                break
+        return records
+
+    @classmethod
     def parse_article_html(
         cls,
         html: str,
@@ -370,6 +519,136 @@ class CNKIAdapter(LiteratureSourceAdapter):
             canonical_paper_id=paper_id,
         )
 
+    @classmethod
+    def parse_article_snapshot(
+        cls,
+        snapshot: str,
+        *,
+        source_url: str,
+        search_query: str = UNKNOWN,
+    ) -> LiteratureRecord:
+        """Extract CNKI article metadata from the structured MCP snapshot."""
+
+        lines = snapshot.splitlines()
+        title = UNKNOWN
+        title_index = -1
+        title_pattern = re.compile(
+            r'^\s*-\s*heading\s+"(?P<title>(?:\\.|[^"])*)"'
+            r'(?:\s+\[[^\]]+\])*\s*\[level=1\]'
+        )
+        for index, line in enumerate(lines):
+            match = title_pattern.match(line)
+            if match:
+                title = re.sub(r"\s+", " ", _snapshot_unquote(match.group("title"))).strip()
+                title_index = index
+                break
+        if title == UNKNOWN:
+            raise SourceLayoutChanged("CNKI structured article snapshot has no level-1 target title")
+
+        links = _snapshot_links(snapshot)
+        abstract_marker = next((i for i, line in enumerate(lines) if "摘要：" in line or "摘要:" in line), len(lines))
+        keyword_marker = next(
+            (i for i, line in enumerate(lines) if i >= abstract_marker and ("关键词：" in line or "关键词:" in line)),
+            len(lines),
+        )
+
+        authors: list[str] = []
+        keywords: list[str] = []
+        journal = UNKNOWN
+        for label, href, line_index, _link_line in links:
+            parsed = urlsplit(urljoin(source_url, href))
+            path = parsed.path.casefold()
+            if "/author/detail" in path and title_index < line_index < abstract_marker and label:
+                clean = re.sub(r"\d+$", "", label).strip()
+                if clean and clean not in authors:
+                    authors.append(clean)
+            elif "/keyword/detail" in path and label:
+                clean = label.strip().rstrip(";；,， ")
+                if clean and clean not in keywords:
+                    keywords.append(clean)
+            elif journal == UNKNOWN and line_index < title_index and parsed.hostname and parsed.hostname.casefold().endswith("cnki.net"):
+                if "/knavi/detail" in path and label and "数据库收录" not in label:
+                    journal = label.rstrip(" .。·").strip()
+
+        abstract_parts: list[str] = []
+        if abstract_marker < len(lines):
+            marker_line = _snapshot_node_text(lines[abstract_marker])
+            inline = re.sub(r"^.*?摘要\s*[：:]\s*", "", marker_line).strip()
+            if inline and inline != marker_line:
+                abstract_parts.append(inline)
+            for line in lines[abstract_marker + 1 : keyword_marker]:
+                value = _snapshot_node_text(line)
+                if value and value not in {"摘要", "摘要：", "摘要:"}:
+                    abstract_parts.append(value)
+        abstract = re.sub(r"\s+", " ", " ".join(abstract_parts)).strip() or UNKNOWN
+
+        header_start = max(0, title_index - 40)
+        header_end = min(len(lines), abstract_marker)
+        header_text = re.sub(
+            r"\s+",
+            " ",
+            " ".join(filter(None, (_snapshot_node_text(line) for line in lines[header_start:header_end]))),
+        ).strip()
+        body_text = re.sub(
+            r"\s+",
+            " ",
+            " ".join(filter(None, (_snapshot_node_text(line) for line in lines))),
+        ).strip()
+
+        date_match = re.search(
+            r"(?:网络首发时间|出版日期|发表时间)\s*[：:]\s*((?:18|19|20|21)\d{2}(?:[-/.]\d{1,2})?(?:[-/.]\d{1,2})?)",
+            header_text,
+        )
+        source_match = re.search(
+            r"((?:18|19|20|21)\d{2})\s*\(([^)]+)\)\s*[：:]\s*([0-9]+(?:\s*[-–—]\s*[0-9]+)?)",
+            header_text,
+        )
+        date = date_match.group(1) if date_match else (source_match.group(1) if source_match else UNKNOWN)
+        year_match = re.search(r"(?:18|19|20|21)\d{2}", date)
+        year = year_match.group(0) if year_match else UNKNOWN
+        issue = source_match.group(2).strip() if source_match else UNKNOWN
+        pages = (
+            re.sub(r"\s+", "", source_match.group(3)).replace("–", "-").replace("—", "-")
+            if source_match
+            else UNKNOWN
+        )
+        volume_match = re.search(r"(?:第\s*)?(\d+)\s*卷", header_text)
+        volume = volume_match.group(1) if volume_match else UNKNOWN
+
+        doi_match = re.search(r"\b10\.\d{4,9}/[^\s<>\]\[\"'，；;]+", body_text, flags=re.IGNORECASE)
+        doi = normalize_doi(doi_match.group(0).rstrip(".。)）")) if doi_match else UNKNOWN
+        issn_match = re.search(r"\b\d{4}-\d{3}[\dXx]\b", body_text)
+        issn = issn_match.group(0).upper() if issn_match else UNKNOWN
+        language = "zh" if re.search(r"[\u3400-\u9fff]", f"{title}{abstract}") else UNKNOWN
+        stable_identifier = _stable_identifier(source_url)
+        publication_type, publication_status = cls._publication_classification(header_text, journal)
+        if "网络首发" in header_text:
+            publication_type = "JournalArticle"
+            publication_status = PublicationStatus.ONLINE_FIRST.value
+        paper_id = stable_paper_id(doi=doi, title=title, year=year, authors=authors)
+        return LiteratureRecord(
+            paper_id=paper_id,
+            title=title,
+            authors=tuple(authors),
+            year=year,
+            journal=journal,
+            volume=volume,
+            issue=issue,
+            pages_or_article_number=pages,
+            doi=doi,
+            issn=issn,
+            language=language,
+            publication_type=publication_type,
+            publication_status=publication_status,
+            abstract=abstract,
+            keywords=tuple(keywords),
+            source_database=cls.name,
+            source_page=sanitize_url(source_url),
+            stable_identifier=stable_identifier,
+            search_query=search_query,
+            canonical_paper_id=paper_id,
+        )
+
     @staticmethod
     def _publication_classification(body: str, journal: str) -> tuple[str, str]:
         if "学位论文" in body:
@@ -460,6 +739,77 @@ class CNKIAdapter(LiteratureSourceAdapter):
             full_text_format=candidate_format,
         )
 
+    @classmethod
+    def check_fulltext_access_snapshot(cls, snapshot: str, *, source_url: str) -> AccessDecision:
+        """Verify a single-paper CNKI full-text control in a structured snapshot."""
+
+        candidates: list[tuple[int, str, str, FullTextFormat]] = []
+        for label, href, _line_index, link_line in _snapshot_links(snapshot):
+            compact = re.sub(r"\s+", "", label).casefold()
+            if any(re.sub(r"\s+", "", marker).casefold() in compact for marker in _REJECT_DOWNLOAD_LABELS):
+                continue
+            if not any(action in compact for action in _DOWNLOAD_ACTIONS):
+                continue
+            if "disabled" in link_line.casefold() or "aria-disabled=true" in link_line.casefold():
+                continue
+            absolute = urljoin(source_url, href) if href else UNKNOWN
+            if absolute != UNKNOWN and not absolute.casefold().startswith("javascript:"):
+                if not _is_cnki_host(urlsplit(absolute).hostname):
+                    continue
+            lower = f"{compact} {href}".casefold()
+            full_text_format = (
+                FullTextFormat.PDF
+                if "pdf" in lower
+                else FullTextFormat.CAJ
+                if any(marker in lower for marker in ("caj", ".nh", ".kdh"))
+                else FullTextFormat.OTHER_AUTHORIZED_FORMAT
+            )
+            preference = {
+                FullTextFormat.PDF: 0,
+                FullTextFormat.CAJ: 1,
+                FullTextFormat.OTHER_AUTHORIZED_FORMAT: 2,
+            }[full_text_format]
+            candidates.append((preference, label, absolute, full_text_format))
+        if not candidates:
+            return AccessDecision(
+                full_text_accessible=False,
+                access_type=AccessType.METADATA_ONLY,
+                authorized_access=False,
+                status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
+                reason="No enabled, official single-paper CNKI full-text control was present",
+                full_text_format=FullTextFormat.UNKNOWN,
+            )
+
+        _preference, label, candidate_url, candidate_format = sorted(candidates, key=lambda item: item[0])[0]
+        body = snapshot.casefold()
+        open_access = any(marker in body for marker in ("开放获取", "open access", "public full text"))
+        institutional_access = any(marker in body for marker in _INSTITUTIONAL_ACCESS_MARKERS)
+        direct_public_file = candidate_url != UNKNOWN and urlsplit(candidate_url).path.casefold().endswith(
+            (".pdf", ".caj", ".nh", ".kdh")
+        )
+        if not (open_access or institutional_access or direct_public_file):
+            return AccessDecision(
+                full_text_accessible=False,
+                access_type=AccessType.METADATA_ONLY,
+                authorized_access=False,
+                status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
+                reason="CNKI exposed a download/order control but no verified institutional, open, or direct public full-text state",
+                download_url=candidate_url,
+                download_locator=label,
+                full_text_format=candidate_format,
+            )
+        access_type = AccessType.INSTITUTIONAL_AUTHENTICATED if institutional_access else AccessType.PUBLIC_FULL_TEXT
+        return AccessDecision(
+            full_text_accessible=True,
+            access_type=access_type,
+            authorized_access=True,
+            status=RunStatus.SUCCESS,
+            reason=f"Official CNKI article page exposed an enabled single-paper {candidate_format.value} control",
+            download_url=candidate_url,
+            download_locator=label,
+            full_text_format=candidate_format,
+        )
+
     @staticmethod
     def identity_matches(search_record: LiteratureRecord, detail_record: LiteratureRecord) -> tuple[bool, str]:
         if search_record.doi != UNKNOWN and detail_record.doi != UNKNOWN:
@@ -470,30 +820,82 @@ class CNKIAdapter(LiteratureSourceAdapter):
         matched = normalize_title(search_record.title) == normalize_title(detail_record.title)
         return matched, "Normalized title match" if matched else "Target title mismatch"
 
-    async def _content(self) -> tuple[str, str]:
+    @staticmethod
+    def _search_input(query: str, request: LiteratureSearchRequest) -> tuple[str, str]:
+        raw = query.strip()
+        author_match = re.fullmatch(r'author:\s*"(.+?)"', raw, flags=re.IGNORECASE)
+        if author_match:
+            return "author", author_match.group(1).strip()
+        unwrapped = raw[1:-1].strip() if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"') else raw
+        if any(normalize_title(unwrapped) == normalize_title(title) for title in request.exact_titles):
+            return "exact_title", unwrapped
+        if any(unwrapped == author for author in request.authors):
+            return "author", unwrapped
+        return "keyword", unwrapped
+
+    async def _content(self) -> tuple[str, str, str]:
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
-        observation = await self.browser.execute(
-            ObserveCommand(
-                include_html=True,
-                text_probes=tuple(pattern.pattern for _, pattern in CNKIChallengeDetector.marker_patterns),
+        probes = tuple(pattern.pattern for _, pattern in CNKIChallengeDetector.marker_patterns)
+        try:
+            observation = await self.browser.execute(
+                ObserveCommand(
+                    include_html=True,
+                    text_probes=probes,
+                )
             )
-        )
+        except ObservationUnavailable:
+            observation = await self.browser.execute(
+                ObserveCommand(
+                    include_html=False,
+                    include_visible_text=False,
+                    text_probes=probes,
+                )
+            )
+            await self._inspect_live_challenge(observation)
+            snapshot = observation.structured_content
+            if not isinstance(snapshot, str) or not snapshot.strip():
+                raise SourceUnavailable("CNKI structured browser snapshot is unavailable")
+            return "snapshot", snapshot, observation.url
         await self._inspect_live_challenge(observation)
-        return observation.require_html(), observation.url
+        return "html", observation.require_html(), observation.url
 
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
-        mode = "exact_title" if query in request.exact_titles else ("author" if query in request.authors else "keyword")
+        mode, search_term = self._search_input(query, request)
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
-        await self.browser.execute(NavigateCommand(self.build_search_url(query, mode=mode)))
-        html, current_url = await self._content()
-        results = self.parse_search_results_html(
-            html,
+        await self.browser.execute(NavigateCommand(self.build_search_url(search_term, mode=mode)))
+        content_kind, content, current_url = await self._content()
+        parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
+        result_limit = min(request.max_results_per_source, request.max_search_results)
+        parse_limit = (
+            min(30, max(10, result_limit * 5))
+            if mode == "exact_title"
+            else result_limit
+        )
+        results = parser(
+            content,
             query=query,
             source_url=current_url,
-            max_results=min(request.max_results_per_source, request.max_search_results),
+            max_results=parse_limit,
         )
+        if mode == "exact_title":
+            wanted = normalize_title(search_term)
+            results = [record for record in results if normalize_title(record.title) == wanted]
+        results = results[:result_limit]
+        if not results and content_kind == "snapshot" and "共找到" not in content:
+            content_kind, content, current_url = await self._content()
+            parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
+            results = parser(
+                content,
+                query=query,
+                source_url=current_url,
+                max_results=parse_limit,
+            )
+            if mode == "exact_title":
+                wanted = normalize_title(search_term)
+                results = [record for record in results if normalize_title(record.title) == wanted]
+            results = results[:result_limit]
         if not results and not _is_cnki_host(urlsplit(current_url).hostname):
             raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
         return results
@@ -507,11 +909,46 @@ class CNKIAdapter(LiteratureSourceAdapter):
         self._detail_record = None
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
-        await self.browser.execute(NavigateCommand(target_url))
+        # CNKI result-detail URLs carry short-lived signed query parameters.
+        # Reusing one after screening can return a genuine CNKI 404 even though
+        # the record still exists.  Refresh the exact-title result page and
+        # click its newly observed link instead of replaying the stale URL.
+        await self.browser.execute(NavigateCommand(self.build_search_url(record.title, mode="exact_title")))
+        content_kind, content, current_url = await self._content()
+        parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
+        fresh_records = parser(
+            content,
+            query=record.search_query if record.search_query != UNKNOWN else record.title,
+            source_url=current_url,
+            max_results=10,
+        )
+        if not fresh_records and content_kind == "snapshot" and "共找到" not in content:
+            content_kind, content, current_url = await self._content()
+            parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
+            fresh_records = parser(
+                content,
+                query=record.search_query if record.search_query != UNKNOWN else record.title,
+                source_url=current_url,
+                max_results=10,
+            )
+        fresh_record = next(
+            (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),
+            None,
+        )
+        if fresh_record is None:
+            raise SourceLayoutChanged("CNKI exact-title refresh could not relock the requested result")
+        await self.browser.execute(
+            ClickCommand(
+                BrowserTarget(text=fresh_record.title, exact_text=True),
+                follow_new_page=True,
+                close_origin_when_sole_page=True,
+            )
+        )
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
-        html, current_url = await self._content()
-        record = self.parse_article_html(html, source_url=current_url, search_query=search_query)
+        content_kind, content, current_url = await self._content()
+        parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
+        record = parser(content, source_url=current_url, search_query=search_query)
         if self._expected_record is not None:
             matches, reason = self.identity_matches(self._expected_record, record)
             if not matches:
@@ -523,23 +960,27 @@ class CNKIAdapter(LiteratureSourceAdapter):
         return record
 
     async def extract_abstract(self) -> str:
-        html, current_url = await self._content()
-        return self.parse_article_html(html, source_url=current_url).abstract
+        content_kind, content, current_url = await self._content()
+        parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
+        return parser(content, source_url=current_url).abstract
 
     async def check_fulltext_access(self) -> AccessDecision:
-        html, current_url = await self._content()
+        content_kind, content, current_url = await self._content()
+        article_parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
         if self._expected_record is not None:
-            detail = self.parse_article_html(html, source_url=current_url, search_query=self._expected_record.search_query)
+            detail = article_parser(content, source_url=current_url, search_query=self._expected_record.search_query)
             matches, reason = self.identity_matches(self._expected_record, detail)
             if not matches:
                 raise SourceLayoutChanged(f"CNKI target identity lock failed before access check: {reason}")
-        return self.check_fulltext_access_html(html, source_url=current_url)
+        access_parser = self.check_fulltext_access_html if content_kind == "html" else self.check_fulltext_access_snapshot
+        return access_parser(content, source_url=current_url)
 
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
         if not access.full_text_accessible or not access.authorized_access:
             raise PermissionError("FULLTEXT_NOT_AUTHORIZED")
-        html, current_url = await self._content()
-        detail = self.parse_article_html(html, source_url=current_url, search_query=record.search_query)
+        content_kind, content, current_url = await self._content()
+        parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
+        detail = parser(content, source_url=current_url, search_query=record.search_query)
         matches, reason = self.identity_matches(record, detail)
         if not matches:
             raise SourceLayoutChanged(f"CNKI target identity lock failed before download: {reason}")
@@ -554,8 +995,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
             artifact = await self.browser.execute(
                 DownloadCommand(
                     target=BrowserTarget(
-                        css="a, button",
-                        text_regex=rf"^\s*{re.escape(label)}\s*$",
+                        text=label,
+                        exact_text=True,
                     ),
                     suggested_filename=f"{record.paper_id}{suffix}",
                 )

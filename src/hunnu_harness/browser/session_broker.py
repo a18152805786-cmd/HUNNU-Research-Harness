@@ -20,7 +20,9 @@ from .commands import (
     BrowserCommandResult,
     BrowserObservation,
     BrowserPageSummary,
+    ClickCommand,
     DownloadArtifact,
+    NavigateCommand,
     ObserveCommand,
     PageHandle,
     SessionHandle,
@@ -156,6 +158,25 @@ class BrowserSessionBroker:
                 generation=self._generation,
                 runtime_tab_index=binding.summary.index,
             )
+            if (
+                isinstance(command, ClickCommand)
+                and command.follow_new_page
+                and isinstance(result, BrowserActionResult)
+                and result.runtime_tab_index is not None
+            ):
+                binding = await self._refresh_action_page(
+                    binding,
+                    runtime_tab_index=result.runtime_tab_index,
+                )
+            elif isinstance(command, NavigateCommand):
+                # Navigation can replace the document in-place without
+                # changing its runtime tab index.  Refresh the inventory now
+                # so the following identity check cannot compare the new
+                # document against the stale pre-navigation URL.
+                binding = await self._refresh_action_page(
+                    binding,
+                    runtime_tab_index=binding.summary.index,
+                )
         except MCPConnectionError:
             self.invalidate("MCP connection state became unknown")
             raise
@@ -165,6 +186,56 @@ class BrowserSessionBroker:
             # current mapping remains active for an explicit retry.
             raise
         return self._decorate_result(result, binding)
+
+    async def _refresh_action_page(
+        self,
+        binding: _PageBinding,
+        *,
+        runtime_tab_index: int,
+    ) -> _PageBinding:
+        """Refresh a logical handle after navigation or a followed click.
+
+        For a followed click, the origin page remains available under a new
+        logical handle.  For an in-place navigation, the same runtime index is
+        refreshed without creating a duplicate origin binding.
+        """
+
+        pages = await self.executor.list_pages()
+        by_index = {summary.index: summary for summary in pages}
+        target_summary = by_index.get(runtime_tab_index)
+        if target_summary is None:
+            self.invalidate("followed MCP page disappeared before broker remap")
+            raise SessionUnavailable("Followed MCP page is absent from the current inventory")
+        for other in self._bindings.values():
+            if other.handle != binding.handle and other.summary.index == runtime_tab_index:
+                self.invalidate("followed MCP page collides with an existing logical binding")
+                raise SessionUnavailable("Followed MCP page is not a unique new-page mapping")
+
+        new_bindings: dict[str, _PageBinding] = {}
+        for other in self._bindings.values():
+            if other.handle == binding.handle:
+                continue
+            refreshed = by_index.get(other.summary.index)
+            if refreshed is None:
+                self.invalidate("an unrelated MCP page disappeared during followed click")
+                raise SessionUnavailable("Existing MCP page mapping cannot be safely preserved")
+            new_bindings[other.handle.value] = _PageBinding(other.handle, refreshed)
+
+        followed_binding = _PageBinding(binding.handle, target_summary)
+        new_bindings[binding.handle.value] = followed_binding
+        origin_summary = by_index.get(binding.summary.index)
+        if origin_summary is not None and binding.summary.index != runtime_tab_index:
+            origin_handle = PageHandle(
+                f"mcp-page-{origin_summary.index}-{uuid.uuid4().hex[:8]}",
+                session=self._session,
+                generation=self._generation,
+            )
+            new_bindings[origin_handle.value] = _PageBinding(origin_handle, origin_summary)
+
+        self._bindings = new_bindings
+        self._active_page_id = binding.handle.value
+        self._page_handle = binding.handle
+        return followed_binding
 
     async def enumerate_pages(self) -> tuple[LogicalPage, ...]:
         """Refresh page inventory and return logical handles, not tab IDs."""

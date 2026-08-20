@@ -1,0 +1,33 @@
+### Page
+- Page URL: https://kns.cnki.net/kns8s/defaultresult/index?korder=TI&kw=target
+- Page Title: 检索-中国知网
+### Snapshot
+- generic [active] [ref=e1]:
+  - generic [ref=e2]: 共找到 2 条结果
+  - generic "推广" [ref=e2a]:
+    - link "1484551487634800640" [ref=e2b]:
+      - /url: https://kns.cnki.net/kcms2/article/abstract?v=advertisement-token
+  - table [ref=e3]:
+    - rowgroup [ref=e4]:
+      - row [ref=e5]:
+        - columnheader "题名" [ref=e6]
+        - columnheader "作者" [ref=e7]
+    - rowgroup [ref=e8]:
+      - row [ref=e9]:
+        - cell "1" [ref=e10]
+        - cell [ref=e11]:
+          - link "投贷联动、媒体监督与科技企业AI漂洗" [ref=e12]:
+            - /url: https://kns.cnki.net/kcms2/article/abstract?dbcode=CJFQ&filename=CJKX202602009
+        - cell [ref=e13]:
+          - link "李媛媛" [ref=e14]:
+            - /url: https://kns.cnki.net/kcms2/author/detail?v=redacted
+        - cell "6" [ref=e14a]:
+          - link "6" [ref=e14b]:
+            - /url: https://kns.cnki.net/kcms2/article/abstract?dbcode=CJFQ&filename=CJKX202602009&anchor=citnet
+      - row [ref=e15]:
+        - cell "2" [ref=e16]
+        - cell "不相关论文" [ref=e17]:
+          - link "不相关论文" [ref=e18]:
+            - /url: https://kns.cnki.net/kcms2/article/abstract?dbcode=CJFQ&filename=OTHER001
+  - generic [ref=e19] [box=0,-1000000,218,279]:
+    - generic [ref=e20] [box=15,-999985,188,18]: 拖动下方拼图完成验证

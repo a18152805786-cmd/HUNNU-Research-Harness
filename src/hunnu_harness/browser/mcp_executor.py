@@ -30,6 +30,7 @@ from .commands import (
     BrowserObservation,
     BrowserPageSummary,
     BrowserTarget,
+    BrowserTargetObservation,
     ClickCommand,
     DownloadArtifact,
     DownloadCommand,
@@ -254,7 +255,13 @@ class MCPExecutor:
         if isinstance(command, ObserveCommand):
             return await self._observe(command, session=session, page=page, generation=generation)
         if isinstance(command, ClickCommand):
-            return await self._click(command, session=session, page=page, generation=generation)
+            return await self._click(
+                command,
+                session=session,
+                page=page,
+                generation=generation,
+                runtime_tab_index=runtime_tab_index,
+            )
         if isinstance(command, DownloadCommand):
             return await self._download(command, session=session, page=page, generation=generation)
         raise MCPUnsupportedCapability(f"Unhandled MCP command {type(command).__name__}")
@@ -338,14 +345,21 @@ class MCPExecutor:
             raise ObservationUnavailable(
                 "Playwright MCP exposes a structured accessibility snapshot, not full HTML"
             )
+        probe_requested = bool(command.text_probes)
         reply = await self._call_tool(
             "browser_snapshot",
             {
-                "boxes": False,
-                "depth": 10,
+                "boxes": probe_requested,
+                "depth": 12 if probe_requested else 10,
             },
         )
         url, title = self._page_info(reply.text)
+        target_observations, probes_complete, probes_truncated = self._parse_probe_observations(
+            reply.text,
+            command.text_probes,
+            max_matches=command.max_probe_matches,
+            frame_url=url or self._last_page_url,
+        )
         observation_id = f"observation-{uuid.uuid4().hex}"
         refs = frozenset(re.findall(r"\[ref=([^\]]+)\]", reply.text))
         self._last_snapshot = _SnapshotBinding(
@@ -366,7 +380,8 @@ class MCPExecutor:
             html=None,
             visible_text=None,
             structured_content=reply.text,
-            inspection_complete=True,
+            target_observations=target_observations,
+            inspection_complete=probes_complete,
             metadata={
                 "Backend": "MCPExecutor",
                 "MCPTool": "browser_snapshot",
@@ -374,8 +389,78 @@ class MCPExecutor:
                 "SnapshotRefCount": len(refs),
                 "SnapshotRefsScope": "single-observation-and-generation",
                 "FullHTML": False,
+                "TextProbeCount": len(command.text_probes),
+                "ProbeObservationCount": len(target_observations),
+                "ProbeMatchesTruncated": probes_truncated,
             },
         )
+
+    @staticmethod
+    def _parse_probe_observations(
+        snapshot: str,
+        probes: tuple[str, ...],
+        *,
+        max_matches: int,
+        frame_url: str,
+    ) -> tuple[tuple[BrowserTargetObservation, ...], bool, bool]:
+        """Extract bounded, source-neutral text-probe geometry from a snapshot.
+
+        Playwright MCP's ``boxes`` snapshot annotates nodes with viewport-relative
+        ``[box=x,y,width,height]`` values.  Those coordinates are sufficient to
+        prove that a node wholly above or left of the viewport is off-screen.
+        They are not sufficient to prove render visibility for an on-screen
+        node, so ``playwright_visible`` deliberately remains unknown and the
+        source detector can fail closed.
+        """
+
+        if not probes:
+            return (), True, False
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+        box_pattern = re.compile(
+            rf"\[box=(?P<x>{number}),(?P<y>{number}),(?P<width>{number}),(?P<height>{number})\]"
+        )
+        lines = snapshot.splitlines()
+        observations: list[BrowserTargetObservation] = []
+        inspection_complete = True
+        truncated = False
+        for probe in probes:
+            pattern = re.compile(probe)
+            matching_lines = [line for line in lines if pattern.search(line)]
+            if len(matching_lines) > max_matches:
+                matching_lines = matching_lines[:max_matches]
+                inspection_complete = False
+                truncated = True
+            for line in matching_lines:
+                box_match = box_pattern.search(line)
+                bounding_box: dict[str, float] | None = None
+                if box_match:
+                    bounding_box = {
+                        key: float(box_match.group(key))
+                        for key in ("x", "y", "width", "height")
+                    }
+                else:
+                    inspection_complete = False
+                marker_match = pattern.search(line)
+                observations.append(
+                    BrowserTargetObservation(
+                        marker=marker_match.group(0) if marker_match else probe,
+                        frame_url=frame_url or "unknown",
+                        playwright_visible=None,
+                        bounding_box=bounding_box,
+                        client_rect=bounding_box,
+                        client_width=(bounding_box or {}).get("width"),
+                        client_height=(bounding_box or {}).get("height"),
+                        # MCP does not expose viewport dimensions through the
+                        # allow-listed command surface. A large positive bound
+                        # preserves the one fact we can prove from coordinates:
+                        # nodes wholly above/left of zero do not intersect it.
+                        viewport_width=1_000_000,
+                        viewport_height=1_000_000,
+                        frame_viewport_visible=True,
+                        inspection_complete=box_match is not None,
+                    )
+                )
+        return tuple(observations), inspection_complete, truncated
 
     async def _click(
         self,
@@ -384,13 +469,56 @@ class MCPExecutor:
         session: SessionHandle,
         page: PageHandle,
         generation: int,
+        runtime_tab_index: int,
     ) -> BrowserActionResult:
+        before_pages: tuple[BrowserPageSummary, ...] = ()
+        if command.follow_new_page:
+            before_pages = await self.list_pages()
+            await self.select_runtime_page(runtime_tab_index)
         target, description = await self._resolve_target(command.target, session=session, page=page, generation=generation)
         reply = await self._call_tool(
             "browser_click",
             {"target": target, "element": description},
         )
         url, _title = self._page_info(reply.text)
+        followed_index = runtime_tab_index
+        if command.follow_new_page:
+            after_pages = await self.list_pages()
+            before_indexes = {item.index for item in before_pages}
+            new_pages = tuple(item for item in after_pages if item.index not in before_indexes)
+            if len(new_pages) > 1:
+                raise MCPProtocolError(
+                    "MCP click opened multiple pages; refusing to guess which page belongs to the target"
+                )
+            if new_pages:
+                followed = new_pages[0]
+                if command.close_origin_when_sole_page and len(before_pages) == 1:
+                    await self._call_tool(
+                        "browser_tabs",
+                        {"action": "close", "index": runtime_tab_index},
+                    )
+                    remaining_pages = await self.list_pages()
+                    if len(remaining_pages) != 1:
+                        raise MCPProtocolError(
+                            "MCP sole-page origin close did not leave one followed page"
+                        )
+                    followed = remaining_pages[0]
+                followed_index = followed.index
+                await self.select_runtime_page(followed_index)
+                url = followed.url or url
+            elif self._current_page_index != runtime_tab_index:
+                raise MCPProtocolError(
+                    "MCP click changed to an existing page without a unique new-page identity"
+                )
+            else:
+                followed = next(
+                    (item for item in after_pages if item.index == runtime_tab_index),
+                    None,
+                )
+                if followed is None:
+                    raise MCPProtocolError("MCP click removed the active page unexpectedly")
+                url = followed.url or url
+        self._last_snapshot = None
         self._last_page_url = url or self._last_page_url
         return BrowserActionResult(
             session=session,
@@ -398,6 +526,7 @@ class MCPExecutor:
             generation=generation,
             action="click",
             url=self._last_page_url,
+            runtime_tab_index=followed_index,
         )
 
     async def _download(
@@ -413,16 +542,27 @@ class MCPExecutor:
                 "MCP generic click/download is not an authorized response-capture implementation"
             )
         target, description = await self._resolve_target(command.target, session=session, page=page, generation=generation)
+        baseline = self._download_directory_state()
         reply = await self._call_tool(
             "browser_click",
             {"target": target, "element": description},
         )
         raw_path = self._download_path(reply.text)
         if raw_path is None:
-            raise MCPProtocolError(
-                "MCP click did not return a completed download path; refusing to infer an artifact"
+            pending_name = self._pending_download_name(reply.text)
+            if pending_name is None:
+                raise MCPProtocolError(
+                    "MCP click did not return a completed download path or a bounded pending-download name"
+                )
+            candidate = await self._wait_for_pending_artifact(
+                pending_name,
+                baseline=baseline,
+                timeout_ms=command.timeout_ms,
             )
-        candidate = await self._wait_for_artifact(raw_path, timeout_ms=command.timeout_ms)
+            completion_signal = "downloading-event+bounded-directory-watch"
+        else:
+            candidate = await self._wait_for_artifact(raw_path, timeout_ms=command.timeout_ms)
+            completion_signal = "downloaded-event+filesystem"
         return DownloadArtifact.from_path(
             candidate,
             suggested_filename=command.suggested_filename,
@@ -432,7 +572,7 @@ class MCPExecutor:
                 "Backend": "MCPExecutor",
                 "MCPTool": "browser_click",
                 "RawReturnedPath": raw_path,
-                "CompletionSignal": "downloaded-event+filesystem",
+                "CompletionSignal": completion_signal,
                 "MCPArtifactId": None,
             },
         )
@@ -468,19 +608,16 @@ class MCPExecutor:
 
         if target.text is None and target.text_regex is None:
             raise MCPUnsupportedCapability("MCP target has no representable selector")
-        arguments: dict[str, Any]
         if target.text_regex is not None:
-            pattern = target.text_regex
+            arguments: dict[str, Any] = {"regex": target.text_regex}
         else:
-            pattern = re.escape(target.text or "") if target.exact_text else None
-        if pattern is not None:
-            if target.exact_text:
-                pattern = f"^(?:{pattern})$"
-            arguments = {"regex": pattern}
-        else:
+            # ``browser_find`` searches the serialized snapshot node, so a
+            # fully anchored regex cannot match a labelled line such as
+            # ``link \"Title\" [ref=...]``.  Use its bounded text lookup and
+            # enforce exactness locally against the parsed accessible label.
             arguments = {"text": target.text}
         reply = await self._call_tool("browser_find", arguments)
-        refs = tuple(dict.fromkeys(re.findall(r"\[ref=([^\]]+)\]", reply.text)))
+        refs = self._matching_find_refs(reply.text, target)
         if not refs:
             raise MCPProtocolError("MCP browser_find returned no executable snapshot ref")
         if target.occurrence >= len(refs):
@@ -497,6 +634,72 @@ class MCPExecutor:
         )
         chosen = refs[target.occurrence]
         return chosen, target.text or target.text_regex or chosen
+
+    @staticmethod
+    def _matching_find_refs(text: str, target: BrowserTarget) -> tuple[str, ...]:
+        """Return refs attached to matching nodes, excluding path ancestors.
+
+        ``browser_find`` returns each match under its full accessibility path.
+        Harvesting every ref from that output can select a root container or a
+        search box instead of the requested link.  Only refs on lines whose
+        accessible label actually matches the requested text are executable.
+        """
+
+        wanted_text = re.sub(r"\s+", " ", target.text or "").strip()
+        wanted_regex = re.compile(target.text_regex) if target.text_regex is not None else None
+
+        def label_matches(value: str) -> bool:
+            candidate = re.sub(r"\s+", " ", value).strip()
+            if wanted_regex is not None:
+                return wanted_regex.search(candidate) is not None
+            if target.exact_text:
+                return candidate == wanted_text
+            return wanted_text.casefold() in candidate.casefold()
+
+        all_refs: list[str] = []
+        matched_refs: list[tuple[int, str]] = []
+        for line in text.splitlines():
+            ref_match = re.search(r"\[ref=([^\]]+)\]", line)
+            if ref_match is None:
+                continue
+            ref = ref_match.group(1)
+            all_refs.append(ref)
+            labels: list[str] = []
+            prefix = line[: ref_match.start()]
+            for quoted in re.finditer(r'"((?:\\.|[^"\\])*)"', prefix):
+                raw = quoted.group(1)
+                try:
+                    labels.append(str(json.loads(f'"{raw}"')))
+                except json.JSONDecodeError:
+                    labels.append(raw.replace(r'\"', '"').replace(r"\\", "\\"))
+            suffix = line[ref_match.end() :]
+            suffix_match = re.search(r"(?:\s*\[[^\]]+\])*\s*:\s*(.+?)\s*$", suffix)
+            if suffix_match:
+                labels.append(suffix_match.group(1).strip().strip('"'))
+            if any(label_matches(label) for label in labels):
+                role_match = re.match(r"^\s*-\s*([A-Za-z]+)\b", line)
+                role = role_match.group(1).casefold() if role_match else ""
+                interactive_roles = {
+                    "button",
+                    "checkbox",
+                    "link",
+                    "menuitem",
+                    "option",
+                    "radio",
+                    "tab",
+                }
+                score = 3 if role in interactive_roles else 1
+                if role not in interactive_roles and "[cursor=pointer]" in line:
+                    score = 2
+                matched_refs.append((score, ref))
+
+        if matched_refs:
+            best_score = max(score for score, _ref in matched_refs)
+            return tuple(
+                dict.fromkeys(ref for score, ref in matched_refs if score == best_score)
+            )
+        unique = tuple(dict.fromkeys(all_refs))
+        return unique if len(unique) == 1 else ()
 
     @staticmethod
     def _page_info(text: str) -> tuple[str, str]:
@@ -538,6 +741,77 @@ class MCPExecutor:
             if match:
                 return match.group(1).strip().strip('"').strip("'")
         return None
+
+    @staticmethod
+    def _pending_download_name(text: str) -> str | None:
+        match = re.search(
+            r"Downloading\s+file\s+(.+?)(?:\s+\.\.\.|\s*$)",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if match is None:
+            return None
+        raw = match.group(1).strip().strip('"').strip("'")
+        name = Path(raw).name
+        return name if name and name == raw else None
+
+    def _download_directory_state(self) -> dict[Path, tuple[int, int]]:
+        if not self.downloads_dir.is_dir():
+            return {}
+        state: dict[Path, tuple[int, int]] = {}
+        for candidate in self.downloads_dir.iterdir():
+            try:
+                if not candidate.is_file():
+                    continue
+                resolved = candidate.resolve()
+                stat = resolved.stat()
+            except OSError:
+                continue
+            state[resolved] = (stat.st_mtime_ns, stat.st_size)
+        return state
+
+    @staticmethod
+    def _normalized_download_name(value: str) -> str:
+        return re.sub(r"[\W_]+", "", Path(value).name, flags=re.UNICODE).casefold()
+
+    async def _wait_for_pending_artifact(
+        self,
+        pending_name: str,
+        *,
+        baseline: dict[Path, tuple[int, int]],
+        timeout_ms: int,
+    ) -> Path:
+        wanted = self._normalized_download_name(pending_name)
+        if not wanted:
+            raise DownloadFailure("MCP pending-download event did not contain a safe filename")
+        deadline = time.monotonic() + min(
+            max(timeout_ms / 1000.0, 0.1),
+            self._max_download_wait_seconds,
+        )
+        previous: tuple[Path, int] | None = None
+        while time.monotonic() <= deadline:
+            current = self._download_directory_state()
+            matches = [
+                (path, metadata)
+                for path, metadata in current.items()
+                if self._normalized_download_name(path.name) == wanted
+                and baseline.get(path) != metadata
+            ]
+            if len(matches) > 1:
+                raise DownloadFailure(
+                    "MCP pending-download event matched more than one changed artifact"
+                )
+            if len(matches) == 1:
+                path, (_mtime_ns, size) = matches[0]
+                if size > 0 and previous == (path, size):
+                    return self._resolve_artifact_path(str(path))
+                previous = (path, size)
+            else:
+                previous = None
+            await asyncio.sleep(0.1)
+        raise DownloadFailure(
+            f"MCP pending download did not stabilize as one approved local artifact: {pending_name}"
+        )
 
     async def _wait_for_artifact(self, raw_path: str, *, timeout_ms: int) -> Path:
         path = self._resolve_artifact_path(raw_path)

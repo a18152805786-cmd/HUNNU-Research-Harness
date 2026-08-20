@@ -6,8 +6,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from hunnu_harness.browser.commands import (
+    BrowserObservation,
+    BrowserTargetObservation,
+    ClickCommand,
+    DownloadArtifact,
+    DownloadCommand,
+    NavigateCommand,
+    ObservationUnavailable,
+    ObserveCommand,
+    PageHandle,
+    SessionHandle,
+)
 from hunnu_harness.literature.adapters.base import SourceActionRequired
 from hunnu_harness.literature.adapters.cnki import CNKIAdapter
+from hunnu_harness.literature.cnki_challenge import ChallengeState
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.adapters.springerlink import SpringerLinkAdapter
 from hunnu_harness.literature.artifacts import LiteratureArtifactWriter
@@ -68,6 +81,44 @@ class CNKIParserTests(unittest.TestCase):
         self.assertIn("korder=TI", CNKIAdapter.build_search_url("人工智能漂洗", mode="exact_title"))
         self.assertIn("korder=AU", CNKIAdapter.build_search_url("张三", mode="author"))
         self.assertIn("korder=SU", CNKIAdapter.build_search_url("盈余管理", mode="keyword"))
+
+    def test_structured_snapshot_search_is_bounded_and_deduplicated(self) -> None:
+        records = CNKIAdapter.parse_search_results_snapshot(
+            fixture("cnki_search_snapshot.yml"),
+            query='"投贷联动、媒体监督与科技企业AI漂洗"',
+            max_results=1,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].title, "投贷联动、媒体监督与科技企业AI漂洗")
+        self.assertEqual(records[0].stable_identifier, "cjfq:CJKX202602009")
+
+    def test_structured_snapshot_extracts_article_metadata(self) -> None:
+        record = CNKIAdapter.parse_article_snapshot(
+            fixture("cnki_article_snapshot.yml"),
+            source_url=(
+                "https://kns.cnki.net/kcms2/article/abstract?"
+                "dbcode=CJFQ&filename=CJKX202602009"
+            ),
+        )
+        self.assertEqual(record.title, "投贷联动、媒体监督与科技企业AI漂洗")
+        self.assertEqual(record.authors, ("李媛媛", "崔梦萦"))
+        self.assertEqual(record.journal, "财经科学")
+        self.assertEqual(record.year, "2026")
+        self.assertEqual(record.issue, "02")
+        self.assertEqual(record.pages_or_article_number, "113-126")
+        self.assertEqual(record.doi, "10.27041/j.cnki.cjkx.2026.02.008")
+        self.assertEqual(record.keywords, ("人工智能", "AI漂洗"))
+        self.assertIn("媒体监督", record.abstract)
+
+    def test_structured_snapshot_access_prefers_authorized_pdf(self) -> None:
+        decision = CNKIAdapter.check_fulltext_access_snapshot(
+            fixture("cnki_article_snapshot.yml"),
+            source_url=ARTICLE_URL,
+        )
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.INSTITUTIONAL_AUTHENTICATED)
+        self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
+        self.assertEqual(decision.download_locator, "PDF下载")
 
     def test_metadata_and_doi_are_normalized(self) -> None:
         record = CNKIAdapter.parse_article_html(
@@ -169,6 +220,139 @@ class CNKIParserTests(unittest.TestCase):
                 "《财经科学》2026年第2期\n投贷联动、媒体监督与科技企业 AI 漂洗\n李媛媛 崔梦萦",
             )
         )
+
+
+class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_snapshot_fallback_ignores_proven_offscreen_challenge(self) -> None:
+        class _StructuredBrowser:
+            navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+            def __init__(self) -> None:
+                self.current_url = "about:blank"
+                self.navigated: list[str] = []
+                self.commands = []
+                self.downloads_dir = None
+                self.session = SessionHandle("snapshot-test")
+                self.page_handle = PageHandle("main", session=self.session)
+
+            def observation(self) -> BrowserObservation:
+                return BrowserObservation(
+                    session=self.session,
+                    page=self.page_handle,
+                    generation=0,
+                    url=self.current_url,
+                    title="检索-中国知网",
+                    structured_content=fixture("cnki_search_snapshot.yml"),
+                    target_observations=(
+                        BrowserTargetObservation(
+                            marker="拖动下方拼图完成验证",
+                            bounding_box={"x": 15, "y": -999985, "width": 188, "height": 18},
+                            client_rect={"x": 15, "y": -999985, "width": 188, "height": 18},
+                            client_width=188,
+                            client_height=18,
+                            viewport_width=1_000_000,
+                            viewport_height=1_000_000,
+                            frame_viewport_visible=True,
+                            inspection_complete=True,
+                        ),
+                    ),
+                )
+
+            async def execute(self, command):
+                self.commands.append(command)
+                if isinstance(command, NavigateCommand):
+                    self.current_url = command.url
+                    self.navigated.append(command.url)
+                    return self.observation()
+                if isinstance(command, ObserveCommand) and command.include_html:
+                    raise ObservationUnavailable("structured snapshot only")
+                if isinstance(command, ObserveCommand):
+                    return self.observation()
+                if isinstance(command, ClickCommand):
+                    return self.observation()
+                raise AssertionError(type(command).__name__)
+
+        browser = _StructuredBrowser()
+        adapter = CNKIAdapter(browser)
+        request = LiteratureSearchRequest(
+            original_research_request="CNKI structured snapshot fallback",
+            exact_titles=("投贷联动、媒体监督与科技企业AI漂洗",),
+            max_search_results=2,
+            max_results_per_source=2,
+            max_downloads=0,
+            max_downloads_per_run=0,
+        )
+        records = await adapter.search('"投贷联动、媒体监督与科技企业AI漂洗"', request)
+        self.assertEqual(len(records), 1)
+        self.assertIn("korder=TI", browser.navigated[0])
+        self.assertNotIn("%22", browser.navigated[0])
+        self.assertIsNotNone(adapter.last_challenge_diagnostic)
+        self.assertEqual(adapter.last_challenge_diagnostic.state, ChallengeState.DORMANT)
+        await adapter.open_result(records[0])
+        click = next(command for command in reversed(browser.commands) if isinstance(command, ClickCommand))
+        self.assertTrue(click.follow_new_page)
+        self.assertTrue(click.close_origin_when_sole_page)
+        self.assertEqual(click.target.text, records[0].title)
+
+    async def test_download_uses_exact_label_without_unsupported_css_text_combo(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-cnki-download-target-") as temporary:
+            root = Path(temporary)
+            downloaded = write_minimal_pdf(root / "authorized.pdf")
+            snapshot = fixture("cnki_article_snapshot.yml")
+
+            class _DownloadBrowser:
+                navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+                def __init__(self) -> None:
+                    self.commands = []
+                    self.downloads_dir = root
+                    self.session = SessionHandle("download-target-test")
+                    self.page_handle = PageHandle("main", session=self.session)
+
+                async def execute(self, command):
+                    self.commands.append(command)
+                    if isinstance(command, ObserveCommand) and command.include_html:
+                        raise ObservationUnavailable("structured snapshot only")
+                    if isinstance(command, ObserveCommand):
+                        return BrowserObservation(
+                            session=self.session,
+                            page=self.page_handle,
+                            generation=0,
+                            url=ARTICLE_URL,
+                            title="投贷联动、媒体监督与科技企业AI漂洗 - 中国知网",
+                            structured_content=snapshot,
+                            target_observations=(
+                                BrowserTargetObservation(
+                                    marker="拖动下方拼图完成验证",
+                                    bounding_box={"x": 15, "y": -999985, "width": 188, "height": 18},
+                                    client_rect={"x": 15, "y": -999985, "width": 188, "height": 18},
+                                    client_width=188,
+                                    client_height=18,
+                                    viewport_width=1_000_000,
+                                    viewport_height=1_000_000,
+                                    frame_viewport_visible=True,
+                                    inspection_complete=True,
+                                ),
+                            ),
+                        )
+                    if isinstance(command, DownloadCommand):
+                        return DownloadArtifact.from_path(
+                            downloaded,
+                            suggested_filename=command.suggested_filename,
+                            page=self.page_handle,
+                        )
+                    raise AssertionError(type(command).__name__)
+
+            browser = _DownloadBrowser()
+            adapter = CNKIAdapter(browser)
+            record = CNKIAdapter.parse_article_snapshot(snapshot, source_url=ARTICLE_URL)
+            access = CNKIAdapter.check_fulltext_access_snapshot(snapshot, source_url=ARTICLE_URL)
+            path = await adapter.download_fulltext(record, access)
+            self.assertEqual(path, downloaded.resolve())
+            command = next(item for item in browser.commands if isinstance(item, DownloadCommand))
+            self.assertIsNone(command.target.css)
+            self.assertEqual(command.target.text, "PDF下载")
+            self.assertTrue(command.target.exact_text)
 
 
 class CNKIDownloadAndManifestTests(unittest.TestCase):

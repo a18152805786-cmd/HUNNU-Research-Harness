@@ -1,0 +1,33 @@
+### Page
+- Page URL: https://kns.cnki.net/kcms2/article/abstract?dbcode=CJFQ&filename=CJKX202602009
+- Page Title: 投贷联动、媒体监督与科技企业AI漂洗 - 中国知网
+### Snapshot
+- generic [active] [ref=a1]:
+  - banner [ref=a2]:
+    - generic "湖南师范大学" [ref=a3]
+  - generic [ref=a4]:
+    - link "财经科学 ." [ref=a5]:
+      - /url: https://navi.cnki.net/knavi/detail?p=redacted
+    - generic [ref=a6]: 财经科学 . 2026 (02) : 113-126
+    - heading "投贷联动、媒体监督与科技企业AI漂洗" [level=1] [ref=a7]
+    - heading [level=3] [ref=a8]:
+      - link "李媛媛" [ref=a9]:
+        - /url: https://kns.cnki.net/kcms2/author/detail?v=author1
+      - link "崔梦萦" [ref=a10]:
+        - /url: https://kns.cnki.net/kcms2/author/detail?v=author2
+    - generic [ref=a11]: 摘要：
+    - text: 文章考察媒体监督与科技企业AI漂洗，并报告稳健的经验证据。
+    - generic [ref=a12]: 关键词：
+    - paragraph [ref=a13]:
+      - link "人工智能;" [ref=a14]:
+        - /url: https://kns.cnki.net/kcms2/keyword/detail?v=keyword1
+      - link "AI漂洗;" [ref=a15]:
+        - /url: https://kns.cnki.net/kcms2/keyword/detail?v=keyword2
+    - paragraph [ref=a16]: DOI：10.27041/j.cnki.cjkx.2026.02.008
+    - link "PDF下载" [ref=a17]:
+      - /url: https://bar.cnki.net/bar/download/order?id=authorized-single-paper
+    - link "CAJ下载" [ref=a18]:
+      - /url: https://bar.cnki.net/bar/download/order?id=authorized-caj
+  - generic [ref=a19] [box=0,-1000000,218,279]:
+    - generic [ref=a20] [box=15,-999985,188,18]: 拖动下方拼图完成验证
+

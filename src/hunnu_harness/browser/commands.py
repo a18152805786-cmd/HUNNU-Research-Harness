@@ -207,6 +207,7 @@ class BrowserActionResult:
     generation: int
     action: str
     url: str
+    runtime_tab_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -288,10 +289,21 @@ class ObserveCommand(BrowserCommand):
 @dataclass(frozen=True)
 class ClickCommand(BrowserCommand):
     target: BrowserTarget
+    follow_new_page: bool = False
+    close_origin_when_sole_page: bool = False
     kind = "Click"
 
+    def __post_init__(self) -> None:
+        if self.close_origin_when_sole_page and not self.follow_new_page:
+            raise ValueError("close_origin_when_sole_page requires follow_new_page")
+
     def as_dict(self) -> dict[str, Any]:
-        return {"Kind": self.kind, "Target": self.target.as_dict()}
+        return {
+            "Kind": self.kind,
+            "Target": self.target.as_dict(),
+            "FollowNewPage": self.follow_new_page,
+            "CloseOriginWhenSolePage": self.close_origin_when_sole_page,
+        }
 
 
 @dataclass(frozen=True)
