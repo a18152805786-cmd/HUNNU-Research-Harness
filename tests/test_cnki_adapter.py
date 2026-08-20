@@ -69,6 +69,20 @@ def authorized(full_text_format: FullTextFormat) -> AccessDecision:
 
 
 class CNKIParserTests(unittest.TestCase):
+    @staticmethod
+    def authenticated_header(*, extra_body: str = "") -> str:
+        return f'''
+        <header class="ecp_header_login_area">
+          <div class="ecp_header_login_status ecp_header_login_status1">
+            <div class="ecp_header_unitName" title="湖南师范大学" style="display: inline-block;">
+              湖南师范大学
+            </div>
+            <div class="ecp_header_personal_loginbg">个人登录</div>
+          </div>
+        </header>
+        {extra_body}
+        '''
+
     def test_exact_title_result_parsing_is_bounded_and_deduplicated(self) -> None:
         records = CNKIAdapter.parse_search_results_html(
             fixture("cnki_search.html"),
@@ -273,7 +287,98 @@ class CNKIParserTests(unittest.TestCase):
         self.assertFalse(decision.full_text_accessible)
         self.assertFalse(decision.authorized_access)
         self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
-        self.assertIn("no verified institutional", decision.reason)
+        self.assertEqual(decision.access_type, AccessType.UNKNOWN)
+        self.assertIn("FULLTEXT_ACCESS_UNKNOWN", decision.reason)
+
+    def test_authenticated_order_action_overrides_generic_personal_purchase_text(self) -> None:
+        html = fixture("cnki_article_live_structure.html").replace(
+            "<body>",
+            "<body>"
+            + self.authenticated_header(extra_body='<div class="site-nav">个人登录 购买 充值</div>')
+            + '<div style="display:none">单篇购买 请登录后购买</div>',
+            1,
+        )
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertTrue(decision.full_text_accessible)
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.INSTITUTIONAL_AUTHENTICATED)
+        self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
+
+    def test_current_article_explicit_not_subscribed_state_is_not_authorized(self) -> None:
+        html = f'''
+        <html><head><title>CNKI</title></head><body>
+          {self.authenticated_header()}
+          <article><h1>人工智能时代下企业智能化转型与全球价值链升级</h1>
+          <p>机构未订购，单篇购买</p></article>
+        </body></html>
+        '''
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertFalse(decision.full_text_accessible)
+        self.assertFalse(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.METADATA_ONLY)
+
+    def test_ambiguous_fulltext_action_is_unknown_even_with_institution_header(self) -> None:
+        html = fixture("cnki_article_live_structure.html").replace(
+            "<body>",
+            "<body>"
+            + self.authenticated_header(extra_body="<div>购买</div>"),
+            1,
+        ).replace(
+            "https://bar.cnki.net/bar/download/order?id=redacted-for-fixture",
+            "/fulltext/action",
+        )
+        decision = CNKIAdapter.check_fulltext_access_html(
+            html,
+            source_url="https://kns.cnki.net/kcms2/article/abstract?v=redacted",
+        )
+        self.assertFalse(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.UNKNOWN)
+        self.assertIn("FULLTEXT_ACCESS_UNKNOWN", decision.reason)
+
+    def test_login_requirement_without_authentication_remains_an_authentication_stop(self) -> None:
+        html = fixture("cnki_article_live_structure.html").replace(
+            "<body>",
+            "<body><div>请登录后下载全文</div>",
+            1,
+        )
+        with self.assertRaisesRegex(SourceActionRequired, "ACTION_REQUIRED_USER_LOGIN=true"):
+            CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+
+    def test_hidden_purchase_template_does_not_block_authorized_action(self) -> None:
+        html = fixture("cnki_article_live_structure.html").replace(
+            "<body>",
+            "<body>"
+            + self.authenticated_header(
+                extra_body='<div class="purchase-modal" style="display:none">单篇购买 请登录后购买 权限不足</div>'
+            ),
+            1,
+        )
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.INSTITUTIONAL_AUTHENTICATED)
+
+    def test_visible_single_article_purchase_without_action_is_not_authorized(self) -> None:
+        html = f'''
+        <html><head><title>CNKI</title></head><body>
+          {self.authenticated_header()}
+          <article><h1>人工智能时代下企业智能化转型与全球价值链升级</h1>
+          <p>单篇购买</p></article>
+        </body></html>
+        '''
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertFalse(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.METADATA_ONLY)
+
+    def test_institution_name_alone_does_not_authorize_fulltext(self) -> None:
+        html = f'''
+        <html><head><title>CNKI</title></head><body>
+          {self.authenticated_header()}
+          <article><h1>人工智能时代下企业智能化转型与全球价值链升级</h1></article>
+        </body></html>
+        '''
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertFalse(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.METADATA_ONLY)
 
     def test_identity_lock_accepts_stable_identifier_and_rejects_wrong_doi(self) -> None:
         search = CNKIAdapter.parse_search_results_html(

@@ -333,7 +333,7 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_download_event_is_bounded_to_one_changed_named_artifact(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-pending-") as temporary:
             root = Path(temporary)
-            payload = b"pending-download-artifact\n"
+            payload = b"%PDF-1.7\npending-download-artifact\n"
 
             class _PendingDownloadClient(_FakeMCPClient):
                 async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -365,6 +365,195 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
                 artifact.metadata["CompletionSignal"],
                 "downloading-event+bounded-directory-watch",
             )
+
+    async def test_filesystem_fallback_captures_completed_pdf_without_mcp_event(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-pdf-") as temporary:
+            root = Path(temporary)
+            payload = b"%PDF-1.7\ncontrolled fallback pdf\n"
+
+            class _FilesystemOnlyClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+
+                        async def complete() -> None:
+                            await asyncio.sleep(0.15)
+                            (root / "Target-paper.pdf").write_bytes(payload)
+
+                        asyncio.create_task(complete())
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            artifact = await MCPExecutor(
+                _FilesystemOnlyClient(root),
+                downloads_dir=root,
+                max_download_wait_seconds=2.0,
+            ).execute(
+                DownloadCommand(
+                    target=BrowserTarget(text="Download probe", exact_text=True),
+                    suggested_filename="target.pdf",
+                )
+            )
+            self.assertEqual(artifact.local_path, (root / "Target-paper.pdf").resolve())
+            self.assertEqual(artifact.metadata["CompletionSignal"], "filesystem-watch-after-authorized-click")
+            self.assertTrue(artifact.metadata["FilesystemFallbackUsed"])
+            self.assertEqual(artifact.metadata["ArtifactCorrelationConfidence"], "HIGH")
+            self.assertEqual(artifact.metadata["DownloadedArtifactType"], "PDF")
+            self.assertEqual(artifact.metadata["ArtifactValidationLevel"], "header-only")
+
+    async def test_filesystem_fallback_honors_command_window_for_late_browser_artifact(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-late-") as temporary:
+            root = Path(temporary)
+            payload = b"%PDF-1.7\nlate browser artifact\n"
+
+            class _LateFilesystemClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+
+                        async def complete() -> None:
+                            await asyncio.sleep(0.25)
+                            (root / "Late-paper.pdf").write_bytes(payload)
+
+                        asyncio.create_task(complete())
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            artifact = await MCPExecutor(
+                _LateFilesystemClient(root),
+                downloads_dir=root,
+                max_download_wait_seconds=0.1,
+            ).execute(
+                DownloadCommand(
+                    target=BrowserTarget(text="Download probe", exact_text=True),
+                    suggested_filename="late.pdf",
+                    timeout_ms=1000,
+                )
+            )
+            self.assertEqual(artifact.local_path, (root / "Late-paper.pdf").resolve())
+            self.assertEqual(artifact.metadata["DownloadedArtifactType"], "PDF")
+
+    async def test_filesystem_fallback_waits_for_crdownload_to_become_pdf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-temp-") as temporary:
+            root = Path(temporary)
+            payload = b"%PDF-1.7\nrenamed after browser completion\n"
+
+            class _RenamingClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+
+                        async def complete() -> None:
+                            partial = root / "Target-paper.pdf.crdownload"
+                            partial.write_bytes(payload[:8])
+                            await asyncio.sleep(0.15)
+                            partial.write_bytes(payload)
+                            await asyncio.sleep(0.15)
+                            partial.replace(root / "Target-paper.pdf")
+
+                        asyncio.create_task(complete())
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            artifact = await MCPExecutor(
+                _RenamingClient(root),
+                downloads_dir=root,
+                max_download_wait_seconds=2.0,
+            ).execute(
+                DownloadCommand(
+                    target=BrowserTarget(text="Download probe", exact_text=True),
+                    suggested_filename="target.pdf",
+                )
+            )
+            self.assertEqual(artifact.local_path, (root / "Target-paper.pdf").resolve())
+            self.assertEqual(artifact.metadata["DownloadedArtifactType"], "PDF")
+
+    async def test_filesystem_fallback_classifies_caj_without_calling_it_pdf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-caj-") as temporary:
+            root = Path(temporary)
+            payload = b"KDH 2.00 Copyright(C) 2000 CAJCD\ncontrolled caj\n"
+
+            class _CAJClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+                        (root / "Target-paper.caj").write_bytes(payload)
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            artifact = await MCPExecutor(_CAJClient(root), downloads_dir=root).execute(
+                DownloadCommand(
+                    target=BrowserTarget(text="Download probe", exact_text=True),
+                    suggested_filename="target.caj",
+                )
+            )
+            self.assertEqual(artifact.metadata["DownloadedArtifactType"], "CAJ")
+            self.assertNotEqual(artifact.metadata["DownloadedArtifactType"], "PDF")
+            self.assertEqual(artifact.metadata["ArtifactValidationLevel"], "header-only")
+
+    async def test_filesystem_fallback_rejects_html_disguised_as_pdf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-html-") as temporary:
+            root = Path(temporary)
+
+            class _HTMLClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+                        (root / "Target-paper.pdf").write_bytes(
+                            b"<!doctype html><html><body>login page</body></html>"
+                        )
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            with self.assertRaisesRegex(DownloadFailure, "HTML"):
+                await MCPExecutor(_HTMLClient(root), downloads_dir=root).execute(
+                    DownloadCommand(
+                        target=BrowserTarget(text="Download probe", exact_text=True),
+                        suggested_filename="target.pdf",
+                    )
+                )
+
+    async def test_filesystem_fallback_does_not_reuse_old_pdf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-old-") as temporary:
+            root = Path(temporary)
+            (root / "old.pdf").write_bytes(b"%PDF-1.7\nold artifact\n")
+
+            class _NoEventClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            with self.assertRaises(DownloadFailure):
+                await MCPExecutor(_NoEventClient(root), downloads_dir=root).execute(
+                    DownloadCommand(
+                        target=BrowserTarget(text="Download probe", exact_text=True),
+                        suggested_filename="target.pdf",
+                        timeout_ms=100,
+                    )
+                )
+
+    async def test_filesystem_fallback_rejects_ambiguous_new_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-fallback-ambiguous-") as temporary:
+            root = Path(temporary)
+
+            class _AmbiguousClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+                        (root / "Target-one.pdf").write_bytes(b"%PDF-1.7\none\n")
+                        (root / "Target-two.pdf").write_bytes(b"%PDF-1.7\ntwo\n")
+                        return _result("### Ran Playwright code\n")
+                    return await super().call(tool, arguments)
+
+            with self.assertRaisesRegex(DownloadFailure, "more than one"):
+                await MCPExecutor(_AmbiguousClient(root), downloads_dir=root).execute(
+                    DownloadCommand(
+                        target=BrowserTarget(text="Download probe", exact_text=True),
+                        suggested_filename="target.pdf",
+                    )
+                )
 
     async def test_missing_download_artifact_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:

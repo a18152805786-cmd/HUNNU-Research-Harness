@@ -37,6 +37,26 @@ from ..security import sanitize_url
 _DETAIL_PATH_MARKERS = ("/article/abstract", "/detail/detail.aspx", "/kcms/detail/")
 _REJECT_DOWNLOAD_LABELS = ("批量下载", "多篇下载", "相关推荐", "参考文献下载", "整本下载")
 _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "download pdf", "download caj")
+_CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
+_CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS = (
+    "当前机构未获得全文访问权限",
+    "机构未获得全文访问权限",
+    "机构未订购",
+    "未订购",
+    "无全文权限",
+    "全文权限不足",
+    "无权访问全文",
+    "获取全文失败",
+    "单篇购买",
+    "请登录后购买",
+    "请登录后阅读",
+    "请登录后下载",
+    "权限不足",
+    "full text not available",
+    "purchase full text",
+    "login required",
+    "sign in to access full text",
+)
 _INSTITUTIONAL_ACCESS_MARKERS = (
     "当前机构已获得全文访问权限",
     "机构已获得全文访问权限",
@@ -97,6 +117,19 @@ def _cnki_authors_identity(authors: tuple[str, ...]) -> tuple[str, ...]:
 def _is_cnki_host(hostname: str | None) -> bool:
     host = (hostname or "").casefold().rstrip(".")
     return host == "cnki.net" or host.endswith(".cnki.net")
+
+
+def _is_cnki_resource_order_url(value: str) -> bool:
+    """Recognize CNKI's current-article order action without treating it as a file URL."""
+
+    if not value or value == UNKNOWN:
+        return False
+    parsed = urlsplit(value)
+    return (
+        (parsed.hostname or "").casefold() == "bar.cnki.net"
+        and parsed.path.casefold().rstrip("/") == _CNKI_RESOURCE_ORDER_PATH
+        and bool(parse_qs(parsed.query).get("id"))
+    )
 
 
 def _stable_identifier(value: str) -> str:
@@ -205,8 +238,10 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         self.author_links: list[str] = []
         self.institution_login_status = False
         self.authenticated_institution_labels: list[str] = []
+        self.visible_text_parts: list[str] = []
         self._capture_stack: list[tuple[str, str, list[str]]] = []
         self._hidden_element_tags: list[str] = []
+        self._non_content_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
@@ -221,6 +256,8 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
             or "visibility:hidden" in style
         ):
             self._hidden_element_tags.append(lowered)
+        if lowered in {"script", "style", "noscript", "template"}:
+            self._non_content_tags.append(lowered)
         if "ecp_header_login_status1" in classes:
             self.institution_login_status = True
         if "ecp_header_unitname" in classes:
@@ -243,8 +280,11 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
 
     def handle_data(self, data: str) -> None:
         super().handle_data(data)
-        if self._hidden_element_tags:
+        if self._hidden_element_tags or self._non_content_tags:
             return
+        stripped = data.strip()
+        if stripped:
+            self.visible_text_parts.append(stripped)
         for _, _, parts in self._capture_stack:
             parts.append(data)
 
@@ -260,6 +300,10 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
             if self._hidden_element_tags[index] == lowered:
                 del self._hidden_element_tags[index]
                 break
+        for index in range(len(self._non_content_tags) - 1, -1, -1):
+            if self._non_content_tags[index] == lowered:
+                del self._non_content_tags[index]
+                break
         if self._capture_stack and self._capture_stack[-1][0] == lowered:
             _, key, parts = self._capture_stack.pop()
             value = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -269,6 +313,10 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
     def first_block(self, key: str) -> str:
         values = self.blocks.get(key, [])
         return values[0] if values else UNKNOWN
+
+    @property
+    def visible_body_text(self) -> str:
+        return " ".join(self.visible_text_parts)
 
 
 class CNKIAdapter(LiteratureSourceAdapter):
@@ -788,28 +836,59 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 reason="No enabled, official single-paper CNKI full-text control was present",
                 full_text_format=FullTextFormat.UNKNOWN,
             )
-        body = parser.body_text.casefold()
+        body = parser.visible_body_text.casefold()
+        explicit_access_block = any(marker.casefold() in body for marker in _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS)
         open_access = any(marker in body for marker in ("开放获取", "open access", "public full text"))
-        institutional_access = any(
-            marker in body
+        explicit_institutional_access = any(
+            marker.casefold() in body
             for marker in ("当前机构已获得全文访问权限", "机构已获得全文访问权限", "institutional access")
+        )
+        institution_header_authenticated = (
+            parser.institution_login_status and bool(parser.authenticated_institution_labels)
+        )
+        resource_scoped_action = _is_cnki_resource_order_url(candidate_url)
+        institutional_access = explicit_institutional_access or (
+            institution_header_authenticated and resource_scoped_action
         )
         direct_public_file = candidate_url != UNKNOWN and urlsplit(candidate_url).path.casefold().endswith(
             (".pdf", ".caj", ".nh", ".kdh")
         )
-        if not (open_access or institutional_access or direct_public_file):
+        positive_access = open_access or institutional_access or direct_public_file
+        locator_label = re.sub(r"\s+", " ", candidate.text).strip()
+        if positive_access and explicit_access_block:
+            return AccessDecision(
+                full_text_accessible=False,
+                access_type=AccessType.UNKNOWN,
+                authorized_access=False,
+                status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
+                reason="CNKI exposed conflicting current-article full-text access and authorization-block signals; FULLTEXT_ACCESS_UNKNOWN",
+                download_url=candidate_url,
+                download_locator=locator_label,
+                full_text_format=candidate_format,
+            )
+        if not positive_access and explicit_access_block:
             return AccessDecision(
                 full_text_accessible=False,
                 access_type=AccessType.METADATA_ONLY,
                 authorized_access=False,
                 status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
-                reason="CNKI exposed a download/order control but no verified institutional, open, or direct public full-text state",
+                reason="The current CNKI article exposed an explicit full-text authorization block without an authorized access signal",
                 download_url=candidate_url,
-                download_locator=re.sub(r"\s+", " ", candidate.text).strip(),
+                download_locator=locator_label,
+                full_text_format=candidate_format,
+            )
+        if not positive_access:
+            return AccessDecision(
+                full_text_accessible=False,
+                access_type=AccessType.UNKNOWN,
+                authorized_access=False,
+                status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
+                reason="CNKI exposed an enabled single-paper full-text control but no unambiguous authorization state; FULLTEXT_ACCESS_UNKNOWN",
+                download_url=candidate_url,
+                download_locator=locator_label,
                 full_text_format=candidate_format,
             )
         access_type = AccessType.INSTITUTIONAL_AUTHENTICATED if institutional_access else AccessType.PUBLIC_FULL_TEXT
-        locator_label = re.sub(r"\s+", " ", candidate.text).strip()
         return AccessDecision(
             full_text_accessible=True,
             access_type=access_type,

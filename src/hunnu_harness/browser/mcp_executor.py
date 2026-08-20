@@ -46,6 +46,9 @@ from .commands import (
 
 MCP_VERSION_BASELINE = "0.0.79"
 
+_DOWNLOAD_FINAL_SUFFIXES = frozenset({".pdf", ".caj", ".nh", ".kdh"})
+_CAJ_SIGNATURES = (b"CAJ", b"HNLC", b"KDH")
+
 
 # This is intentionally a fixed, read-only observation expression.  The
 # Harness does not expose arbitrary page evaluation to adapters; it asks the
@@ -589,26 +592,36 @@ class MCPExecutor:
             )
         target, description = await self._resolve_target(command.target, session=session, page=page, generation=generation)
         baseline = self._download_directory_state()
+        capture_started_ns = time.time_ns()
         reply = await self._call_tool(
             "browser_click",
             {"target": target, "element": description},
         )
         raw_path = self._download_path(reply.text)
+        filesystem_fallback_used = False
+        artifact_correlation_confidence: str | None = None
         if raw_path is None:
             pending_name = self._pending_download_name(reply.text)
-            if pending_name is None:
-                raise MCPProtocolError(
-                    "MCP click did not return a completed download path or a bounded pending-download name"
+            if pending_name is not None:
+                candidate = await self._wait_for_pending_artifact(
+                    pending_name,
+                    baseline=baseline,
+                    timeout_ms=command.timeout_ms,
                 )
-            candidate = await self._wait_for_pending_artifact(
-                pending_name,
-                baseline=baseline,
-                timeout_ms=command.timeout_ms,
-            )
-            completion_signal = "downloading-event+bounded-directory-watch"
+                completion_signal = "downloading-event+bounded-directory-watch"
+            else:
+                candidate = await self._wait_for_unannounced_artifact(
+                    baseline=baseline,
+                    capture_started_ns=capture_started_ns,
+                    timeout_ms=command.timeout_ms,
+                )
+                completion_signal = "filesystem-watch-after-authorized-click"
+                filesystem_fallback_used = True
+                artifact_correlation_confidence = "HIGH"
         else:
             candidate = await self._wait_for_artifact(raw_path, timeout_ms=command.timeout_ms)
             completion_signal = "downloaded-event+filesystem"
+        downloaded_artifact_type = self._validate_download_artifact_header(candidate)
         return DownloadArtifact.from_path(
             candidate,
             suggested_filename=command.suggested_filename,
@@ -620,6 +633,12 @@ class MCPExecutor:
                 "RawReturnedPath": raw_path,
                 "CompletionSignal": completion_signal,
                 "MCPArtifactId": None,
+                "FilesystemFallbackUsed": filesystem_fallback_used,
+                "ArtifactCorrelationConfidence": artifact_correlation_confidence,
+                "DownloadedArtifactType": downloaded_artifact_type,
+                "ArtifactValidationLevel": (
+                    "header-only" if downloaded_artifact_type is not None else None
+                ),
             },
         )
 
@@ -801,10 +820,10 @@ class MCPExecutor:
         name = Path(raw).name
         return name if name and name == raw else None
 
-    def _download_directory_state(self) -> dict[Path, tuple[int, int]]:
+    def _download_directory_state(self) -> dict[Path, tuple[int, int, int]]:
         if not self.downloads_dir.is_dir():
             return {}
-        state: dict[Path, tuple[int, int]] = {}
+        state: dict[Path, tuple[int, int, int]] = {}
         for candidate in self.downloads_dir.iterdir():
             try:
                 if not candidate.is_file():
@@ -813,7 +832,7 @@ class MCPExecutor:
                 stat = resolved.stat()
             except OSError:
                 continue
-            state[resolved] = (stat.st_mtime_ns, stat.st_size)
+            state[resolved] = (stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
         return state
 
     @staticmethod
@@ -824,7 +843,7 @@ class MCPExecutor:
         self,
         pending_name: str,
         *,
-        baseline: dict[Path, tuple[int, int]],
+        baseline: dict[Path, tuple[int, int, int]],
         timeout_ms: int,
     ) -> Path:
         wanted = self._normalized_download_name(pending_name)
@@ -834,7 +853,7 @@ class MCPExecutor:
             max(timeout_ms / 1000.0, 0.1),
             self._max_download_wait_seconds,
         )
-        previous: tuple[Path, int] | None = None
+        previous: tuple[Path, tuple[int, int, int]] | None = None
         while time.monotonic() <= deadline:
             current = self._download_directory_state()
             matches = [
@@ -848,16 +867,94 @@ class MCPExecutor:
                     "MCP pending-download event matched more than one changed artifact"
                 )
             if len(matches) == 1:
-                path, (_mtime_ns, size) = matches[0]
-                if size > 0 and previous == (path, size):
+                path, metadata = matches[0]
+                if metadata[2] > 0 and previous == (path, metadata):
+                    self._validate_download_artifact_header(path)
                     return self._resolve_artifact_path(str(path))
-                previous = (path, size)
+                previous = (path, metadata)
             else:
                 previous = None
             await asyncio.sleep(0.1)
         raise DownloadFailure(
             f"MCP pending download did not stabilize as one approved local artifact: {pending_name}"
         )
+
+    async def _wait_for_unannounced_artifact(
+        self,
+        *,
+        baseline: dict[Path, tuple[int, int, int]],
+        capture_started_ns: int,
+        timeout_ms: int,
+    ) -> Path:
+        """Capture one browser-created final artifact when MCP omits its event.
+
+        This is deliberately a post-click observation path.  It never fetches a
+        URL or chooses an unchanged historical file; it only accepts one final
+        artifact in the configured MCP output directory whose metadata changed
+        during this click window and then stabilized.
+        """
+
+        deadline = time.monotonic() + min(
+            max(timeout_ms / 1000.0, 0.1),
+            max(self._max_download_wait_seconds, timeout_ms / 1000.0),
+        )
+        previous: tuple[Path, tuple[int, int, int]] | None = None
+        while time.monotonic() <= deadline:
+            current = self._download_directory_state()
+            matches: list[tuple[Path, tuple[int, int, int]]] = []
+            for path, metadata in current.items():
+                if path.suffix.casefold() not in _DOWNLOAD_FINAL_SUFFIXES:
+                    continue
+                if baseline.get(path) == metadata:
+                    continue
+                created_ns, modified_ns, size = metadata
+                if size <= 0 or max(created_ns, modified_ns) < capture_started_ns:
+                    continue
+                matches.append((path, metadata))
+            if len(matches) > 1:
+                raise DownloadFailure(
+                    "MCP post-click filesystem capture matched more than one final artifact"
+                )
+            if len(matches) == 1:
+                path, metadata = matches[0]
+                if previous == (path, metadata):
+                    self._validate_download_artifact_header(path)
+                    return self._resolve_artifact_path(str(path))
+                previous = (path, metadata)
+            else:
+                previous = None
+            await asyncio.sleep(0.1)
+        raise DownloadFailure(
+            "MCP click returned no download event and no single stable post-click artifact"
+        )
+
+    @staticmethod
+    def _validate_download_artifact_header(path: Path) -> str | None:
+        """Reject obvious HTML/error masquerades and classify known full-text types."""
+
+        suffix = path.suffix.casefold()
+        if suffix not in _DOWNLOAD_FINAL_SUFFIXES:
+            return None
+        try:
+            with path.open("rb") as stream:
+                header = stream.read(512)
+        except OSError as exc:
+            raise DownloadFailure(f"MCP downloaded artifact could not be read: {path}") from exc
+        if not header:
+            raise DownloadFailure(f"MCP downloaded artifact is empty: {path}")
+        lowered = header.lstrip().lower()
+        if (
+            lowered.startswith((b"<!doctype html", b"<html", b"<?xml", b"<head", b"<body"))
+            or b"<html" in lowered
+        ):
+            raise DownloadFailure(f"MCP downloaded artifact is HTML rather than full text: {path}")
+        if suffix == ".pdf":
+            if not header.startswith(b"%PDF-"):
+                raise DownloadFailure(f"MCP PDF artifact has no PDF signature: {path}")
+            return "PDF"
+        if not header.startswith(_CAJ_SIGNATURES):
+            raise DownloadFailure(f"MCP CAJ artifact has no recognized CAJ signature: {path}")
+        return "CAJ"
 
     async def _wait_for_artifact(self, raw_path: str, *, timeout_ms: int) -> Path:
         path = self._resolve_artifact_path(raw_path)
