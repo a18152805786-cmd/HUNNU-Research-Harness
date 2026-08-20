@@ -101,6 +101,21 @@ def _lock_search_result_to_detail(
     return None
 
 
+def _is_fulltext_acquisition_candidate(record: LiteratureRecord) -> bool:
+    """Require both identity confirmation and a final KEEP decision.
+
+    Search/detail identity confirmation proves that the inspected detail page
+    belongs to the selected search result.  It does not turn a MAYBE screening
+    result into permission to enter the full-text acquisition stage.
+    """
+
+    return (
+        record.target_identity_confirmed
+        and record.screening_decision == ScreeningDecision.KEEP.value
+        and not record.duplicate_detected
+    )
+
+
 class LiteratureAcquisitionWorkflow:
     """Serial, bounded acquisition with durable artifacts on every exit path."""
 
@@ -298,12 +313,12 @@ class LiteratureAcquisitionWorkflow:
         self.writer.write_search_results(records)
 
         max_downloads = min(request.max_downloads, request.max_downloads_per_run)
+        candidates: list[LiteratureRecord] = []
         if max_downloads > 0:
             candidates = [
                 record
                 for record in records
-                if record.screening_decision in {ScreeningDecision.KEEP.value, ScreeningDecision.MAYBE.value}
-                and not record.duplicate_detected
+                if _is_fulltext_acquisition_candidate(record)
             ]
             for record in candidates:
                 if len(downloads) >= max_downloads:
@@ -391,7 +406,7 @@ class LiteratureAcquisitionWorkflow:
 
         self.deduplicator.deduplicate(records)
         if request.require_full_text and not downloads and status == RunStatus.SUCCESS:
-            status = RunStatus.FULLTEXT_NOT_AUTHORIZED
+            status = RunStatus.NO_RESULTS if max_downloads > 0 and not candidates else RunStatus.FULLTEXT_NOT_AUTHORIZED
         elif errors and status == RunStatus.SUCCESS:
             status = RunStatus.PARTIAL_SUCCESS
         return self._finalize(
