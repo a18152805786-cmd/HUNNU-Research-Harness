@@ -71,6 +71,7 @@ _CNKI_DASH_CHARS = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 _CNKI_DASH_SPACE_RE = re.compile(rf"\s*([{_CNKI_DASH_CHARS}])\s*")
 _CNKI_CJK_JOIN_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 _CNKI_ENUMERATION_SPACE_RE = re.compile(r"\s*([、])\s*")
+_CNKI_MARKUP_PUNCT_SPACE_RE = re.compile(r'\s*([?!“”‘’「」『』《》〈〉【】〔〕（）])\s*')
 
 
 def _decode_cnki_form_query_value(value: str) -> str:
@@ -91,6 +92,15 @@ def _normalize_cnki_plain_title_spacing(value: str) -> str:
     text = _CNKI_CJK_JOIN_SPACE_RE.sub("", text)
     text = _CNKI_ENUMERATION_SPACE_RE.sub(r"\1", text)
     return _CNKI_DASH_SPACE_RE.sub(r"\1", text)
+
+
+def _normalize_cnki_observed_title_spacing(value: str) -> str:
+    """Also collapse spacing around punctuation split by highlighted markup."""
+
+    return _CNKI_MARKUP_PUNCT_SPACE_RE.sub(
+        r"\1",
+        _normalize_cnki_plain_title_spacing(value),
+    )
 
 
 def _canonicalize_cnki_exact_query(value: str) -> str:
@@ -114,7 +124,7 @@ def _canonicalize_cnki_title_identity(value: str) -> str:
     when the input is known to be encoded query data.
     """
 
-    return _normalize_cnki_plain_title_spacing(value).casefold()
+    return _normalize_cnki_observed_title_spacing(value).casefold()
 
 
 def _cnki_known(value: str) -> bool:
@@ -480,7 +490,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             parsed = urlsplit(absolute)
             if not _is_cnki_host(parsed.hostname) or not any(marker in parsed.path.casefold() for marker in _DETAIL_PATH_MARKERS):
                 continue
-            title = _normalize_cnki_plain_title_spacing(anchor.text)
+            title = _normalize_cnki_observed_title_spacing(anchor.text)
             if not title or any(label in title for label in _REJECT_DOWNLOAD_LABELS):
                 continue
             stable_identifier = _stable_identifier(absolute)

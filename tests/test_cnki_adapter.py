@@ -115,6 +115,24 @@ class CNKIParserTests(unittest.TestCase):
             _canonicalize_cnki_title_identity(title),
         )
 
+    def test_highlighted_title_collapses_question_and_quote_markup_spacing(self) -> None:
+        title = "社会信用环境改善降低了企业违规吗？——来自“中国社会信用体系建设”的证据"
+        html = """
+        <html><body><main><div>共找到 1 条结果</div>
+          <a class="fz14 inline" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=JRYJ202301001">
+            <font color="red">社会信用环境改善降低了企业违规吗</font>?——
+            <font color="red">来自</font>“<font color="red">中国社会信用体系建设</font>”
+            <font color="red">的证据</font>
+          </a>
+        </main></body></html>
+        """
+        records = CNKIAdapter.parse_search_results_html(html, query=title, max_results=1)
+        self.assertEqual(
+            _canonicalize_cnki_title_identity(records[0].title),
+            _canonicalize_cnki_title_identity(title),
+        )
+        self.assertEqual(records[0].title, title.replace("？", "?"))
+
     def test_search_modes_are_explicit_and_do_not_embed_credentials(self) -> None:
         self.assertIn("korder=TI", CNKIAdapter.build_search_url("人工智能漂洗", mode="exact_title"))
         self.assertIn("korder=AU", CNKIAdapter.build_search_url("张三", mode="author"))
@@ -140,6 +158,7 @@ class CNKIParserTests(unittest.TestCase):
         url = CNKIAdapter.build_search_url(spaced, mode="exact_title")
         self.assertNotIn("+%E2%80%94", url)
         self.assertEqual(_canonicalize_cnki_title_identity("AI and firms"), "ai and firms")
+        self.assertIn("%3F+Evidence", CNKIAdapter.build_search_url("Does AI matter? Evidence", mode="exact_title"))
 
     def test_form_plus_between_words_is_decoded_at_the_query_boundary(self) -> None:
         self.assertEqual(_decode_cnki_form_query_value("A+B"), "A B")
