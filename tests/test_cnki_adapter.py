@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hunnu_harness.browser.commands import (
     BrowserObservation,
@@ -597,7 +598,11 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         </body></html>
         """
         browser = self._HTMLBrowser([transient, fixture("cnki_search.html")])
-        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._SEARCH_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
         self.assertEqual([record.title for record in records], [title])
         self.assertEqual(browser.observe_count, 2)
 
@@ -635,7 +640,11 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         </body></html>
         """
         browser = self._HTMLBrowser([transient, transient, fixture("cnki_search.html")])
-        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._SEARCH_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
         self.assertEqual(records, [])
         self.assertEqual(browser.observe_count, 2)
 

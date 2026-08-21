@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html as html_lib
 import json
 import re
@@ -38,6 +39,7 @@ _DETAIL_PATH_MARKERS = ("/article/abstract", "/detail/detail.aspx", "/kcms/detai
 _REJECT_DOWNLOAD_LABELS = ("批量下载", "多篇下载", "相关推荐", "参考文献下载", "整本下载")
 _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "download pdf", "download caj")
 _CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
+_SEARCH_SETTLE_DELAY_SECONDS = 2.0
 _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS = (
     "当前机构未获得全文访问权限",
     "机构未获得全文访问权限",
@@ -1102,6 +1104,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
         results = results[:result_limit]
         if not results and not self._search_outcome_is_stable(content_kind, content):
+            await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
             content_kind, content, current_url = await self._content()
             parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
             results = parser(
