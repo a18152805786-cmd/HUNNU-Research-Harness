@@ -1089,7 +1089,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
         parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
         result_limit = min(request.max_results_per_source, request.max_search_results)
         parse_limit = (
-            min(30, max(10, result_limit * 5))
+            30
             if mode == "exact_title"
             else result_limit
         )

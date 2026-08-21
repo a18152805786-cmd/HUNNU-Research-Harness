@@ -632,6 +632,25 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records, [])
         self.assertEqual(browser.observe_count, 1)
 
+    async def test_exact_title_checks_bounded_thirty_results_before_filtering(self) -> None:
+        title = "人工智能技术应用如何影响企业创新"
+        distractors = "\n".join(
+            f'<a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=DISTRACTOR{i:03d}">相似题名{i}</a>'
+            for i in range(1, 15)
+        )
+        counted_results = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 18 条结果</div>
+            {distractors}
+            <a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=GGYY202410009">{title}</a>
+          </main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([counted_results])
+        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual([record.title for record in records], [title])
+        self.assertEqual(browser.observe_count, 1)
+
     async def test_html_search_retry_remains_bounded_when_page_never_settles(self) -> None:
         title = "不存在的精确论文标题"
         transient = """
