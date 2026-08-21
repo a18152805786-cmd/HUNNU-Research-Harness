@@ -802,13 +802,20 @@ class CNKIAdapter(LiteratureSourceAdapter):
 
     @staticmethod
     def _publication_classification(body: str, journal: str) -> tuple[str, str]:
+        if journal != UNKNOWN:
+            status = (
+                PublicationStatus.PEER_REVIEWED_JOURNAL_ARTICLE.value
+                if any(marker in body for marker in ("同行评议", "peer reviewed", "peer-reviewed"))
+                else PublicationStatus.UNKNOWN.value
+            )
+            return "JournalArticle", status
         if "学位论文" in body:
             return "Dissertation", PublicationStatus.OTHER.value
         if "会议论文" in body:
             return "ConferencePaper", PublicationStatus.CONFERENCE_PAPER.value
         if "报纸" in body:
             return "Newspaper", PublicationStatus.OTHER.value
-        if journal != UNKNOWN or "期刊" in body:
+        if "期刊" in body:
             status = (
                 PublicationStatus.PEER_REVIEWED_JOURNAL_ARTICLE.value
                 if any(marker in body for marker in ("同行评议", "peer reviewed", "peer-reviewed"))

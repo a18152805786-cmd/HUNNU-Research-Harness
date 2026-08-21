@@ -38,6 +38,7 @@ from hunnu_harness.literature.models import (
     FullTextFormat,
     LiteratureRecord,
     LiteratureSearchRequest,
+    PublicationStatus,
     RunStatus,
     UNKNOWN,
 )
@@ -242,6 +243,21 @@ class CNKIParserTests(unittest.TestCase):
         self.assertEqual(record.stable_identifier, "cjfq:CJKX202602009")
         self.assertIn("媒体监督", record.abstract)
         self.assertIn("AI漂洗", record.keywords)
+
+    def test_journal_evidence_outranks_dissertation_navigation_text(self) -> None:
+        html = fixture("cnki_article_live_structure.html").replace(
+            "<body>",
+            "<body><nav>学术期刊 学位论文 会议论文 报纸</nav>",
+        )
+
+        record = CNKIAdapter.parse_article_html(
+            html,
+            source_url="https://kns.cnki.net/kcms2/article/abstract?v=redacted",
+        )
+
+        self.assertEqual(record.journal, "财经科学")
+        self.assertEqual(record.publication_type, "JournalArticle")
+        self.assertEqual(record.publication_status, PublicationStatus.UNKNOWN.value)
 
     def test_hidden_cnki_title_ui_marker_is_not_bibliographic_text(self) -> None:
         html = fixture("cnki_article_live_structure.html").replace(
