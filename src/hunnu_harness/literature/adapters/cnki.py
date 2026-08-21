@@ -1142,7 +1142,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             content,
             query=record.search_query if record.search_query != UNKNOWN else record.title,
             source_url=current_url,
-            max_results=10,
+            max_results=30,
         )
         if not fresh_records and content_kind == "snapshot" and "共找到" not in content:
             content_kind, content, current_url = await self._content()
@@ -1151,7 +1151,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 content,
                 query=record.search_query if record.search_query != UNKNOWN else record.title,
                 source_url=current_url,
-                max_results=10,
+                max_results=30,
             )
         fresh_record = next(
             (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),

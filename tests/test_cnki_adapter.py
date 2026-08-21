@@ -555,11 +555,13 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         def __init__(self, observations: list[str]) -> None:
             self.observations = observations
             self.observe_count = 0
+            self.commands = []
             self.current_url = "about:blank"
             self.session = SessionHandle("html-search-settling-test")
             self.page_handle = PageHandle("main", session=self.session)
 
         async def execute(self, command):
+            self.commands.append(command)
             if isinstance(command, NavigateCommand):
                 self.current_url = command.url
                 return self._observation(self.observations[0])
@@ -567,6 +569,8 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
                 index = min(self.observe_count, len(self.observations) - 1)
                 self.observe_count += 1
                 return self._observation(self.observations[index])
+            if isinstance(command, ClickCommand):
+                return self._observation(self.observations[-1])
             raise AssertionError(type(command).__name__)
 
         def _observation(self, html: str) -> BrowserObservation:
@@ -650,6 +654,27 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
         self.assertEqual([record.title for record in records], [title])
         self.assertEqual(browser.observe_count, 1)
+
+    async def test_exact_title_refresh_relocks_target_after_first_ten_results(self) -> None:
+        title = "人工智能技术应用如何影响企业创新"
+        distractors = "\n".join(
+            f'<a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=DISTRACTOR{i:03d}">相似题名{i}</a>'
+            for i in range(1, 15)
+        )
+        counted_results = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 18 条结果</div>
+            {distractors}
+            <a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=GGYY202410009">{title}</a>
+          </main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([counted_results])
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search(f'"{title}"', self._request(title))
+        await adapter.open_result(records[0])
+        click = next(command for command in reversed(browser.commands) if isinstance(command, ClickCommand))
+        self.assertEqual(click.target.text, title)
 
     async def test_html_search_retry_remains_bounded_when_page_never_settles(self) -> None:
         title = "不存在的精确论文标题"
