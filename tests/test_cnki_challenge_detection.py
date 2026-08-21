@@ -233,6 +233,44 @@ class CNKIPageIdentityTests(unittest.TestCase):
         self.assertEqual(diagnostic.target_page_index, 2)
         self.assertIn("broker-runtime-index-correlated", diagnostic.target_page_identity_basis)
 
+    def test_structured_below_viewport_preload_is_dormant(self) -> None:
+        observation = SimpleNamespace(
+            url="https://kns.cnki.net/kns8s/search?kw=safe",
+            title="检索-中国知网",
+            page_inventory=(),
+            target_observations=(
+                SimpleNamespace(
+                    marker="拖动下方拼图完成验证",
+                    frame_index=0,
+                    frame_name="",
+                    frame_url="https://kns.cnki.net/kns8s/search?kw=safe",
+                    playwright_visible=None,
+                    bounding_box={"x": 15, "y": 2400, "width": 188, "height": 18},
+                    client_rect={"x": 15, "y": 2400, "width": 188, "height": 18},
+                    display=None,
+                    visibility=None,
+                    opacity=None,
+                    pointer_events=None,
+                    aria_hidden=None,
+                    client_width=188,
+                    client_height=18,
+                    viewport_width=1200,
+                    viewport_height=800,
+                    frame_viewport_visible=True,
+                    inspection_complete=True,
+                    blocking_overlay=False,
+                ),
+            ),
+            inspection_complete=True,
+            metadata={},
+        )
+
+        diagnostic = CNKIChallengeDetector.inspect_observation(observation)
+
+        self.assertEqual(diagnostic.state, ChallengeState.DORMANT)
+        self.assertFalse(diagnostic.action_required_user_login)
+        CNKIAdapter.enforce_challenge_diagnostic(diagnostic)
+
     def test_route_provenance_is_preserved_in_diagnostic(self) -> None:
         route = ("HUNNU Official Portal", "Library / Database Navigation", "CNKI")
         diagnostic = classify_challenge([node(visible=False)], route_provenance=route)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import re
 import sys
 import time
@@ -57,6 +58,7 @@ _CAJ_SIGNATURES = (b"CAJ", b"HNLC", b"KDH")
 _FULL_HTML_OBSERVATION_FUNCTION = (
     "() => document.documentElement ? document.documentElement.outerHTML : ''"
 )
+_VIEWPORT_OBSERVATION_FUNCTION = "() => ({width: window.innerWidth, height: window.innerHeight})"
 
 
 MCP_TOOL_ALLOWLIST = frozenset(
@@ -178,6 +180,35 @@ class _MCPToolReply:
 
 class MCPExecutor:
     """Translate Harness commands into source-neutral Playwright MCP calls."""
+
+    @classmethod
+    def for_harness_playwright_mcp(
+        cls,
+        client: MCPToolClient,
+        *,
+        session: SessionHandle | None = None,
+        page_handle: PageHandle | None = None,
+        max_download_wait_seconds: float = 8.0,
+    ) -> MCPExecutor:
+        """Bind to the Harness-configured MCP output directory.
+
+        Playwright MCP writes browser downloads to its process-level
+        ``--output-dir``.  That directory is distinct from a literature run's
+        archive directory, so callers must observe the configured MCP staging
+        directory and let the workflow copy validated artifacts into the run.
+        """
+
+        from ..paths import CORE_ROOT, PLAYWRIGHT_OUTPUT_DIR
+
+        return cls(
+            client,
+            downloads_dir=PLAYWRIGHT_OUTPUT_DIR,
+            mcp_path_base=CORE_ROOT,
+            artifact_roots=(PLAYWRIGHT_OUTPUT_DIR,),
+            session=session,
+            page_handle=page_handle,
+            max_download_wait_seconds=max_download_wait_seconds,
+        )
 
     def __init__(
         self,
@@ -380,12 +411,28 @@ class MCPExecutor:
                 raise ObservationUnavailable(
                     "Playwright MCP returned no usable full-HTML observation"
                 )
+        viewport: tuple[float, float] | None = None
+        if probe_requested:
+            try:
+                viewport_reply = await self._call_tool(
+                    "browser_evaluate",
+                    {"function": _VIEWPORT_OBSERVATION_FUNCTION},
+                )
+            except MCPUnsupportedCapability:
+                # Geometry without the real viewport can prove only that a
+                # node is above/left of zero.  Keep the probe incomplete so a
+                # source detector fails closed instead of treating a
+                # below/right off-screen preload as visible.
+                viewport = None
+            else:
+                viewport = self._parse_evaluated_viewport(viewport_reply.text)
         url, title = self._page_info(reply.text)
         target_observations, probes_complete, probes_truncated = self._parse_probe_observations(
             reply.text,
             command.text_probes,
             max_matches=command.max_probe_matches,
             frame_url=url or self._last_page_url,
+            viewport=viewport,
         )
         observation_id = f"observation-{uuid.uuid4().hex}"
         refs = frozenset(re.findall(r"\[ref=([^\]]+)\]", reply.text))
@@ -419,6 +466,7 @@ class MCPExecutor:
                 "TextProbeCount": len(command.text_probes),
                 "ProbeObservationCount": len(target_observations),
                 "ProbeMatchesTruncated": probes_truncated,
+                "ViewportObserved": viewport is not None,
             },
         )
 
@@ -445,21 +493,51 @@ class MCPExecutor:
         return value
 
     @staticmethod
+    def _parse_evaluated_viewport(text: str) -> tuple[float, float] | None:
+        """Extract a positive finite viewport from MCP evaluate output."""
+
+        result_marker = "### Result"
+        code_marker = "### Ran Playwright code"
+        if result_marker not in text:
+            return None
+        payload = text.split(result_marker, 1)[1]
+        if code_marker in payload:
+            payload = payload.split(code_marker, 1)[0]
+        payload = payload.strip()
+        if not payload:
+            return None
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, Mapping):
+            return None
+        try:
+            width = float(value["width"])
+            height = float(value["height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (math.isfinite(width) and math.isfinite(height) and width > 0 and height > 0):
+            return None
+        return width, height
+
+    @staticmethod
     def _parse_probe_observations(
         snapshot: str,
         probes: tuple[str, ...],
         *,
         max_matches: int,
         frame_url: str,
+        viewport: tuple[float, float] | None = None,
     ) -> tuple[tuple[BrowserTargetObservation, ...], bool, bool]:
         """Extract bounded, source-neutral text-probe geometry from a snapshot.
 
         Playwright MCP's ``boxes`` snapshot annotates nodes with viewport-relative
-        ``[box=x,y,width,height]`` values.  Those coordinates are sufficient to
-        prove that a node wholly above or left of the viewport is off-screen.
-        They are not sufficient to prove render visibility for an on-screen
-        node, so ``playwright_visible`` deliberately remains unknown and the
-        source detector can fail closed.
+        ``[box=x,y,width,height]`` values.  A separately observed real viewport
+        is required to classify nodes below or right of the visible page.  Box
+        coordinates alone do not prove render visibility for an on-screen node,
+        so ``playwright_visible`` deliberately remains unknown and the source
+        detector can fail closed.
         """
 
         if not probes:
@@ -489,6 +567,8 @@ class MCPExecutor:
                     }
                 else:
                     inspection_complete = False
+                if viewport is None:
+                    inspection_complete = False
                 marker_match = pattern.search(line)
                 observations.append(
                     BrowserTargetObservation(
@@ -499,14 +579,10 @@ class MCPExecutor:
                         client_rect=bounding_box,
                         client_width=(bounding_box or {}).get("width"),
                         client_height=(bounding_box or {}).get("height"),
-                        # MCP does not expose viewport dimensions through the
-                        # allow-listed command surface. A large positive bound
-                        # preserves the one fact we can prove from coordinates:
-                        # nodes wholly above/left of zero do not intersect it.
-                        viewport_width=1_000_000,
-                        viewport_height=1_000_000,
-                        frame_viewport_visible=True,
-                        inspection_complete=box_match is not None,
+                        viewport_width=viewport[0] if viewport is not None else 0,
+                        viewport_height=viewport[1] if viewport is not None else 0,
+                        frame_viewport_visible=True if viewport is not None else None,
+                        inspection_complete=box_match is not None and viewport is not None,
                     )
                 )
         return tuple(observations), inspection_complete, truncated

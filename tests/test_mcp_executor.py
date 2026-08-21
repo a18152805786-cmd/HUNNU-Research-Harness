@@ -26,6 +26,7 @@ from hunnu_harness.browser import (
     validate_browser_command_port,
 )
 from hunnu_harness.browser.commands import AuthenticatedFetchCommand, BrowserObservation, ClickCommand
+from hunnu_harness.paths import CORE_ROOT, PLAYWRIGHT_OUTPUT_DIR
 
 
 def _result(text: str) -> dict[str, Any]:
@@ -114,6 +115,13 @@ class _SourceAffinityMCPClient(_FakeMCPClient):
 
 
 class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_harness_factory_binds_the_actual_playwright_mcp_output(self) -> None:
+        executor = MCPExecutor.for_harness_playwright_mcp(_FakeMCPClient())
+
+        self.assertEqual(executor.downloads_dir, PLAYWRIGHT_OUTPUT_DIR.resolve())
+        self.assertEqual(executor.mcp_path_base, CORE_ROOT.resolve())
+        self.assertEqual(executor._artifact_roots, (PLAYWRIGHT_OUTPUT_DIR.resolve(),))
+
     async def test_command_to_mcp_mapping_returns_structured_observation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
             client = _FakeMCPClient()
@@ -154,6 +162,12 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
                         "- generic [ref=e1] [box=0,0,1200,800]\n"
                         "  - generic [ref=e2] [box=15,-999985,188,18]: dormant marker"
                     )
+                if tool == "browser_evaluate":
+                    self.calls.append((tool, dict(arguments)))
+                    return _result(
+                        '### Result\n{"width":1200,"height":800}\n'
+                        "### Ran Playwright code\n"
+                    )
                 return await super().call(tool, arguments)
 
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
@@ -166,13 +180,81 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
                     text_probes=(r"dormant marker",),
                 )
             )
-            self.assertTrue(client.calls[-1][1]["boxes"])
+            snapshot_call = next(call for call in client.calls if call[0] == "browser_snapshot")
+            self.assertTrue(snapshot_call[1]["boxes"])
             self.assertEqual(len(observation.target_observations), 1)
             evidence = observation.target_observations[0]
             self.assertEqual(evidence.bounding_box["y"], -999985.0)
+            self.assertEqual(evidence.viewport_width, 1200.0)
+            self.assertEqual(evidence.viewport_height, 800.0)
             self.assertIsNone(evidence.playwright_visible)
             self.assertTrue(evidence.inspection_complete)
             self.assertTrue(observation.inspection_complete)
+
+    async def test_text_probe_geometry_uses_real_viewport_for_below_page_component(self) -> None:
+        class _BelowViewportProbeClient(_FakeMCPClient):
+            async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                if tool == "browser_snapshot":
+                    self.calls.append((tool, dict(arguments)))
+                    return _result(
+                        "### Page\n- Page URL: https://controlled.test/results\n"
+                        "- Page Title: Controlled\n### Snapshot\n"
+                        "- generic [ref=e1] [box=0,0,1200,800]\n"
+                        "  - generic [ref=e2] [box=15,2400,188,18]: dormant marker"
+                    )
+                if tool == "browser_evaluate":
+                    self.calls.append((tool, dict(arguments)))
+                    return _result(
+                        '### Result\n{"width":1200,"height":800}\n'
+                        "### Ran Playwright code\n"
+                    )
+                return await super().call(tool, arguments)
+
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
+            client = _BelowViewportProbeClient()
+            executor = MCPExecutor(client, downloads_dir=Path(temporary))
+            observation = await executor.execute(
+                ObserveCommand(
+                    include_html=False,
+                    include_visible_text=False,
+                    text_probes=(r"dormant marker",),
+                )
+            )
+
+            evidence = observation.target_observations[0]
+            self.assertEqual(evidence.bounding_box["y"], 2400.0)
+            self.assertEqual(evidence.viewport_height, 800.0)
+            self.assertTrue(evidence.inspection_complete)
+            self.assertTrue(observation.metadata["ViewportObserved"])
+
+    async def test_text_probe_without_viewport_fails_closed(self) -> None:
+        class _MissingViewportClient(_FakeMCPClient):
+            async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                if tool == "browser_snapshot":
+                    self.calls.append((tool, dict(arguments)))
+                    return _result(
+                        "### Page\n- Page URL: https://controlled.test/results\n"
+                        "- Page Title: Controlled\n### Snapshot\n"
+                        "- generic [ref=e2] [box=15,2400,188,18]: challenge marker"
+                    )
+                return await super().call(tool, arguments)
+
+        with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
+            client = _MissingViewportClient()
+            executor = MCPExecutor(client, downloads_dir=Path(temporary))
+            observation = await executor.execute(
+                ObserveCommand(
+                    include_html=False,
+                    include_visible_text=False,
+                    text_probes=(r"challenge marker",),
+                )
+            )
+
+            evidence = observation.target_observations[0]
+            self.assertIsNone(evidence.frame_viewport_visible)
+            self.assertFalse(evidence.inspection_complete)
+            self.assertFalse(observation.inspection_complete)
+            self.assertFalse(observation.metadata["ViewportObserved"])
 
     async def test_text_target_is_resolved_to_short_lived_mcp_ref(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-") as temporary:
@@ -355,6 +437,42 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(artifact.sha256, hashlib.sha256(payload).hexdigest())
             self.assertTrue(artifact.artifact_id.startswith("artifact-"))
             self.assertEqual(artifact.metadata["CompletionSignal"], "downloaded-event+filesystem")
+
+    async def test_download_event_relative_to_mcp_workdir_resolves_inside_exact_output_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-relative-") as temporary:
+            root = Path(temporary)
+            workdir = root / "core"
+            output = root / "playwright-output"
+            workdir.mkdir()
+            output.mkdir()
+            payload = b"KDH 2.00 Copyright(C) 2000 CAJCD\nrelative path\n"
+            target = output / "Target-paper.caj"
+            target.write_bytes(payload)
+            relative = Path("..") / output.name / target.name
+
+            class _RelativePathClient(_FakeMCPClient):
+                async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                    if tool == "browser_click" and arguments.get("target") == "e5":
+                        self.calls.append((tool, dict(arguments)))
+                        return _result(
+                            f'### Events\n- Downloaded file Target-paper.caj to "{relative}"'
+                        )
+                    return await super().call(tool, arguments)
+
+            artifact = await MCPExecutor(
+                _RelativePathClient(output),
+                downloads_dir=output,
+                mcp_path_base=workdir,
+                artifact_roots=(output,),
+            ).execute(
+                DownloadCommand(
+                    target=BrowserTarget(text="Download probe", exact_text=True),
+                    suggested_filename="target.caj",
+                )
+            )
+
+            self.assertEqual(artifact.local_path, target.resolve())
+            self.assertEqual(artifact.metadata["DownloadedArtifactType"], "CAJ")
 
     async def test_pending_download_event_is_bounded_to_one_changed_named_artifact(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v018-mcp-pending-") as temporary:

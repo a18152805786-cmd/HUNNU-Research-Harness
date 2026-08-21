@@ -12,13 +12,14 @@ from hunnu_harness.browser.commands import (
     ClickCommand,
     DownloadArtifact,
     DownloadCommand,
+    DownloadFailure,
     NavigateCommand,
     ObservationUnavailable,
     ObserveCommand,
     PageHandle,
     SessionHandle,
 )
-from hunnu_harness.literature.adapters.base import SourceActionRequired
+from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceUnavailable
 from hunnu_harness.literature.adapters.cnki import (
     CNKIAdapter,
     _canonicalize_cnki_title_identity,
@@ -258,6 +259,58 @@ class CNKIParserTests(unittest.TestCase):
         decision = CNKIAdapter.check_fulltext_access_html(fixture("cnki_article_pdf.html"), source_url=ARTICLE_URL)
         self.assertTrue(decision.authorized_access)
         self.assertEqual(decision.access_type, AccessType.INSTITUTIONAL_AUTHENTICATED)
+        self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
+        self.assertEqual(decision.download_locator, "PDF下载")
+
+    def test_html_access_prefers_pdf_when_caj_precedes_it_in_dom(self) -> None:
+        html = """
+        <html><body><div>当前机构已获得全文访问权限</div>
+          <a href="/download/article/target.caj">CAJ下载</a>
+          <a href="/download/article/target.pdf">PDF下载</a>
+        </body></html>
+        """
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
+        self.assertEqual(decision.download_locator, "PDF下载")
+
+    def test_html_access_uses_caj_when_pdf_control_is_disabled(self) -> None:
+        html = """
+        <html><body><div>当前机构已获得全文访问权限</div>
+          <a href="/download/article/target.pdf" aria-disabled="true">PDF下载</a>
+          <a href="/download/article/target.caj">CAJ下载</a>
+        </body></html>
+        """
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.full_text_format, FullTextFormat.CAJ)
+        self.assertEqual(decision.download_locator, "CAJ下载")
+
+    def test_html_access_uses_cnki_caj_when_pdf_control_is_external(self) -> None:
+        html = """
+        <html><body><div>当前机构已获得全文访问权限</div>
+          <a href="https://example.invalid/target.pdf">PDF下载</a>
+          <a href="/download/article/target.caj">CAJ下载</a>
+        </body></html>
+        """
+        decision = CNKIAdapter.check_fulltext_access_html(html, source_url=ARTICLE_URL)
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.full_text_format, FullTextFormat.CAJ)
+        self.assertEqual(decision.download_locator, "CAJ下载")
+
+    def test_snapshot_access_prefers_pdf_when_caj_precedes_it(self) -> None:
+        snapshot = """
+        ### Page
+        - Page URL: https://kns.cnki.net/kcms2/article/abstract?dbcode=CJFQ&filename=TEST
+        ### Snapshot
+        - banner: 湖南师范大学
+        - link "CAJ下载" [ref=a1]:
+          - /url: https://bar.cnki.net/bar/download/order?id=caj
+        - link "PDF下载" [ref=a2]:
+          - /url: https://bar.cnki.net/bar/download/order?id=pdf
+        """
+        decision = CNKIAdapter.check_fulltext_access_snapshot(snapshot, source_url=ARTICLE_URL)
+        self.assertTrue(decision.authorized_access)
         self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
         self.assertEqual(decision.download_locator, "PDF下载")
 
@@ -609,6 +662,47 @@ class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(command.target.css)
             self.assertEqual(command.target.text, "PDF下载")
             self.assertTrue(command.target.exact_text)
+
+    async def test_failed_pdf_download_does_not_blindly_retry_caj(self) -> None:
+        snapshot = fixture("cnki_article_snapshot.yml")
+
+        class _FailingDownloadBrowser:
+            navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+            def __init__(self) -> None:
+                self.commands = []
+                self.downloads_dir = None
+                self.session = SessionHandle("download-failure-test")
+                self.page_handle = PageHandle("main", session=self.session)
+
+            async def execute(self, command):
+                self.commands.append(command)
+                if isinstance(command, ObserveCommand) and command.include_html:
+                    raise ObservationUnavailable("structured snapshot only")
+                if isinstance(command, ObserveCommand):
+                    return BrowserObservation(
+                        session=self.session,
+                        page=self.page_handle,
+                        generation=0,
+                        url=ARTICLE_URL,
+                        title="投贷联动、媒体监督与科技企业AI漂洗 - 中国知网",
+                        structured_content=snapshot,
+                    )
+                if isinstance(command, DownloadCommand):
+                    raise DownloadFailure("download result is uncertain")
+                raise AssertionError(type(command).__name__)
+
+        browser = _FailingDownloadBrowser()
+        adapter = CNKIAdapter(browser)
+        record = CNKIAdapter.parse_article_snapshot(snapshot, source_url=ARTICLE_URL)
+        access = CNKIAdapter.check_fulltext_access_snapshot(snapshot, source_url=ARTICLE_URL)
+        with self.assertRaises(SourceUnavailable):
+            await adapter.download_fulltext(record, access)
+
+        downloads = [item for item in browser.commands if isinstance(item, DownloadCommand)]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(downloads[0].target.text, "PDF下载")
+        self.assertEqual(downloads[0].suggested_filename, f"{record.paper_id}.pdf")
 
 
 class CNKIDownloadAndManifestTests(unittest.TestCase):

@@ -132,6 +132,27 @@ def _is_cnki_resource_order_url(value: str) -> bool:
     )
 
 
+def _cnki_full_text_format(label: str, href: str) -> FullTextFormat:
+    """Classify one already-screened CNKI single-paper download control."""
+
+    value = f"{label} {href}".casefold()
+    if "pdf" in value:
+        return FullTextFormat.PDF
+    if any(marker in value for marker in ("caj", ".nh", ".kdh")):
+        return FullTextFormat.CAJ
+    return FullTextFormat.OTHER_AUTHORIZED_FORMAT
+
+
+def _cnki_full_text_preference(full_text_format: FullTextFormat) -> int:
+    """Return the frozen acquisition preference: PDF, then CAJ, then other."""
+
+    return {
+        FullTextFormat.PDF: 0,
+        FullTextFormat.CAJ: 1,
+        FullTextFormat.OTHER_AUTHORIZED_FORMAT: 2,
+    }[full_text_format]
+
+
 def _stable_identifier(value: str) -> str:
     parsed = urlsplit(value)
     query = parse_qs(parsed.query)
@@ -800,9 +821,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
     def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
         cls.detect_interruption(html, url=source_url)
         parser = cls._parser(html)
-        candidate: _Anchor | None = None
-        candidate_url = UNKNOWN
-        candidate_format = FullTextFormat.UNKNOWN
+        candidates: list[tuple[int, _Anchor, str, FullTextFormat]] = []
         for anchor in parser.anchors:
             label = re.sub(
                 r"\s+",
@@ -817,17 +836,21 @@ class CNKIAdapter(LiteratureSourceAdapter):
             if disabled:
                 continue
             absolute = urljoin(source_url, anchor.href) if anchor.href else UNKNOWN
-            if absolute != UNKNOWN and not absolute.casefold().startswith("javascript:"):
-                if not _is_cnki_host(urlsplit(absolute).hostname):
+            if absolute != UNKNOWN:
+                if absolute.casefold().startswith("javascript:"):
+                    absolute = UNKNOWN
+                elif not _is_cnki_host(urlsplit(absolute).hostname):
                     continue
-                candidate_url = absolute
-            lower = f"{label} {anchor.href}".casefold()
-            candidate_format = FullTextFormat.PDF if "pdf" in lower else (
-                FullTextFormat.CAJ if any(marker in lower for marker in ("caj", ".nh", ".kdh")) else FullTextFormat.OTHER_AUTHORIZED_FORMAT
+            candidate_format = _cnki_full_text_format(label, anchor.href)
+            candidates.append(
+                (
+                    _cnki_full_text_preference(candidate_format),
+                    anchor,
+                    absolute,
+                    candidate_format,
+                )
             )
-            candidate = anchor
-            break
-        if candidate is None:
+        if not candidates:
             return AccessDecision(
                 full_text_accessible=False,
                 access_type=AccessType.METADATA_ONLY,
@@ -836,6 +859,10 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 reason="No enabled, official single-paper CNKI full-text control was present",
                 full_text_format=FullTextFormat.UNKNOWN,
             )
+        _preference, candidate, candidate_url, candidate_format = sorted(
+            candidates,
+            key=lambda item: item[0],
+        )[0]
         body = parser.visible_body_text.casefold()
         explicit_access_block = any(marker.casefold() in body for marker in _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS)
         open_access = any(marker in body for marker in ("开放获取", "open access", "public full text"))
@@ -917,19 +944,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
             if absolute != UNKNOWN and not absolute.casefold().startswith("javascript:"):
                 if not _is_cnki_host(urlsplit(absolute).hostname):
                     continue
-            lower = f"{compact} {href}".casefold()
-            full_text_format = (
-                FullTextFormat.PDF
-                if "pdf" in lower
-                else FullTextFormat.CAJ
-                if any(marker in lower for marker in ("caj", ".nh", ".kdh"))
-                else FullTextFormat.OTHER_AUTHORIZED_FORMAT
-            )
-            preference = {
-                FullTextFormat.PDF: 0,
-                FullTextFormat.CAJ: 1,
-                FullTextFormat.OTHER_AUTHORIZED_FORMAT: 2,
-            }[full_text_format]
+            full_text_format = _cnki_full_text_format(compact, href)
+            preference = _cnki_full_text_preference(full_text_format)
             candidates.append((preference, label, absolute, full_text_format))
         if not candidates:
             return AccessDecision(
