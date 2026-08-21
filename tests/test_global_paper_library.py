@@ -1,4 +1,5 @@
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -238,6 +239,28 @@ class GlobalLibraryReconciliationTests(unittest.TestCase):
                 self.library.ingest_external_pdf(source, record)
         self.assertEqual(list(self.library.papers_dir.iterdir()), [])
         self.assertEqual(self.library.catalog_jsonl_path.read_text(encoding="utf-8"), "")
+
+    def test_read_only_source_is_ingested_without_leaving_transaction_temp(self) -> None:
+        record = paper_record(doi="10.1000/read-only-source")
+        source = write_paper_pdf(self.root / "read-only-source.pdf", record)
+        source.chmod(source.stat().st_mode & ~stat.S_IWRITE)
+
+        try:
+            result = self.library.ingest_external_pdf(source, record)
+
+            self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
+            self.assertTrue(result.managed_path.exists())
+            self.assertEqual(list(self.library.transaction_dir.iterdir()), [])
+            self.assertEqual(self._catalog()[0]["paper_id"], record.paper_id)
+        finally:
+            cleanup_paths = (
+                source,
+                *self.library.papers_dir.iterdir(),
+                *self.library.transaction_dir.iterdir(),
+            )
+            for path in cleanup_paths:
+                if path.exists():
+                    path.chmod(path.stat().st_mode | stat.S_IWRITE)
 
 
 class ExternalImporterSafetyTests(unittest.TestCase):

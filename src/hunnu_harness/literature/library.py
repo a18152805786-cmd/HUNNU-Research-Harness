@@ -779,10 +779,20 @@ class GlobalPaperLibrary:
                 raise OSError("COPY verification failed: destination SHA256 differs")
         except Exception:
             if destination_created:
-                destination.unlink(missing_ok=True)
+                GlobalPaperLibrary._unlink_read_only_path(destination)
             raise
         finally:
-            temporary.unlink(missing_ok=True)
+            GlobalPaperLibrary._unlink_read_only_path(temporary)
+
+    @staticmethod
+    def _unlink_read_only_path(path: Path) -> None:
+        """Remove a controlled transaction path even when copy2 preserved ReadOnly."""
+
+        try:
+            path.chmod(path.stat().st_mode | stat.S_IWRITE)
+        except FileNotFoundError:
+            return
+        path.unlink(missing_ok=True)
 
     def _reject(
         self,
