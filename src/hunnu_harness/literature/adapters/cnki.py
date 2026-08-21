@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlsplit
 
 from ...browser.commands import (
+    BrowserCommandError,
     BrowserTarget,
     ClickCommand,
     DownloadCommand,
@@ -41,6 +42,8 @@ _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "
 _CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
 _SEARCH_SETTLE_DELAY_SECONDS = 10.0
 _SEARCH_SETTLE_MAX_OBSERVATIONS = 3
+_CNKI_CLICK_RETRY_DELAY_SECONDS = 1.0
+_CNKI_CLICK_RETRIES = 1
 _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS = (
     "当前机构未获得全文访问权限",
     "机构未获得全文访问权限",
@@ -1179,14 +1182,36 @@ class CNKIAdapter(LiteratureSourceAdapter):
         # a dash while the accessibility label exposes the same title without
         # it.  Use the restricted exact-query canonical form for the click
         # target too; the multi-field identity lock above remains authoritative.
-        click_title = _canonicalize_cnki_exact_query(fresh_record.title)
-        await self.browser.execute(
-            ClickCommand(
-                BrowserTarget(text=click_title, exact_text=True),
-                follow_new_page=True,
-                close_origin_when_sole_page=True,
+        click_titles = tuple(
+            dict.fromkeys(
+                (
+                    _canonicalize_cnki_exact_query(fresh_record.title),
+                    _normalize_cnki_observed_title_spacing(fresh_record.title),
+                    fresh_record.title,
+                    record.title,
+                )
             )
         )
+        last_find_error: BrowserCommandError | None = None
+        for attempt in range(_CNKI_CLICK_RETRIES + 1):
+            for click_title in click_titles:
+                try:
+                    await self.browser.execute(
+                        ClickCommand(
+                            BrowserTarget(text=click_title, exact_text=True),
+                            follow_new_page=True,
+                            close_origin_when_sole_page=True,
+                        )
+                    )
+                    return
+                except BrowserCommandError as exc:
+                    if "browser_find returned no executable snapshot ref" not in str(exc):
+                        raise
+                    last_find_error = exc
+            if attempt < _CNKI_CLICK_RETRIES:
+                await asyncio.sleep(_CNKI_CLICK_RETRY_DELAY_SECONDS)
+        if last_find_error is not None:
+            raise last_find_error
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         content_kind, content, current_url = await self._content()

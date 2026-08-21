@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from hunnu_harness.browser.commands import (
+    BrowserCommandError,
     BrowserObservation,
     BrowserTargetObservation,
     ClickCommand,
@@ -765,6 +766,40 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
             await CNKIAdapter(browser).open_result(expected)
         self.assertEqual(browser.observe_count, 3)
         self.assertTrue(any(isinstance(command, ClickCommand) for command in browser.commands))
+
+    async def test_exact_title_click_retries_transient_missing_find_ref(self) -> None:
+        title = "社会信用环境改善降低了企业违规吗?——来自“中国社会信用体系建设”的证据"
+        html = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 1 条结果</div>
+            <a href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=JRYJ202301001">{title}</a>
+          </main>
+        </body></html>
+        """
+
+        class _TransientClickBrowser(self._HTMLBrowser):
+            def __init__(self, observations: list[str]) -> None:
+                super().__init__(observations)
+                self.click_attempts = 0
+
+            async def execute(self, command):
+                if isinstance(command, ClickCommand):
+                    self.click_attempts += 1
+                    if self.click_attempts == 1:
+                        raise BrowserCommandError(
+                            "MCP browser_find returned no executable snapshot ref"
+                        )
+                return await super().execute(command)
+
+        expected = CNKIAdapter.parse_search_results_html(html, query=title, max_results=1)[0]
+        browser = _TransientClickBrowser([html])
+        adapter = CNKIAdapter(browser)
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._CNKI_CLICK_RETRY_DELAY_SECONDS",
+            0,
+        ):
+            await adapter.open_result(expected)
+        self.assertEqual(browser.click_attempts, 2)
 
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
