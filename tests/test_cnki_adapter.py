@@ -610,6 +610,22 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([record.title for record in records], [title])
         self.assertEqual(browser.observe_count, 2)
 
+    async def test_html_search_can_settle_on_third_bounded_observation(self) -> None:
+        title = "人工智能漂洗、审计监督与盈余管理"
+        transient = """
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><section aria-label="检索结果">检索结果正在加载</section></main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([transient, transient, fixture("cnki_search.html")])
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._SEARCH_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual([record.title for record in records], [title])
+        self.assertEqual(browser.observe_count, 3)
+
     async def test_html_search_does_not_retry_an_explicit_no_results_state(self) -> None:
         title = "不存在的精确论文标题"
         no_results = """
@@ -683,14 +699,35 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
           <main><section aria-label="检索结果">检索结果正在加载</section></main>
         </body></html>
         """
+        browser = self._HTMLBrowser([transient, transient, transient, fixture("cnki_search.html")])
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._SEARCH_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            with self.assertRaisesRegex(SourceUnavailable, "bounded observation"):
+                await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual(browser.observe_count, 3)
+
+    async def test_exact_title_refresh_uses_the_same_bounded_settling(self) -> None:
+        title = "人工智能漂洗、审计监督与盈余管理"
+        transient = """
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><section aria-label="检索结果">检索结果正在加载</section></main>
+        </body></html>
+        """
+        expected = CNKIAdapter.parse_search_results_html(
+            fixture("cnki_search.html"),
+            query=title,
+            max_results=1,
+        )[0]
         browser = self._HTMLBrowser([transient, transient, fixture("cnki_search.html")])
         with patch(
             "hunnu_harness.literature.adapters.cnki._SEARCH_SETTLE_DELAY_SECONDS",
             0,
         ):
-            records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
-        self.assertEqual(records, [])
-        self.assertEqual(browser.observe_count, 2)
+            await CNKIAdapter(browser).open_result(expected)
+        self.assertEqual(browser.observe_count, 3)
+        self.assertTrue(any(isinstance(command, ClickCommand) for command in browser.commands))
 
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):

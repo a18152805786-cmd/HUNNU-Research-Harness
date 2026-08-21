@@ -39,7 +39,8 @@ _DETAIL_PATH_MARKERS = ("/article/abstract", "/detail/detail.aspx", "/kcms/detai
 _REJECT_DOWNLOAD_LABELS = ("批量下载", "多篇下载", "相关推荐", "参考文献下载", "整本下载")
 _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "download pdf", "download caj")
 _CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
-_SEARCH_SETTLE_DELAY_SECONDS = 2.0
+_SEARCH_SETTLE_DELAY_SECONDS = 10.0
+_SEARCH_SETTLE_MAX_OBSERVATIONS = 3
 _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS = (
     "当前机构未获得全文访问权限",
     "机构未获得全文访问权限",
@@ -1080,43 +1081,53 @@ class CNKIAdapter(LiteratureSourceAdapter):
             )
         )
 
+    async def _settled_search_records(
+        self,
+        *,
+        query: str,
+        max_results: int,
+    ) -> tuple[list[LiteratureRecord], str]:
+        """Observe a bounded CNKI result window until it reaches a terminal state."""
+
+        current_url = self.search_origin
+        for observation_number in range(_SEARCH_SETTLE_MAX_OBSERVATIONS):
+            content_kind, content, current_url = await self._content()
+            parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
+            records = parser(
+                content,
+                query=query,
+                source_url=current_url,
+                max_results=max_results,
+            )
+            if records or self._search_outcome_is_stable(content_kind, content):
+                return records, current_url
+            if observation_number + 1 < _SEARCH_SETTLE_MAX_OBSERVATIONS:
+                await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
+        if not _is_cnki_host(urlsplit(current_url).hostname):
+            raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
+        raise SourceUnavailable(
+            "CNKI search results did not reach a terminal state after bounded observation"
+        )
+
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
         mode, search_term = self._search_input(query, request)
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
         await self.browser.execute(NavigateCommand(self.build_search_url(search_term, mode=mode)))
-        content_kind, content, current_url = await self._content()
-        parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
         result_limit = min(request.max_results_per_source, request.max_search_results)
         parse_limit = (
             30
             if mode == "exact_title"
             else result_limit
         )
-        results = parser(
-            content,
+        results, current_url = await self._settled_search_records(
             query=query,
-            source_url=current_url,
             max_results=parse_limit,
         )
         if mode == "exact_title":
             wanted = _canonicalize_cnki_title_identity(search_term)
             results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
         results = results[:result_limit]
-        if not results and not self._search_outcome_is_stable(content_kind, content):
-            await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
-            content_kind, content, current_url = await self._content()
-            parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
-            results = parser(
-                content,
-                query=query,
-                source_url=current_url,
-                max_results=parse_limit,
-            )
-            if mode == "exact_title":
-                wanted = _canonicalize_cnki_title_identity(search_term)
-                results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
-            results = results[:result_limit]
         if not results and not _is_cnki_host(urlsplit(current_url).hostname):
             raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
         return results
@@ -1136,23 +1147,10 @@ class CNKIAdapter(LiteratureSourceAdapter):
         # click its newly observed link instead of replaying the stale URL.
         exact_title_query = _canonicalize_cnki_exact_query(record.title)
         await self.browser.execute(NavigateCommand(self.build_search_url(exact_title_query, mode="exact_title")))
-        content_kind, content, current_url = await self._content()
-        parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
-        fresh_records = parser(
-            content,
+        fresh_records, _current_url = await self._settled_search_records(
             query=record.search_query if record.search_query != UNKNOWN else record.title,
-            source_url=current_url,
             max_results=30,
         )
-        if not fresh_records and content_kind == "snapshot" and "共找到" not in content:
-            content_kind, content, current_url = await self._content()
-            parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
-            fresh_records = parser(
-                content,
-                query=record.search_query if record.search_query != UNKNOWN else record.title,
-                source_url=current_url,
-                max_results=30,
-            )
         fresh_record = next(
             (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),
             None,

@@ -214,13 +214,14 @@ class _RecordingPort:
                 title=self.title,
             )
         if isinstance(command, ObserveCommand):
+            body = "未找到相关结果" if "cnki.net" in self.current_url else "中文文献"
             return BrowserObservation(
                 session=SessionHandle(),
                 page=PageHandle(),
                 generation=len(self.commands),
                 url=self.current_url,
                 title=self.title,
-                html="<html><body>中文文献</body></html>",
+                html=f"<html><body>{body}</body></html>",
                 page_inventory=(BrowserPageSummary(0, self.title, self.current_url),),
                 target_observations=tuple(
                     BrowserTargetObservation(marker=probe, playwright_visible=False)
