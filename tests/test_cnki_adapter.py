@@ -547,6 +547,99 @@ class CNKIAuthenticationClassificationTests(unittest.TestCase):
             )
 
 
+class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
+    class _HTMLBrowser:
+        navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+        def __init__(self, observations: list[str]) -> None:
+            self.observations = observations
+            self.observe_count = 0
+            self.current_url = "about:blank"
+            self.session = SessionHandle("html-search-settling-test")
+            self.page_handle = PageHandle("main", session=self.session)
+
+        async def execute(self, command):
+            if isinstance(command, NavigateCommand):
+                self.current_url = command.url
+                return self._observation(self.observations[0])
+            if isinstance(command, ObserveCommand):
+                index = min(self.observe_count, len(self.observations) - 1)
+                self.observe_count += 1
+                return self._observation(self.observations[index])
+            raise AssertionError(type(command).__name__)
+
+        def _observation(self, html: str) -> BrowserObservation:
+            return BrowserObservation(
+                session=self.session,
+                page=self.page_handle,
+                generation=self.observe_count,
+                url=self.current_url,
+                title="检索-中国知网",
+                html=html,
+            )
+
+    @staticmethod
+    def _request(title: str) -> LiteratureSearchRequest:
+        return LiteratureSearchRequest(
+            original_research_request="CNKI dynamic HTML search result",
+            exact_titles=(title,),
+            max_search_results=1,
+            max_results_per_source=1,
+            max_downloads=0,
+            max_downloads_per_run=0,
+        )
+
+    async def test_html_search_reobserves_once_when_initial_page_has_no_terminal_marker(self) -> None:
+        title = "人工智能漂洗、审计监督与盈余管理"
+        transient = """
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><section aria-label="检索结果">检索结果正在加载</section></main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([transient, fixture("cnki_search.html")])
+        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual([record.title for record in records], [title])
+        self.assertEqual(browser.observe_count, 2)
+
+    async def test_html_search_does_not_retry_an_explicit_no_results_state(self) -> None:
+        title = "不存在的精确论文标题"
+        no_results = """
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><section aria-label="检索结果">抱歉，未找到相关结果</section></main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([no_results, fixture("cnki_search.html")])
+        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual(records, [])
+        self.assertEqual(browser.observe_count, 1)
+
+    async def test_html_search_does_not_retry_after_an_explicit_result_count(self) -> None:
+        title = "人工智能漂洗、审计监督与盈余管理"
+        counted_results = """
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 1 条结果</div>
+            <a href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=OTHER2026001">其他论文</a>
+          </main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([counted_results, fixture("cnki_search.html")])
+        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual(records, [])
+        self.assertEqual(browser.observe_count, 1)
+
+    async def test_html_search_retry_remains_bounded_when_page_never_settles(self) -> None:
+        title = "不存在的精确论文标题"
+        transient = """
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><section aria-label="检索结果">检索结果正在加载</section></main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([transient, transient, fixture("cnki_search.html")])
+        records = await CNKIAdapter(browser).search(f'"{title}"', self._request(title))
+        self.assertEqual(records, [])
+        self.assertEqual(browser.observe_count, 2)
+
+
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_mcp_snapshot_fallback_ignores_proven_offscreen_challenge(self) -> None:
         class _StructuredBrowser:

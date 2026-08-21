@@ -1063,6 +1063,21 @@ class CNKIAdapter(LiteratureSourceAdapter):
         await self._inspect_live_challenge(observation)
         return "html", observation.require_html(), observation.url
 
+    @classmethod
+    def _search_outcome_is_stable(cls, content_kind: str, content: str) -> bool:
+        """Return whether CNKI has rendered an explicit terminal search state."""
+
+        text = cls._parser(content).visible_body_text if content_kind == "html" else content
+        compact = re.sub(r"\s+", "", html_lib.unescape(text)).casefold()
+        if re.search(r"共(?:为您)?找到(?:约)?[\d,，]+(?:条|篇|项)?(?:结果|记录|文献)?", compact):
+            return True
+        return bool(
+            re.search(
+                r"(?:未找到|没有找到|未检索到|没有检索到|暂无|无符合条件的).{0,40}(?:结果|记录|文献)",
+                compact,
+            )
+        )
+
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
         mode, search_term = self._search_input(query, request)
         if self.browser is None:
@@ -1086,7 +1101,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             wanted = _canonicalize_cnki_title_identity(search_term)
             results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
         results = results[:result_limit]
-        if not results and content_kind == "snapshot" and "共找到" not in content:
+        if not results and not self._search_outcome_is_stable(content_kind, content):
             content_kind, content, current_url = await self._content()
             parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
             results = parser(
