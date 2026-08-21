@@ -1187,7 +1187,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 (
                     _canonicalize_cnki_exact_query(fresh_record.title),
                     _normalize_cnki_observed_title_spacing(fresh_record.title),
+                    fresh_record.title.replace("？", "?"),
                     fresh_record.title,
+                    record.title.replace("？", "?") if record.title != UNKNOWN else record.title,
                     record.title,
                 )
             )
