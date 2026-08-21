@@ -98,6 +98,23 @@ class CNKIParserTests(unittest.TestCase):
         self.assertNotIn("temporary-removed", records[0].source_page)
         self.assertEqual(records[0].source_database, "CNKI")
 
+    def test_highlighted_exact_title_collapses_only_cnki_markup_spacing(self) -> None:
+        title = "供应链冲击、多元化战略与企业发展韧性——来自中国重大自然灾害的证据"
+        html = f"""
+        <html><body><main><div>共找到 1 条结果</div>
+          <a class="fz14 inline" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=GGYY202409007">
+            <font color="red">供应链冲击</font>、<font color="red">多元化战略与企业发展韧性</font>
+            ——<font color="red">来自中国重大自然灾害的证据</font>
+          </a>
+        </main></body></html>
+        """
+        records = CNKIAdapter.parse_search_results_html(html, query=title, max_results=1)
+        self.assertEqual([record.title for record in records], [title])
+        self.assertEqual(
+            _canonicalize_cnki_title_identity(records[0].title),
+            _canonicalize_cnki_title_identity(title),
+        )
+
     def test_search_modes_are_explicit_and_do_not_embed_credentials(self) -> None:
         self.assertIn("korder=TI", CNKIAdapter.build_search_url("人工智能漂洗", mode="exact_title"))
         self.assertIn("korder=AU", CNKIAdapter.build_search_url("张三", mode="author"))
@@ -113,7 +130,7 @@ class CNKIParserTests(unittest.TestCase):
         detail = LiteratureRecord(paper_id="detail", title=observed)
         self.assertTrue(CNKIAdapter.identity_matches(search, detail)[0])
 
-    def test_exact_title_query_removes_only_dash_adjacent_spaces(self) -> None:
+    def test_exact_title_query_removes_cnki_markup_spacing_but_keeps_english_spaces(self) -> None:
         spaced = "A —— B"
         compact = "A——B"
         self.assertEqual(
@@ -122,6 +139,7 @@ class CNKIParserTests(unittest.TestCase):
         )
         url = CNKIAdapter.build_search_url(spaced, mode="exact_title")
         self.assertNotIn("+%E2%80%94", url)
+        self.assertEqual(_canonicalize_cnki_title_identity("AI and firms"), "ai and firms")
 
     def test_form_plus_between_words_is_decoded_at_the_query_boundary(self) -> None:
         self.assertEqual(_decode_cnki_form_query_value("A+B"), "A B")

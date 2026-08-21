@@ -69,6 +69,8 @@ _INSTITUTIONAL_ACCESS_MARKERS = (
 )
 _CNKI_DASH_CHARS = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 _CNKI_DASH_SPACE_RE = re.compile(rf"\s*([{_CNKI_DASH_CHARS}])\s*")
+_CNKI_CJK_JOIN_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
+_CNKI_ENUMERATION_SPACE_RE = re.compile(r"\s*([、])\s*")
 
 
 def _decode_cnki_form_query_value(value: str) -> str:
@@ -81,18 +83,27 @@ def _decode_cnki_form_query_value(value: str) -> str:
     return html_lib.unescape(unquote_plus(str(value)))
 
 
+def _normalize_cnki_plain_title_spacing(value: str) -> str:
+    """Remove only nonsemantic spacing introduced around CNKI title markup."""
+
+    text = html_lib.unescape(unicodedata.normalize("NFKC", str(value)))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = _CNKI_CJK_JOIN_SPACE_RE.sub("", text)
+    text = _CNKI_ENUMERATION_SPACE_RE.sub(r"\1", text)
+    return _CNKI_DASH_SPACE_RE.sub(r"\1", text)
+
+
 def _canonicalize_cnki_exact_query(value: str) -> str:
     """Canonicalize plain text used to build a CNKI exact-title query.
 
     This is deliberately a query-input operation, not a URL decoder. It
-    removes only nonsemantic whitespace adjacent to the dash forms observed
-    in CNKI titles, so ``quote_plus`` cannot turn that layout difference into
-    a literal ``+`` in CNKI's search box.
+    removes only nonsemantic whitespace observed around nested highlighted
+    fragments, enumeration commas, and dash forms in CNKI titles, so
+    ``quote_plus`` cannot turn those layout differences into literal ``+``
+    characters in CNKI's search box.
     """
 
-    text = html_lib.unescape(unicodedata.normalize("NFKC", str(value)))
-    text = re.sub(r"\s+", " ", text).strip()
-    return _CNKI_DASH_SPACE_RE.sub(r"\1", text)
+    return _normalize_cnki_plain_title_spacing(value)
 
 
 def _canonicalize_cnki_title_identity(value: str) -> str:
@@ -103,10 +114,7 @@ def _canonicalize_cnki_title_identity(value: str) -> str:
     when the input is known to be encoded query data.
     """
 
-    text = html_lib.unescape(unicodedata.normalize("NFKC", str(value)))
-    text = re.sub(r"\s+", " ", text).strip()
-    text = _CNKI_DASH_SPACE_RE.sub(r"\1", text)
-    return text.casefold()
+    return _normalize_cnki_plain_title_spacing(value).casefold()
 
 
 def _cnki_known(value: str) -> bool:
@@ -472,7 +480,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             parsed = urlsplit(absolute)
             if not _is_cnki_host(parsed.hostname) or not any(marker in parsed.path.casefold() for marker in _DETAIL_PATH_MARKERS):
                 continue
-            title = re.sub(r"\s+", " ", anchor.text).strip()
+            title = _normalize_cnki_plain_title_spacing(anchor.text)
             if not title or any(label in title for label in _REJECT_DOWNLOAD_LABELS):
                 continue
             stable_identifier = _stable_identifier(absolute)
