@@ -1194,6 +1194,11 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 )
             )
         )
+        # CNKI can expose the result row in the settled HTML before the
+        # accessibility snapshot has attached an executable link reference.
+        # Give that bounded result window one short settle interval before the
+        # first exact-title click; the retry below remains fail-closed.
+        await asyncio.sleep(_CNKI_CLICK_RETRY_DELAY_SECONDS)
         last_find_error: BrowserCommandError | None = None
         for attempt in range(_CNKI_CLICK_RETRIES + 1):
             for click_title in click_titles:
