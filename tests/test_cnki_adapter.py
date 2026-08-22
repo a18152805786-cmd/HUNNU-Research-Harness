@@ -210,6 +210,17 @@ class CNKIParserTests(unittest.TestCase):
         )
         self.assertTrue(CNKIAdapter.identity_matches(left, right)[0])
 
+    def test_exact_title_relock_accepts_cnki_subtitle_separator_variant(self) -> None:
+        left = LiteratureRecord(
+            paper_id="left",
+            title="最低工资与异质性人力资本需求——基于招聘网站数据的研究",
+        )
+        right = LiteratureRecord(
+            paper_id="right",
+            title="最低工资与异质性人力资本需求:基于招聘网站数据的研究",
+        )
+        self.assertTrue(CNKIAdapter.identity_matches(left, right)[0])
+
     def test_existing_cnki_exact_title_fixture_identity_remains_locked(self) -> None:
         search = CNKIAdapter.parse_search_results_html(
             fixture("cnki_search.html"), query="人工智能漂洗", max_results=1

@@ -75,6 +75,7 @@ _CNKI_DASH_SPACE_RE = re.compile(rf"\s*([{_CNKI_DASH_CHARS}])\s*")
 _CNKI_CJK_JOIN_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 _CNKI_ENUMERATION_SPACE_RE = re.compile(r"\s*([、])\s*")
 _CNKI_MARKUP_PUNCT_SPACE_RE = re.compile(r'\s*([?!:：“”‘’「」『』《》〈〉【】〔〕（）])\s*')
+_CNKI_SUBTITLE_SEPARATOR_RE = re.compile(r"[:：](?=(?:基于|来自|关于|对))")
 
 
 def _decode_cnki_form_query_value(value: str) -> str:
@@ -127,7 +128,12 @@ def _canonicalize_cnki_title_identity(value: str) -> str:
     when the input is known to be encoded query data.
     """
 
-    return _normalize_cnki_observed_title_spacing(value).casefold()
+    text = _normalize_cnki_observed_title_spacing(value)
+    # CNKI sometimes renders the same subtitle separator as a colon on the
+    # result page and as an em dash on the article page.  Treat only the
+    # common subtitle lead-ins as equivalent; other punctuation remains strict.
+    text = _CNKI_SUBTITLE_SEPARATOR_RE.sub("——", text)
+    return text.casefold()
 
 
 def _cnki_known(value: str) -> bool:
