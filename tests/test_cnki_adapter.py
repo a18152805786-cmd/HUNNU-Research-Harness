@@ -197,6 +197,19 @@ class CNKIParserTests(unittest.TestCase):
         self.assertFalse(matched)
         self.assertEqual(reason, "Year mismatch")
 
+    def test_exact_title_relock_ignores_cnki_affiliation_markers(self) -> None:
+        left = LiteratureRecord(
+            paper_id="left",
+            title="企业如何出口骗税",
+            authors=("李红 1; 包群 2; 樊军锋 2",),
+        )
+        right = LiteratureRecord(
+            paper_id="right",
+            title="企业如何出口骗税",
+            authors=("李红", "包群", "樊军锋"),
+        )
+        self.assertTrue(CNKIAdapter.identity_matches(left, right)[0])
+
     def test_existing_cnki_exact_title_fixture_identity_remains_locked(self) -> None:
         search = CNKIAdapter.parse_search_results_html(
             fixture("cnki_search.html"), query="人工智能漂洗", max_results=1
@@ -231,6 +244,22 @@ class CNKIParserTests(unittest.TestCase):
         self.assertEqual(record.doi, "10.27041/j.cnki.cjkx.2026.02.008")
         self.assertEqual(record.keywords, ("人工智能", "AI漂洗"))
         self.assertIn("媒体监督", record.abstract)
+
+    def test_structured_snapshot_accepts_volume_comma_spacing(self) -> None:
+        snapshot = fixture("cnki_article_snapshot.yml").replace(
+            "财经科学 . 2026 (02) : 113-126",
+            "财经科学 . 2026 ,46 (02) : 113-126",
+        )
+        record = CNKIAdapter.parse_article_snapshot(
+            snapshot,
+            source_url=(
+                "https://kns.cnki.net/kcms2/article/abstract?"
+                "dbcode=CJFQ&filename=CJKX202602009"
+            ),
+        )
+        self.assertEqual(record.year, "2026")
+        self.assertEqual(record.issue, "02")
+        self.assertEqual(record.pages_or_article_number, "113-126")
 
     def test_structured_snapshot_access_prefers_authorized_pdf(self) -> None:
         decision = CNKIAdapter.check_fulltext_access_snapshot(

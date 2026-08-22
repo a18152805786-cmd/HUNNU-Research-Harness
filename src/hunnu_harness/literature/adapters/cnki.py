@@ -135,7 +135,19 @@ def _cnki_known(value: str) -> bool:
 
 
 def _cnki_authors_identity(authors: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(_canonicalize_cnki_title_identity(author) for author in authors if _cnki_known(author))
+    normalized: list[str] = []
+    for author in authors:
+        if not _cnki_known(author):
+            continue
+        # CNKI result rows may append affiliation markers (for example
+        # ``李红 1; 包群 2``) while the article page exposes one author link
+        # per person.  Strip only trailing numeric markers at this identity
+        # boundary; the bibliographic author text itself remains unchanged.
+        for item in re.split(r"[;；,，、]+", str(author)):
+            value = re.sub(r"\s*\d+\s*$", "", item).strip()
+            if value:
+                normalized.append(_canonicalize_cnki_title_identity(value))
+    return tuple(normalized)
 
 
 def _is_cnki_host(hostname: str | None) -> bool:
@@ -620,7 +632,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             journal = _text_field(body, "来源", "期刊")
         source_line = parser.first_block("source")
         source_match = re.search(
-            r"^(.+?)\s*\.\s*((?:18|19|20|21)\d{2})\s*\(([^)]+)\)\s*:\s*([0-9]+(?:\s*[-–—]\s*[0-9]+)?)",
+            r"^(.+?)\s*\.\s*((?:18|19|20|21)\d{2})\s*(?:[,，]\s*\d+)?\s*\(([^)]+)\)\s*[:：]\s*([0-9]+(?:\s*[-–—]\s*[0-9]+)?)",
             source_line,
         )
         if source_match:
@@ -775,7 +787,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             header_text,
         )
         source_match = re.search(
-            r"((?:18|19|20|21)\d{2})\s*\(([^)]+)\)\s*[：:]\s*([0-9]+(?:\s*[-–—]\s*[0-9]+)?)",
+            r"((?:18|19|20|21)\d{2})\s*(?:[,，]\s*\d+)?\s*\(([^)]+)\)\s*[：:]\s*([0-9]+(?:\s*[-–—]\s*[0-9]+)?)",
             header_text,
         )
         date = date_match.group(1) if date_match else (source_match.group(1) if source_match else UNKNOWN)
