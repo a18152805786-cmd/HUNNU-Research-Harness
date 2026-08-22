@@ -1159,7 +1159,21 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
         if mode == "exact_title":
             wanted = _canonicalize_cnki_title_identity(search_term)
-            results = [record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted]
+            exact_matches = [
+                record for record in results if _canonicalize_cnki_title_identity(record.title) == wanted
+            ]
+            if exact_matches:
+                results = exact_matches
+            else:
+                # CNKI occasionally replaces a subtitle dash with a colon in
+                # the rendered title (for example ``——基于`` vs ``：基于``).
+                # Allow one bounded punctuation-equivalent result to proceed;
+                # the fresh detail-page identity lock remains authoritative.
+                normalized_wanted = normalize_title(search_term)
+                normalized_matches = [
+                    record for record in results if normalize_title(record.title) == normalized_wanted
+                ]
+                results = normalized_matches if len(normalized_matches) == 1 else []
         results = results[:result_limit]
         if not results and not _is_cnki_host(urlsplit(current_url).hostname):
             raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
