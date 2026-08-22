@@ -74,7 +74,7 @@ _CNKI_DASH_CHARS = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 _CNKI_DASH_SPACE_RE = re.compile(rf"\s*([{_CNKI_DASH_CHARS}])\s*")
 _CNKI_CJK_JOIN_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 _CNKI_ENUMERATION_SPACE_RE = re.compile(r"\s*([、])\s*")
-_CNKI_MARKUP_PUNCT_SPACE_RE = re.compile(r'\s*([?!“”‘’「」『』《》〈〉【】〔〕（）])\s*')
+_CNKI_MARKUP_PUNCT_SPACE_RE = re.compile(r'\s*([?!:：“”‘’「」『』《》〈〉【】〔〕（）])\s*')
 
 
 def _decode_cnki_form_query_value(value: str) -> str:

@@ -740,7 +740,7 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_exact_title_accepts_single_cnki_subtitle_punctuation_variant(self) -> None:
         requested = "最低工资与异质性人力资本需求——基于招聘网站数据的研究"
-        observed = "最低工资与异质性人力资本需求:基于招聘网站数据的研究"
+        observed = "最低工资与异质性人力资本需求 : 基于招聘网站数据的研究"
         counted_results = f"""
         <html><head><title>检索-中国知网</title></head><body>
           <main><div>共找到 1 条结果</div>
@@ -750,7 +750,10 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         """
         browser = self._HTMLBrowser([counted_results])
         records = await CNKIAdapter(browser).search(f'"{requested}"', self._request(requested))
-        self.assertEqual([record.title for record in records], [observed])
+        self.assertEqual(
+            [record.title for record in records],
+            ["最低工资与异质性人力资本需求:基于招聘网站数据的研究"],
+        )
         self.assertEqual(browser.observe_count, 1)
 
     async def test_exact_title_refresh_relocks_target_after_first_ten_results(self) -> None:
