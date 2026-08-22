@@ -1237,13 +1237,25 @@ class CNKIAdapter(LiteratureSourceAdapter):
         for attempt in range(_CNKI_CLICK_RETRIES + 1):
             for click_title in click_titles:
                 try:
-                    await self.browser.execute(
+                    click_result = await self.browser.execute(
                         ClickCommand(
                             BrowserTarget(text=click_title, exact_text=True),
                             follow_new_page=True,
                             close_origin_when_sole_page=True,
                         )
                     )
+                    # Some CNKI result rows acknowledge the click but keep the
+                    # active page on the search result document.  The result
+                    # URL was freshly relocked above, so a single typed
+                    # navigation is a bounded, identity-preserving fallback;
+                    # the detail-page parser and target identity lock remain
+                    # authoritative before any download.
+                    clicked_url = getattr(click_result, "url", "")
+                    if not any(
+                        marker in urlsplit(str(clicked_url)).path.casefold()
+                        for marker in _DETAIL_PATH_MARKERS
+                    ):
+                        await self.browser.execute(NavigateCommand(fresh_record.navigation_url))
                     return
                 except BrowserCommandError as exc:
                     if "browser_find returned no executable snapshot ref" not in str(exc):

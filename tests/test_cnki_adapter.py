@@ -788,6 +788,22 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         click = next(command for command in reversed(browser.commands) if isinstance(command, ClickCommand))
         self.assertEqual(click.target.text, title)
 
+    async def test_exact_title_click_falls_back_to_fresh_detail_url_when_click_stays_on_results(self) -> None:
+        title = "最低工资与异质性人力资本需求——基于招聘网站数据的研究"
+        html = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 1 条结果</div>
+            <a href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=SJJJ202312003">{title}</a>
+          </main>
+        </body></html>
+        """
+        browser = self._HTMLBrowser([html])
+        expected = CNKIAdapter.parse_search_results_html(html, query=title, max_results=1)[0]
+        await CNKIAdapter(browser).open_result(expected)
+        navigations = [command.url for command in browser.commands if isinstance(command, NavigateCommand)]
+        self.assertEqual(len(navigations), 2)
+        self.assertIn("/kcms2/article/abstract?", navigations[-1])
+
     async def test_html_search_retry_remains_bounded_when_page_never_settles(self) -> None:
         title = "不存在的精确论文标题"
         transient = """
