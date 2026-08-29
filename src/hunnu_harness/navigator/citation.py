@@ -126,7 +126,12 @@ def _author_tokens(head: str) -> list[str]:
                 if 2 <= len(name) <= 5:
                     names.append(name)
         elif len(part.split()) <= 4 and any(char.isalpha() for char in part):
-            names.append(part)
+            # "Biddle, G., Hilary, G." splits into surnames and bare initials.
+            # An initial is not a name: counting it as one makes a complete
+            # author match look like 3-of-5 agreement and can push a correct
+            # citation below the match threshold.
+            if len(part.replace(".", "").strip()) > 1:
+                names.append(part)
     return [name for name in dict.fromkeys(names) if name][:8]
 
 

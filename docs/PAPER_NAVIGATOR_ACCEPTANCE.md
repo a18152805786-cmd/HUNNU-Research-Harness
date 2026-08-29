@@ -47,8 +47,8 @@ Catalog changes:                 0    (0 expected)
 Unexpected physical file changes: 0   (0 expected)
 Potential paper loss:            NONE (NONE expected)
 
-Test suite:                      688 passed, 0 failed
-                                 (550 pre-existing, unchanged + 138 new)
+Test suite:                      689 passed, 0 failed
+                                 (550 pre-existing, unchanged + 139 new)
 Failure modes exercised:         20 / 20 pass
 ```
 

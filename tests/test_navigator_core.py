@@ -569,6 +569,16 @@ class CitationTests(unittest.TestCase):
         self.assertEqual(parsed.year, "2026")
         self.assertTrue(parsed.title_guess)
 
+    def test_initials_are_not_counted_as_authors(self):
+        """"Biddle, G., Hilary, G." is two authors, not four."""
+
+        parsed = parse_citation(
+            "Biddle, G., Hilary, G., Verdi, R. (2009). Accounting quality. JAE."
+        )
+        self.assertEqual(list(parsed.authors), ["Biddle", "Hilary", "Verdi"])
+        self.assertNotIn("G", parsed.authors)
+        self.assertNotIn("R", parsed.authors)
+
     def test_doi_citation_matches_exactly(self):
         with tempfile.TemporaryDirectory() as raw:
             navigator = self._navigator(Path(raw))

@@ -9,17 +9,17 @@ Harness `0.2.21` + Navigator `navigator-0.1`, Python 3.12.13 (`.venv`), Windows 
 
 ```
 Baseline before any Navigator code   550 passed in 21.5 s
-After Navigator                      688 passed in 29.5 s
+After Navigator                      689 passed in 28.4 s
 ```
 
 | Suite | Tests | Result |
 |---|---|---|
 | Pre-existing Harness suite | 550 | **all pass, unchanged** |
-| `tests/test_navigator_core.py` (synthetic, temp dirs) | 62 | **pass** |
+| `tests/test_navigator_core.py` (synthetic, temp dirs) | 63 | **pass** |
 | `tests/test_navigator_acceptance.py` (real 179 WORKS) | 76 | **pass** |
-| **Total** | **688** | **0 failures, 0 errors** |
+| **Total** | **689** | **0 failures, 0 errors** |
 
-No pre-existing test was modified, skipped, or weakened. The 138 new tests are
+No pre-existing test was modified, skipped, or weakened. The 139 new tests are
 purely additive.
 
 ## 2. Acceptance tests on the real corpus
@@ -163,6 +163,7 @@ not as a reason to re-acquire.
 | `doi:10.9999/fabricated.2030.0001` | `NOT_IN_LIBRARY` |
 | Handoff returned | identity + `acquisition_request_hint` + `agent-route` entry point |
 | Real citations still found | Chinese title → `P4451110E69BF`; real DOI → correct WORK |
+| APA citation with initials → correct WORK | `Biddle, G., Hilary, G., Verdi, R. (2009)…` → `P48F6ACEC90DC`, evidence `title_token_overlap 0.875`, `author_agreement 1.0`, `year_match true`, score 0.925 |
 
 **A hallucination risk was found and fixed here.** The first implementation fell
 back to lexical similarity when an exact identity missed, so an unknown DOI
@@ -349,6 +350,7 @@ would be over-engineering.
 | 6 | Write-guard test was a grep and produced a false positive on `cli.py` | Low (test-only) | Replaced with a runtime filesystem interception guard |
 | 7 | CJK bigram fragments made human-readable reasons unreadable | Low | `display_terms()` filter for human-facing text only |
 | 8 | Matched-passage page list repeated page numbers | Low | Deduplicated and sorted |
+| 9 | Citation parser counted bare initials as authors ("Biddle, G." = 2 authors), under-reporting `author_agreement` as 0.6 for a perfect match | Medium — could sink a borderline true match below the 0.72 threshold | Initials dropped; the Biddle/Hilary/Verdi (2009) citation now scores 0.925 with `author_agreement: 1.0`, and all fictional citations are still refused |
 
 ## 8. What was not tested
 
