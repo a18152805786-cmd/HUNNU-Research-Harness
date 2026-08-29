@@ -80,12 +80,29 @@ logs/private/*
 *.py[cod]
 __pycache__/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 .venv/
 dist/
 build/
 *.egg-info/
+
+# Playwright report/trace output (traces are also covered by *.zip above)
+/test-results/
+/playwright-report/
+/.playwright/
+
+# Editor, patch, and merge leftovers
+*.bak
+*.orig
+*.rej
+*~
+.DS_Store
+Thumbs.db
 
 # Local config overrides
 config/config.local.yaml
