@@ -21,7 +21,16 @@ from ...browser.commands import (
 )
 from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
-from ..cnki_challenge import CNKIChallengeDetector, ChallengeDiagnostic, ChallengeState
+from ..cnki_challenge import (
+    CAPTCHA_CHALLENGE_STATES,
+    CNKIChallengeDetector,
+    ChallengeDiagnostic,
+    ChallengeState,
+    StaticChallengeEvidence,
+    challenge_state_requires_manual_action,
+    classify_static_challenge,
+    resolve_challenge_state,
+)
 from ..models import (
     AccessDecision,
     AccessType,
@@ -292,6 +301,117 @@ def _snapshot_node_text(line: str) -> str:
     return _snapshot_unquote(labelled_match.group("label")).strip() if labelled_match else ""
 
 
+#: Offsets at least this far outside the document are treated as "parked"
+#: rather than merely scrolled: CNKI preloads its verification component at
+#: coordinates such as ``top:-1000000px``, and ``left:-9999px`` is the classic
+#: off-screen idiom.  A sticky header at ``top:-40px`` stays on screen.
+_OFFSCREEN_OFFSET_THRESHOLD_PX = 2000
+_OVERLAY_NAME_MARKERS = ("mask", "overlay", "modal", "dialog", "backdrop", "popup", "shade")
+_VOID_ELEMENTS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+
+#: Text fragments that indicate a CNKI verification component *exists*.  They
+#: are shared by every static probe so no module keeps its own private list.
+_CHALLENGE_TEXT_MARKERS = (
+    "拖动下方拼图完成验证",
+    "captcha",
+    "验证码",
+    "滑块",
+    "拼图",
+    "安全验证",
+    "人机验证",
+    "访问过于频繁",
+)
+
+
+def _contains_challenge_marker(value: str) -> bool:
+    lowered = value.casefold()
+    return any(marker in lowered for marker in _CHALLENGE_TEXT_MARKERS)
+
+
+def _style_declarations(style: str) -> dict[str, str]:
+    """Split an already whitespace-stripped inline style into declarations."""
+
+    declarations: dict[str, str] = {}
+    for item in style.split(";"):
+        name, separator, value = item.partition(":")
+        if separator and name:
+            declarations[name] = value
+    return declarations
+
+
+def _css_px(value: str) -> float | None:
+    match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(?:px)?", value)
+    return float(match.group(1)) if match else None
+
+
+def _style_is_inert(declarations: dict[str, str]) -> bool:
+    """Return whether an inline style parks an element outside the rendered page.
+
+    This is the static counterpart of the runtime detector's viewport and
+    ancestor-opacity checks.  It proves a component is *not* on screen; it
+    never proves that one is.
+    """
+
+    opacity = declarations.get("opacity")
+    if opacity is not None:
+        value = _css_px(opacity)
+        if value is not None and value <= 0:
+            return True
+    for axis in ("top", "left", "right", "bottom", "text-indent", "margin-left", "margin-top"):
+        offset = _css_px(declarations.get(axis, ""))
+        if offset is not None and offset <= -_OFFSCREEN_OFFSET_THRESHOLD_PX:
+            return True
+    transform = declarations.get("transform", "")
+    if any(
+        offset is not None and offset <= -_OFFSCREEN_OFFSET_THRESHOLD_PX
+        for offset in (_css_px(item) for item in re.findall(r"-?\d+(?:\.\d+)?px", transform))
+    ):
+        return True
+    if declarations.get("clip-path", "").startswith("inset(100%"):
+        return True
+    if re.fullmatch(r"rect\(0(?:px)?,0(?:px)?,0(?:px)?,0(?:px)?\)", declarations.get("clip", "")):
+        return True
+    for axis in ("width", "height"):
+        size = _css_px(declarations.get(axis, ""))
+        if size is not None and size <= 0:
+            return True
+    return False
+
+
+def _style_is_blocking_overlay(declarations: dict[str, str], names: set[str]) -> bool:
+    """Return whether inline markup declares a layer that covers the page.
+
+    Only positioned layers count, and only when they are either named as a
+    mask/overlay or stacked above the page content.  A parked component is
+    excluded by the caller before this runs.
+    """
+
+    position = declarations.get("position", "")
+    if position not in {"fixed", "absolute", "sticky"}:
+        return False
+    if any(marker in name for name in names for marker in _OVERLAY_NAME_MARKERS):
+        return True
+    z_index = _css_px(declarations.get("z-index", ""))
+    return z_index is not None and z_index >= 100
+
+
 class _CNKIHTMLParser(_ScienceDirectHTMLParser):
     """Capture CNKI's stable semantic blocks in addition to citation metadata."""
 
@@ -302,9 +422,17 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         self.institution_login_status = False
         self.authenticated_institution_labels: list[str] = []
         self.visible_text_parts: list[str] = []
+        self.overlay_text_parts: list[str] = []
+        self.document_title_parts: list[str] = []
+        self._document_title_depth = 0
         self._capture_stack: list[tuple[str, str, list[str]]] = []
-        self._hidden_element_tags: list[str] = []
-        self._non_content_tags: list[str] = []
+        # Subtree state is tracked by position in the open-element stack rather
+        # than by tag name: a parked ``<div>`` wrapper must stay parked while
+        # its ordinary ``<div>`` children open and close inside it.
+        self._open_tags: list[str] = []
+        self._hidden_depths: list[int] = []
+        self._non_content_depths: list[int] = []
+        self._overlay_depths: list[int] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
@@ -312,15 +440,27 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         lowered = tag.casefold()
         classes = set(attributes.get("class", "").casefold().split())
         style = re.sub(r"\s+", "", attributes.get("style", "").casefold())
-        if (
+        declarations = _style_declarations(style)
+        inert = (
             "hidden" in attributes
             or attributes.get("aria-hidden", "").casefold() == "true"
-            or "display:none" in style
-            or "visibility:hidden" in style
-        ):
-            self._hidden_element_tags.append(lowered)
-        if lowered in {"script", "style", "noscript", "template"}:
-            self._non_content_tags.append(lowered)
+            or declarations.get("display") == "none"
+            or declarations.get("visibility") in {"hidden", "collapse"}
+            or _style_is_inert(declarations)
+        )
+        if lowered not in _VOID_ELEMENTS:
+            self._open_tags.append(lowered)
+            depth = len(self._open_tags)
+            if inert:
+                # Parked, transparent, and declared-hidden subtrees are recorded
+                # so their text never counts as rendered on screen.
+                self._hidden_depths.append(depth)
+            elif _style_is_blocking_overlay(declarations, classes | {attributes.get("id", "").casefold()}):
+                self._overlay_depths.append(depth)
+            if lowered in {"script", "style", "noscript", "template"}:
+                self._non_content_depths.append(depth)
+            if lowered == "title":
+                self._document_title_depth += 1
         if "ecp_header_login_status1" in classes:
             self.institution_login_status = True
         if "ecp_header_unitname" in classes:
@@ -343,35 +483,55 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
 
     def handle_data(self, data: str) -> None:
         super().handle_data(data)
-        if self._hidden_element_tags or self._non_content_tags:
+        if self._document_title_depth:
+            self.document_title_parts.append(data.strip())
+        if self._hidden_depths or self._non_content_depths:
             return
         stripped = data.strip()
         if stripped:
             self.visible_text_parts.append(stripped)
+            if self._overlay_depths:
+                self.overlay_text_parts.append(stripped)
         for _, _, parts in self._capture_stack:
             parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.casefold()
+        if lowered == "title" and self._document_title_depth:
+            self._document_title_depth -= 1
         if lowered == "a" and self._capture_stack and self._anchor_stack:
             if any(key == "authors" for _, key, _ in self._capture_stack):
                 author = re.sub(r"\s+", " ", " ".join(self._anchor_stack[-1][2])).strip()
                 if author:
                     self.author_links.append(author)
         super().handle_endtag(tag)
-        for index in range(len(self._hidden_element_tags) - 1, -1, -1):
-            if self._hidden_element_tags[index] == lowered:
-                del self._hidden_element_tags[index]
-                break
-        for index in range(len(self._non_content_tags) - 1, -1, -1):
-            if self._non_content_tags[index] == lowered:
-                del self._non_content_tags[index]
-                break
+        self._close_element(lowered)
         if self._capture_stack and self._capture_stack[-1][0] == lowered:
             _, key, parts = self._capture_stack.pop()
             value = re.sub(r"\s+", " ", " ".join(parts)).strip()
             if value:
                 self.blocks[key].append(value)
+
+    def _close_element(self, tag: str) -> None:
+        """Close the nearest matching open element and any unclosed descendants.
+
+        Real CNKI markup leaves elements unclosed, so an end tag closes back to
+        its nearest matching start tag.  Subtree state is then trimmed to the
+        remaining depth, which keeps a parked wrapper active for exactly its
+        own subtree and never leaks past it.
+        """
+
+        if tag in _VOID_ELEMENTS:
+            return
+        for index in range(len(self._open_tags) - 1, -1, -1):
+            if self._open_tags[index] != tag:
+                continue
+            del self._open_tags[index:]
+            remaining = len(self._open_tags)
+            self._hidden_depths = [depth for depth in self._hidden_depths if depth <= remaining]
+            self._non_content_depths = [depth for depth in self._non_content_depths if depth <= remaining]
+            self._overlay_depths = [depth for depth in self._overlay_depths if depth <= remaining]
+            return
 
     def first_block(self, key: str) -> str:
         values = self.blocks.get(key, [])
@@ -380,6 +540,21 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
     @property
     def visible_body_text(self) -> str:
         return " ".join(self.visible_text_parts)
+
+    @property
+    def overlay_body_text(self) -> str:
+        return " ".join(self.overlay_text_parts)
+
+    @property
+    def document_title(self) -> str:
+        """The ``<title>`` element, i.e. the page's own identity.
+
+        This is deliberately distinct from ``og:title``/``citation_title``,
+        which carry the *article* title and may legitimately name CAPTCHA
+        research.
+        """
+
+        return " ".join(part for part in self.document_title_parts if part)
 
 
 class CNKIAdapter(LiteratureSourceAdapter):
@@ -403,38 +578,96 @@ class CNKIAdapter(LiteratureSourceAdapter):
         return parser
 
     @classmethod
-    def detect_interruption(cls, html: str, *, url: str = "") -> None:
+    def static_challenge_evidence(cls, html: str, *, url: str = "") -> StaticChallengeEvidence:
+        """Collect static CNKI challenge evidence without claiming activity."""
+
         parser = cls._parser(html)
-        haystack = f"{url} {_meta_first(parser, 'title', 'og:title')} {parser.body_text}".casefold()
-        challenge_markers = ("captcha", "验证码", "滑块", "安全验证", "人机验证", "访问过于频繁")
-        challenge_node_detected = any(marker in haystack for marker in challenge_markers)
-        has_metadata = _meta_first(parser, "citation_title", "dc.title") != UNKNOWN
-        normal_business_evidence = has_metadata or any(
-            marker in parser.body_text.casefold()
-            for marker in (
-                "中文文献",
-                "外文文献",
-                "主题检索",
-                "检索结果",
-                "结果中检索",
-                "学术期刊",
-                "摘要",
-                "关键词",
-            )
-        ) or any(
-            _is_cnki_host(urlsplit(urljoin(url or cls.search_origin, anchor.href)).hostname)
-            and any(path_marker in urlsplit(urljoin(url or cls.search_origin, anchor.href)).path.casefold() for path_marker in _DETAIL_PATH_MARKERS)
-            for anchor in parser.anchors
+        return cls._static_challenge_evidence(parser, url=url)
+
+    @classmethod
+    def _static_challenge_evidence(
+        cls,
+        parser: _CNKIHTMLParser,
+        *,
+        url: str = "",
+    ) -> StaticChallengeEvidence:
+        text_present = _contains_challenge_marker(parser.body_text)
+        # ``visible_body_text`` excludes declared-hidden, transparent, and
+        # parked subtrees, so on-screen text is real rendering evidence rather
+        # than DOM presence.
+        on_screen = _contains_challenge_marker(parser.visible_body_text)
+        # The document's own ``<title>`` identifies the page; ``og:title`` and
+        # ``citation_title`` carry the *article* title, which may legitimately
+        # be research about CAPTCHAs and must never gate the run.
+        page_identity_is_challenge = _contains_challenge_marker(
+            parser.document_title
+        ) or _contains_challenge_marker(urlsplit(url).path)
+        return StaticChallengeEvidence(
+            text_present=text_present,
+            on_screen_text_present=on_screen,
+            blocking_overlay=_contains_challenge_marker(parser.overlay_body_text),
+            business_evidence=cls._normal_business_evidence(parser, url=url),
+            page_identity_is_challenge=page_identity_is_challenge and not cls._has_metadata(parser),
         )
-        page_identity_is_challenge = any(
-            marker in _meta_first(parser, "title", "og:title").casefold()
-            for marker in challenge_markers
-        )
-        if challenge_node_detected and (page_identity_is_challenge or not normal_business_evidence):
-            raise SourceActionRequired(
-                "ACTION_REQUIRED_USER_LOGIN=true; Reason=CNKI CAPTCHA or security verification required; "
-                "BrowserReadyForManualAction=true"
+
+    @staticmethod
+    def _has_metadata(parser: _CNKIHTMLParser) -> bool:
+        return _meta_first(parser, "citation_title", "dc.title") != UNKNOWN
+
+    @classmethod
+    def _normal_business_evidence(cls, parser: _CNKIHTMLParser, *, url: str = "") -> bool:
+        return (
+            cls._has_metadata(parser)
+            or any(
+                marker in parser.body_text.casefold()
+                for marker in (
+                    "中文文献",
+                    "外文文献",
+                    "主题检索",
+                    "检索结果",
+                    "结果中检索",
+                    "学术期刊",
+                    "摘要",
+                    "关键词",
+                )
             )
+            or any(
+                _is_cnki_host(urlsplit(urljoin(url or cls.search_origin, anchor.href)).hostname)
+                and any(
+                    path_marker in urlsplit(urljoin(url or cls.search_origin, anchor.href)).path.casefold()
+                    for path_marker in _DETAIL_PATH_MARKERS
+                )
+                for anchor in parser.anchors
+            )
+        )
+
+    @classmethod
+    def detect_interruption(
+        cls,
+        html: str,
+        *,
+        url: str = "",
+        challenge_state: ChallengeState | None = None,
+    ) -> None:
+        """Stop for manual action only on authoritative challenge/login evidence.
+
+        ``challenge_state`` carries the runtime verdict already produced by
+        :class:`CNKIChallengeDetector` for this very observation.  When it is
+        supplied it is authoritative, so this parse can never re-escalate a
+        page the detector has already classified as dormant.
+        """
+
+        parser = cls._parser(html)
+        has_metadata = cls._has_metadata(parser)
+        normal_business_evidence = cls._normal_business_evidence(parser, url=url)
+        cls.enforce_challenge_state(
+            resolve_challenge_state(
+                static_state=classify_static_challenge(
+                    cls._static_challenge_evidence(parser, url=url)
+                ),
+                runtime_state=challenge_state,
+            )
+        )
         login_url = any(marker in url.casefold() for marker in ("/login", "passport.cnki", "cas.", "carsi", "webvpn"))
         institution_authenticated = (
             parser.institution_login_status
@@ -444,8 +677,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
         if institution_authenticated:
             return
+        # A login prompt only blocks the run when it is actually rendered.  CNKI
+        # keeps a personal-login box in the markup of ordinary result pages, so
+        # the same rule that governs challenge text governs login text: page
+        # identity (URL and title) plus on-screen body copy, never parked or
+        # declared-hidden DOM text.
+        login_haystack = (
+            f"{url} {_meta_first(parser, 'title', 'og:title')} {parser.visible_body_text}".casefold()
+        )
         blocking_login = any(
-            marker in haystack
+            marker in login_haystack
             for marker in ("统一身份认证", "请登录", "登录已失效", "重新登录", "短信验证", "二次认证")
         )
         if (login_url or blocking_login) and not has_metadata:
@@ -458,20 +699,51 @@ class CNKIAdapter(LiteratureSourceAdapter):
     def last_challenge_diagnostic(self) -> ChallengeDiagnostic | None:
         return self._last_challenge_diagnostic
 
+    def _runtime_challenge_state(self) -> ChallengeState | None:
+        """The authoritative state for the observation currently being parsed.
+
+        ``_content`` inspects every observation with ``CNKIChallengeDetector``
+        before returning it, so this value is the verdict for exactly the
+        content the caller is about to parse.
+        """
+
+        diagnostic = self._last_challenge_diagnostic
+        return diagnostic.state if diagnostic is not None else None
+
     @staticmethod
-    def enforce_challenge_diagnostic(diagnostic: ChallengeDiagnostic) -> None:
+    def enforce_challenge_state(state: ChallengeState) -> None:
+        """The one place CNKI turns a challenge state into a manual-action stop.
+
+        Every CNKI caller routes through here, so a state that is ``NONE`` or
+        ``DORMANT`` continues the run and a state that is ``VISIBLE``,
+        ``BLOCKING``, or ``UNCERTAIN`` stops it.  No challenge interaction of
+        any kind is attempted in either direction.
+        """
+
+        if not challenge_state_requires_manual_action(state):
+            return
+        captcha = state in CAPTCHA_CHALLENGE_STATES
+        reason = (
+            "CNKI CAPTCHA or security verification required"
+            if captcha
+            else f"CNKI challenge state is {state.value}"
+        )
+        raise SourceActionRequired(
+            "ACTION_REQUIRED_USER_LOGIN=true; "
+            f"Reason={reason}; "
+            f"ChallengeState={state.value}; "
+            "BrowserReadyForManualAction=true; "
+            f"CaptchaDetected={'true' if captcha else 'uncertain'}; "
+            "CaptchaBypassAttempted=false"
+        )
+
+    @classmethod
+    def enforce_challenge_diagnostic(cls, diagnostic: ChallengeDiagnostic) -> None:
         if not diagnostic.target_page_confirmed:
             raise SourceLayoutChanged(
                 "TargetPageIdentity=uncertain; CNKI automation stopped before any business action"
             )
-        if diagnostic.state in {ChallengeState.VISIBLE, ChallengeState.BLOCKING, ChallengeState.UNCERTAIN}:
-            detected = "true" if diagnostic.captcha_detected else "uncertain"
-            raise SourceActionRequired(
-                "ACTION_REQUIRED_USER_LOGIN=true; "
-                f"Reason=CNKI challenge state is {diagnostic.state.value}; "
-                "BrowserReadyForManualAction=true; "
-                f"CaptchaDetected={detected}; CaptchaBypassAttempted=false"
-            )
+        cls.enforce_challenge_state(diagnostic.state)
 
     async def _inspect_live_challenge(self, observation: Any) -> ChallengeDiagnostic:
         if self.browser is None:
@@ -501,8 +773,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
         query: str,
         source_url: str = "https://kns.cnki.net/kns8s/defaultresult/index",
         max_results: int = 30,
+        challenge_state: ChallengeState | None = None,
     ) -> list[LiteratureRecord]:
-        cls.detect_interruption(html, url=source_url)
+        cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
         parser = cls._parser(html)
         records: list[LiteratureRecord] = []
         seen: set[str] = set()
@@ -544,9 +817,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
         query: str,
         source_url: str = "https://kns.cnki.net/kns8s/defaultresult/index",
         max_results: int = 30,
+        challenge_state: ChallengeState | None = None,
     ) -> list[LiteratureRecord]:
-        """Parse bounded CNKI result links from an MCP accessibility snapshot."""
+        """Parse bounded CNKI result links from an MCP accessibility snapshot.
 
+        Snapshot text naming a verification component is never escalated here:
+        an accessibility tree cannot show whether a component is on screen, so
+        only the runtime ``challenge_state`` may stop the run.
+        """
+
+        cls.enforce_challenge_state(resolve_challenge_state(runtime_state=challenge_state))
         records: list[LiteratureRecord] = []
         seen: set[str] = set()
         lines = snapshot.splitlines()
@@ -613,8 +893,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
         *,
         source_url: str,
         search_query: str = UNKNOWN,
+        challenge_state: ChallengeState | None = None,
     ) -> LiteratureRecord:
-        cls.detect_interruption(html, url=source_url)
+        cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
         parser = cls._parser(html)
         body = re.sub(r"\s+", " ", parser.body_text).strip()
         title = _meta_first(parser, "citation_title", "dc.title", "og:title")
@@ -719,9 +1000,11 @@ class CNKIAdapter(LiteratureSourceAdapter):
         *,
         source_url: str,
         search_query: str = UNKNOWN,
+        challenge_state: ChallengeState | None = None,
     ) -> LiteratureRecord:
         """Extract CNKI article metadata from the structured MCP snapshot."""
 
+        cls.enforce_challenge_state(resolve_challenge_state(runtime_state=challenge_state))
         lines = snapshot.splitlines()
         title = UNKNOWN
         title_index = -1
@@ -867,8 +1150,14 @@ class CNKIAdapter(LiteratureSourceAdapter):
         return UNKNOWN, PublicationStatus.UNKNOWN.value
 
     @classmethod
-    def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
-        cls.detect_interruption(html, url=source_url)
+    def check_fulltext_access_html(
+        cls,
+        html: str,
+        *,
+        source_url: str,
+        challenge_state: ChallengeState | None = None,
+    ) -> AccessDecision:
+        cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
         parser = cls._parser(html)
         candidates: list[tuple[int, _Anchor, str, FullTextFormat]] = []
         for anchor in parser.anchors:
@@ -977,9 +1266,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
 
     @classmethod
-    def check_fulltext_access_snapshot(cls, snapshot: str, *, source_url: str) -> AccessDecision:
+    def check_fulltext_access_snapshot(
+        cls,
+        snapshot: str,
+        *,
+        source_url: str,
+        challenge_state: ChallengeState | None = None,
+    ) -> AccessDecision:
         """Verify a single-paper CNKI full-text control in a structured snapshot."""
 
+        cls.enforce_challenge_state(resolve_challenge_state(runtime_state=challenge_state))
         candidates: list[tuple[int, str, str, FullTextFormat]] = []
         for label, href, _line_index, link_line in _snapshot_links(snapshot):
             compact = re.sub(r"\s+", "", label).casefold()
@@ -1137,6 +1433,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 query=query,
                 source_url=current_url,
                 max_results=max_results,
+                challenge_state=self._runtime_challenge_state(),
             )
             if records or self._search_outcome_is_stable(content_kind, content):
                 return records, current_url
@@ -1269,7 +1566,12 @@ class CNKIAdapter(LiteratureSourceAdapter):
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         content_kind, content, current_url = await self._content()
         parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
-        record = parser(content, source_url=current_url, search_query=search_query)
+        record = parser(
+            content,
+            source_url=current_url,
+            search_query=search_query,
+            challenge_state=self._runtime_challenge_state(),
+        )
         if self._expected_record is not None:
             matches, reason = self.identity_matches(self._expected_record, record)
             if not matches:
@@ -1283,25 +1585,43 @@ class CNKIAdapter(LiteratureSourceAdapter):
     async def extract_abstract(self) -> str:
         content_kind, content, current_url = await self._content()
         parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
-        return parser(content, source_url=current_url).abstract
+        return parser(
+            content,
+            source_url=current_url,
+            challenge_state=self._runtime_challenge_state(),
+        ).abstract
 
     async def check_fulltext_access(self) -> AccessDecision:
         content_kind, content, current_url = await self._content()
         article_parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
         if self._expected_record is not None:
-            detail = article_parser(content, source_url=current_url, search_query=self._expected_record.search_query)
+            detail = article_parser(
+                content,
+                source_url=current_url,
+                search_query=self._expected_record.search_query,
+                challenge_state=self._runtime_challenge_state(),
+            )
             matches, reason = self.identity_matches(self._expected_record, detail)
             if not matches:
                 raise SourceLayoutChanged(f"CNKI target identity lock failed before access check: {reason}")
         access_parser = self.check_fulltext_access_html if content_kind == "html" else self.check_fulltext_access_snapshot
-        return access_parser(content, source_url=current_url)
+        return access_parser(
+            content,
+            source_url=current_url,
+            challenge_state=self._runtime_challenge_state(),
+        )
 
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
         if not access.full_text_accessible or not access.authorized_access:
             raise PermissionError("FULLTEXT_NOT_AUTHORIZED")
         content_kind, content, current_url = await self._content()
         parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
-        detail = parser(content, source_url=current_url, search_query=record.search_query)
+        detail = parser(
+            content,
+            source_url=current_url,
+            search_query=record.search_query,
+            challenge_state=self._runtime_challenge_state(),
+        )
         matches, reason = self.identity_matches(record, detail)
         if not matches:
             raise SourceLayoutChanged(f"CNKI target identity lock failed before download: {reason}")

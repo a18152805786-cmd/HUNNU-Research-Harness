@@ -27,6 +27,21 @@ class ChallengeState(str, Enum):
     UNCERTAIN = "UNCERTAIN"
 
 
+#: States that require a human to act before automation may continue.  Every
+#: CNKI caller must consult this one set instead of re-deriving its own rule.
+MANUAL_ACTION_CHALLENGE_STATES = frozenset(
+    {ChallengeState.VISIBLE, ChallengeState.BLOCKING, ChallengeState.UNCERTAIN}
+)
+
+#: States that positively identify an active CAPTCHA rather than an unresolved
+#: observation.  ``UNCERTAIN`` stops safely but is not a CAPTCHA claim.
+CAPTCHA_CHALLENGE_STATES = frozenset({ChallengeState.VISIBLE, ChallengeState.BLOCKING})
+
+
+def challenge_state_requires_manual_action(state: ChallengeState) -> bool:
+    return state in MANUAL_ACTION_CHALLENGE_STATES
+
+
 class TargetPageIdentityError(RuntimeError):
     """The current browser page cannot be locked to one CNKI target."""
 
@@ -231,11 +246,11 @@ class ChallengeDiagnostic:
 
     @property
     def captcha_detected(self) -> bool:
-        return self.state in {ChallengeState.VISIBLE, ChallengeState.BLOCKING}
+        return self.state in CAPTCHA_CHALLENGE_STATES
 
     @property
     def action_required_user_login(self) -> bool:
-        return self.state in {ChallengeState.VISIBLE, ChallengeState.BLOCKING, ChallengeState.UNCERTAIN}
+        return challenge_state_requires_manual_action(self.state)
 
     def as_dict(self) -> dict[str, Any]:
         visible_frames = {node.frame_index for node in self.nodes if node.effective_visible is True}
@@ -396,6 +411,80 @@ def classify_challenge(
         errors=tuple(sanitize_text(item) for item in errors),
         bypass_attempted=False,
     )
+
+
+@dataclass(frozen=True)
+class StaticChallengeEvidence:
+    """Challenge evidence obtainable without a live visibility probe.
+
+    Static HTML and accessibility snapshots can prove that a challenge
+    component *exists*, and can sometimes prove that it is inert (declared
+    hidden, moved far outside the document, or made fully transparent).  They
+    cannot prove that a component is currently rendered on the user's screen,
+    so this evidence is deliberately weaker than a runtime diagnostic.
+    """
+
+    text_present: bool = False
+    on_screen_text_present: bool = False
+    blocking_overlay: bool = False
+    business_evidence: bool = False
+    page_identity_is_challenge: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ChallengeTextPresent": self.text_present,
+            "ChallengeOnScreenTextPresent": self.on_screen_text_present,
+            "ChallengeStaticBlockingOverlay": self.blocking_overlay,
+            "NormalBusinessEvidence": self.business_evidence,
+            "PageIdentityIsChallenge": self.page_identity_is_challenge,
+        }
+
+
+def classify_static_challenge(evidence: StaticChallengeEvidence) -> ChallengeState:
+    """Classify static challenge evidence without ever assuming activity.
+
+    The ordering encodes the rule that markup text is not a CAPTCHA:
+
+    * no marker text at all -> ``NONE``;
+    * a statically provable blocking overlay -> ``BLOCKING``;
+    * marker text that is provably rendered on screen while the page shows no
+      working business content, or a document whose own identity is a
+      challenge interstitial -> ``VISIBLE``;
+    * anything else, including text that is only present in the DOM or in an
+      accessibility tree -> ``DORMANT``.
+
+    Static evidence never yields ``UNCERTAIN``: an unproven hidden string is
+    not a reason to stop the run.
+    """
+
+    if not evidence.text_present:
+        return ChallengeState.NONE
+    if evidence.blocking_overlay:
+        return ChallengeState.BLOCKING
+    if evidence.page_identity_is_challenge:
+        return ChallengeState.VISIBLE
+    if evidence.on_screen_text_present and not evidence.business_evidence:
+        return ChallengeState.VISIBLE
+    return ChallengeState.DORMANT
+
+
+def resolve_challenge_state(
+    *,
+    static_state: ChallengeState = ChallengeState.NONE,
+    runtime_state: ChallengeState | None = None,
+) -> ChallengeState:
+    """Return the single authoritative CNKI challenge state.
+
+    A runtime diagnostic is produced from viewport geometry, effective
+    visibility, ancestor opacity, frame visibility, and overlay evidence.  It
+    therefore outranks static text unconditionally: once the detector has
+    ruled on an observation, no later keyword scan of the same page may
+    re-escalate it.
+    """
+
+    if runtime_state is not None:
+        return runtime_state
+    return static_state
 
 
 async def _maybe_await(value: Any) -> Any:

@@ -408,27 +408,42 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         parser.feed(html)
         return parser
 
+    @staticmethod
+    def is_cnki_publisher_url(url: str) -> bool:
+        """Whether a page belongs to CNKI, which owns its own challenge model."""
+
+        host = _hostname(url).rstrip(".")
+        return host == "cnki.net" or host.endswith(".cnki.net")
+
     @classmethod
     def detect_manual_authentication(cls, html: str, *, url: str = "") -> None:
         parser = cls._parse(html)
         normalized_body = _normalized_label(f"{parser.title} {parser.body_text}")
         normalized_url = url.casefold()
-        captcha = parser.has_challenge_control or any(
-            marker in normalized_body
-            for marker in (
-                "请完成验证码",
-                "请输入验证码",
-                "拖动滑块",
-                "安全验证",
-                "verifyyouarehuman",
-                "recaptcha",
+        # CNKI preloads a verification component far outside the viewport on
+        # ordinary pages, so a keyword scan of its HTML is not evidence of an
+        # active challenge.  CNKI challenge state has a single owner --
+        # ``CNKIChallengeDetector`` and the CNKI adapter that enforces it --
+        # and this generic route gate must not second-guess that verdict.
+        # Static publisher pages that really do gate on a rendered CAPTCHA
+        # (SpringerLink, Oxford Academic, HUNNU CAS/WebVPN) keep the scan.
+        if not cls.is_cnki_publisher_url(url):
+            captcha = parser.has_challenge_control or any(
+                marker in normalized_body
+                for marker in (
+                    "请完成验证码",
+                    "请输入验证码",
+                    "拖动滑块",
+                    "安全验证",
+                    "verifyyouarehuman",
+                    "recaptcha",
+                )
             )
-        )
-        if captcha:
-            raise SourceActionRequired(
-                "ACTION_REQUIRED_USER_LOGIN=true; Reason=CAPTCHA or human verification required; "
-                "BrowserReadyForManualAction=true"
-            )
+            if captcha:
+                raise SourceActionRequired(
+                    "ACTION_REQUIRED_USER_LOGIN=true; Reason=CAPTCHA or human verification required; "
+                    "BrowserReadyForManualAction=true"
+                )
 
         auth_host_or_path = any(
             marker in normalized_url

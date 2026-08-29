@@ -349,14 +349,32 @@ class LocalPlaywrightExecutor:
         frame: Any,
         viewport: tuple[float, float],
     ) -> tuple[bool | None, Mapping[str, float] | None, bool]:
-        if frame is page:
+        # ``page.frames[0]`` is the main ``Frame``, never the ``Page`` itself, so
+        # identity against ``page`` alone never matches a real Playwright page.
+        # Without the ``main_frame`` comparison the main frame fell through to
+        # ``frame_element()``, which a top-level frame does not have: every live
+        # observation was then marked incomplete and every run stopped for
+        # manual action regardless of the challenge evidence.
+        main_frame = getattr(page, "main_frame", None)
+        if frame is page or (main_frame is not None and frame is main_frame):
             return True, None, True
         try:
             frame_element = await _maybe_await(getattr(frame, "frame_element")())
             visible = bool(await _maybe_await(frame_element.is_visible()))
             box = await _maybe_await(frame_element.bounding_box())
             if not isinstance(box, Mapping):
-                return None, None, False
+                # Playwright returns no bounding box for an element that is not
+                # rendered.  Real pages always carry such frames (an
+                # ``about:blank`` utility iframe, a display:none container), so
+                # treating that as a failed inspection would mark every live
+                # observation incomplete and stop the run for manual action
+                # with no challenge evidence at all.  A frame that reports no
+                # box and is not visible is completely assessed: it is hidden.
+                # A frame that claims visibility yet exposes no box is genuinely
+                # contradictory and stays unresolved.
+                if visible:
+                    return None, None, False
+                return False, None, True
             intersects = (
                 float(box.get("width", 0)) > 0
                 and float(box.get("height", 0)) > 0
