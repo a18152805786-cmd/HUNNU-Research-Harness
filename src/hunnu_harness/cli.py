@@ -55,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     library_import.add_argument("--source", type=Path, required=True)
     library_import.add_argument("--metadata-json", type=Path, required=True)
+    from .navigator.cli import add_navigator_subcommands
+
+    add_navigator_subcommands(sub)
     return parser
 
 
@@ -119,6 +122,10 @@ def main() -> int:
             LibraryDisposition.SAME_WORK_DIFFERENT_VERSION,
         }
         return 0 if result.disposition in accepted else 2
+    from .navigator.cli import NAVIGATOR_COMMANDS, run_navigator_command
+
+    if args.command in NAVIGATOR_COMMANDS:
+        return run_navigator_command(args)
     raise SystemExit(f"Unknown command: {args.command}")
 
 

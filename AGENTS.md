@@ -101,3 +101,15 @@ This section defines **how** an Agent calls Harness after global routing has sel
 61. `OfficialWeb` is public evidence only. It must stop at login, CAPTCHA, security challenge, paywall/access restriction, non-HTML content, or an unverified redirect. It does not perform CNKI/publisher full-text downloads or HUNNU institutional access.
 62. The literature single-batch download ceiling remains 25. A larger explicit total may only be represented by `BoundedBatchPlanner` batches, each at or below 25, with preserved aggregate budgets and finite retries. Planning never authorizes execution past the planning/budget gate.
 63. For CNKI single-paper authorized full text, select formats in the fixed order `PDF` → `CAJ` → other supported authorized formats. Fall back to CAJ only when the PDF control is absent, disabled, or rejected as unsafe during the current access check. If a PDF click has an uncertain outcome, fail closed rather than blindly clicking CAJ; any retry requires a fresh challenge, page-identity, target-identity, and authorization check.
+
+## Paper Research Navigator (retrieval layer v0.1)
+
+64. To find literature the Harness may already hold, query the Navigator before anything else: `paper-search`, `paper-lookup`, `paper-fulltext`, `paper-related`, `paper-pack`, `paper-gaps`, `paper-verify-citation` on the `hunnu-harness` CLI, or `hunnu_harness.navigator.PaperNavigator` in process. Do not glob the disk, search `Desktop`/`Downloads`/`D:\BaiduNetdiskDownload`/Obsidian history, or guess a paper path. The full contract is `docs/PAPER_RESEARCH_NAVIGATOR.md`.
+
+65. Retrieval is WORK-first. A `paper_id` is the logical identity; the 192 physical files are versions of the 179 works and must never be treated as separate papers. Open only the path the Navigator returns in `preferred_version.absolute_path`; never construct a path from a `paper_id`, because three managed files carry a historical name that differs from the `paper_id` of the work that owns them.
+
+66. The Navigator is a retrieval/navigation layer, not a source of truth and not an acquisition path. It never downloads and never writes to `library/`, `papers_by_topic/`, the catalog, or the topic metadata. When `paper-verify-citation` returns `NOT_IN_LIBRARY`, use the returned handoff object with the existing acquisition chain (Rules 38–44); never cite an `unverified_candidates` entry as a held paper.
+
+67. Everything under `Output Root\paper_retrieval` is derived and rebuildable from the catalog and the managed full texts. `paper-index rebuild` reconstructs it; deleting it loses no paper, version, or topic assignment. Metadata and topic retrieval work with no index present, so an absent, stale, or corrupt index degrades the answer and is reported in `index_status`, never fails the Harness.
+
+68. `paper-gaps` reports coverage of the local corpus only. Absence in this library is not evidence about the research literature and must never be presented as novelty; to make any claim about the literature, run the acquisition/search pipeline against external databases first.

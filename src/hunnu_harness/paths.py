@@ -46,6 +46,23 @@ LIBRARY_CATALOG_JSONL = LIBRARY_CATALOG_DIR / "papers.jsonl"
 LIBRARY_CATALOG_CSV = LIBRARY_CATALOG_DIR / "papers.csv"
 LIBRARY_IMPORT_STAGING_DIR = LIBRARY_ROOT / "import_staging"
 
+# Additive topic metadata produced alongside the catalog.  These are read-only
+# navigation inputs; the Library writer does not own them.
+LIBRARY_TOPICS_JSONL = LIBRARY_CATALOG_DIR / "paper_topics.jsonl"
+LIBRARY_TOPICS_CSV = LIBRARY_CATALOG_DIR / "paper_topics.csv"
+PAPERS_BY_TOPIC_DIR = OUTPUT_ROOT / "papers_by_topic"
+TOPIC_TAXONOMY_JSON = OUTPUT_ROOT / "topic_taxonomy.json"
+
+# Paper Research Navigator derived data.  Everything below this root is
+# rebuildable from the catalog and the managed full texts; deleting it must
+# never lose a paper, a version, or a topic assignment.
+PAPER_RETRIEVAL_ROOT = OUTPUT_ROOT / "paper_retrieval"
+PAPER_RETRIEVAL_INDEX_DIR = PAPER_RETRIEVAL_ROOT / "index"
+PAPER_RETRIEVAL_INDEX_MANIFEST = PAPER_RETRIEVAL_INDEX_DIR / "manifest.json"
+PAPER_RETRIEVAL_FULLTEXT_DIR = PAPER_RETRIEVAL_INDEX_DIR / "fulltext"
+PAPER_RETRIEVAL_FULLTEXT_MANIFEST = PAPER_RETRIEVAL_INDEX_DIR / "fulltext_manifest.json"
+PAPER_RETRIEVAL_PACKS_DIR = PAPER_RETRIEVAL_ROOT / "reading_packs"
+
 V023_RUN_ROOT = RUNS_ROOT / "Harness_V023_Output_Root_Separation"
 V024_RUN_ROOT = RUNS_ROOT / "Harness_V024_CNKI_Challenge_Detection_Hardening"
 # Retained as a historical artifact location.
