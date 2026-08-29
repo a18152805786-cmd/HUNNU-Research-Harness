@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from ..literature.models import UNKNOWN
@@ -27,14 +28,46 @@ from .search import PaperNavigator
 from .tokenize import contains_cjk, fold, tokenize
 
 
-#: Minimum evidence score for a citation to be reported as held by the library.
+class CitationStatus(str, Enum):
+    """The three outcomes citation verification must distinguish.
+
+    ``IN_LIBRARY`` is the FOUND state; the existing name is kept because the
+    agent contract, the CLI, and the tests already speak it, and inventing a
+    second vocabulary for the same state helps nobody.
+    """
+
+    IN_LIBRARY = "IN_LIBRARY"
+    AMBIGUOUS = "AMBIGUOUS"
+    NOT_IN_LIBRARY = "NOT_IN_LIBRARY"
+
+
+#: Minimum agreement, over the identity fields the citation actually supplies,
+#: for a candidate to qualify as the cited work.
 MATCH_THRESHOLD = 0.72
 
 #: Below this, a candidate is not even worth showing as a near miss.
 CANDIDATE_FLOOR = 0.30
 
+#: How much each identity field is worth *when the citation supplies it*.
+#: The score is normalised by the weight of the supplied fields only -- see
+#: ``_score_candidates`` for why that normalisation is the whole fix.
+WEIGHT_TITLE = 0.60
+WEIGHT_AUTHORS = 0.25
+WEIGHT_YEAR = 0.15
+
+#: A field counts as an agreeing identity signal at or above this agreement.
+SIGNAL_AGREEMENT = 0.5
+
+#: One signal is not an identity.  "Biddle" alone names no particular paper; a
+#: surname plus a year does.  Requiring two independent agreeing signals is what
+#: keeps shorthand resolution from degenerating into similarity search.
+MIN_IDENTITY_SIGNALS = 2
+
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 _ET_AL_RE = re.compile(r"\bet\.?\s*al\.?", re.IGNORECASE)
+#: CJK "and others".  Written attached to the last surname (``王海森等``) as well
+#: as standing alone, so it is stripped in both positions.
+_CJK_ET_AL_RE = re.compile(r"等人?")
 _QUOTED_RE = re.compile(r"[\"“”'‘’《〈]([^\"“”'‘’》〉]{4,})[\"“”'‘’》〉]")
 
 
@@ -100,7 +133,12 @@ def parse_citation(text: str) -> ParsedCitation:
         if not title_guess:
             title_guess = working.strip()
 
-    if not title_guess:
+    # A shorthand citation -- "Biddle et al. 2009", "王海森等 2026" -- names
+    # authors and a year and no title.  Falling back to "the whole string is the
+    # title" would put the surname into the title field, where it scores 0
+    # overlap against every real title and drags the match down.  An absent
+    # title is recorded as absent.
+    if not title_guess and not (authors and year):
         title_guess = re.sub(r"[\(\)（）\[\]]", " ", working).strip()
 
     return ParsedCitation(
@@ -123,6 +161,10 @@ def _author_tokens(head: str) -> list[str]:
             continue
         if contains_cjk(part):
             for name in part.split():
+                # "王海森等" is one surname plus the CJK "et al." marker, not a
+                # four-character name.  Strip the marker before length-testing,
+                # or the author never matches anything in the catalog.
+                name = _CJK_ET_AL_RE.sub("", name).strip()
                 if 2 <= len(name) <= 5:
                     names.append(name)
         elif len(part.split()) <= 4 and any(char.isalpha() for char in part):
@@ -133,6 +175,30 @@ def _author_tokens(head: str) -> list[str]:
             if len(part.replace(".", "").strip()) > 1:
                 names.append(part)
     return [name for name in dict.fromkeys(names) if name][:8]
+
+
+def author_name_matches(wanted: str, actual: str) -> bool:
+    """Does a cited author name identify a catalog author?
+
+    Deliberately token-based rather than substring-based.  ``"biddle"`` should
+    match ``"gary c biddle"`` because it is one of its name tokens, but a bare
+    substring test would also let a two-character fragment match half the
+    corpus, which is exactly the looseness citation verification must not have.
+    """
+
+    if not wanted or not actual or wanted == UNKNOWN or actual == UNKNOWN:
+        return False
+    if wanted == actual:
+        return True
+    actual_tokens = actual.split()
+    wanted_tokens = wanted.split()
+    if wanted_tokens and all(token in actual_tokens for token in wanted_tokens):
+        return True
+    # CJK personal names carry no internal whitespace, so token equality cannot
+    # apply; require the whole cited name to appear, and never a single glyph.
+    if len(wanted) >= 2 and contains_cjk(wanted) and wanted in actual:
+        return True
+    return False
 
 
 def _title_from_tail(tail: str) -> str:
@@ -149,6 +215,7 @@ class CitationCandidate:
     work: PaperWork
     evidence_score: float
     signals: dict[str, Any]
+    identity_signals: int = 0
 
     def as_dict(self, navigator: PaperNavigator) -> dict[str, Any]:
         resolution = navigator.resolution_for(self.work)
@@ -203,64 +270,170 @@ class CitationVerifier:
                     candidates=(),
                 )
 
-        # 3. Weighted field agreement over the lexical shortlist.
+        # 3. Agreement over the identity fields the citation actually supplies.
         candidates = self._score_candidates(parsed, max_candidates=max_candidates)
-        if candidates and candidates[0].evidence_score >= MATCH_THRESHOLD:
+        qualified = [
+            candidate
+            for candidate in candidates
+            if candidate.evidence_score >= MATCH_THRESHOLD
+            and candidate.identity_signals >= MIN_IDENTITY_SIGNALS
+        ]
+        if len(qualified) == 1:
             return self._found(
                 parsed,
-                candidates[0],
+                qualified[0],
                 match_type="FIELD_AGREEMENT",
-                candidates=tuple(candidates[1:]),
+                candidates=tuple(item for item in candidates if item is not qualified[0]),
             )
+        if len(qualified) > 1:
+            return self._ambiguous(parsed, qualified)
         return self._not_in_library(parsed, candidates)
 
     # -- internals ---------------------------------------------------------
 
+    def _candidate_pool(self, parsed: ParsedCitation, wanted_authors: set[str]) -> list[PaperWork]:
+        """Every work the citation could plausibly denote.
+
+        When the citation names authors, the pool is built by scanning the
+        catalog for those authors rather than by taking a lexical shortlist.
+        That matters for ambiguity: a shortlist ranked by text similarity can
+        silently omit a second work by the same author in the same year, which
+        would turn a genuinely AMBIGUOUS citation into a confident FOUND.
+        """
+
+        pool: dict[str, PaperWork] = {}
+        if wanted_authors:
+            for work in self.navigator.snapshot.works:
+                if any(
+                    author_name_matches(wanted, actual)
+                    for wanted in wanted_authors
+                    for actual in work.normalized_authors
+                ):
+                    pool[work.paper_id] = work
+        if parsed.title_guess:
+            probe = " ".join([parsed.title_guess, " ".join(parsed.authors)]).strip() or parsed.raw
+            search = self.navigator.search(probe, top=25, use_fulltext=False, expand=False)
+            for row in search["results"]:
+                work = self.navigator.snapshot.by_id(row["paper_id"])
+                if work is not None:
+                    pool.setdefault(work.paper_id, work)
+        return list(pool.values())
+
     def _score_candidates(self, parsed: ParsedCitation, *, max_candidates: int) -> list[CitationCandidate]:
-        probe = " ".join([parsed.title_guess, " ".join(parsed.authors)]).strip() or parsed.raw
-        search = self.navigator.search(probe, top=25, use_fulltext=False, expand=False)
+        """Score each candidate on the fields the citation supplies, and only those.
+
+        The defect this replaces: the score was a fixed-weight sum over title
+        (0.60), authors (0.25) and year (0.15).  A shorthand citation supplies no
+        title, so its maximum attainable score was 0.40 -- structurally below the
+        0.72 threshold.  "Biddle et al. 2009" could not be verified no matter how
+        perfectly the author and year agreed.
+
+        Normalising by the weight of the *supplied* fields fixes that without
+        loosening anything: a citation is now judged on the identity evidence it
+        actually carries, and carrying less evidence is handled by the separate
+        ``MIN_IDENTITY_SIGNALS`` requirement and by ambiguity detection rather
+        than by an arithmetic accident.
+        """
+
         wanted_authors = {normalize_person(name) for name in parsed.authors}
         wanted_authors.discard(UNKNOWN)
         wanted_authors.discard("")
         title_tokens = set(tokenize(parsed.title_guess))
 
         scored: list[CitationCandidate] = []
-        for row in search["results"]:
-            work = self.navigator.snapshot.by_id(row["paper_id"])
-            if work is None:
-                continue
+        for work in self._candidate_pool(parsed, wanted_authors):
             signals: dict[str, Any] = {}
-            score = 0.0
+            supplied: list[tuple[float, float]] = []
+            agreeing = 0
 
-            # Title overlap: the share of the citation's distinctive title
-            # tokens present in the candidate's title.
-            work_tokens = set(tokenize(work.title))
             if title_tokens:
+                work_tokens = set(tokenize(work.title))
                 overlap = len(title_tokens & work_tokens) / len(title_tokens)
                 signals["title_token_overlap"] = round(overlap, 3)
-                score += 0.60 * overlap
+                supplied.append((WEIGHT_TITLE, overlap))
+                if overlap >= SIGNAL_AGREEMENT:
+                    agreeing += 1
 
-            author_hits = [
-                name
-                for name in wanted_authors
-                if any(name == author or (len(name) >= 2 and name in author) for author in work.normalized_authors)
-            ]
             if wanted_authors:
+                author_hits = [
+                    wanted
+                    for wanted in wanted_authors
+                    if any(author_name_matches(wanted, actual) for actual in work.normalized_authors)
+                ]
                 ratio = len(author_hits) / len(wanted_authors)
                 signals["author_agreement"] = round(ratio, 3)
                 signals["authors_matched"] = sorted(author_hits)
-                score += 0.25 * ratio
+                supplied.append((WEIGHT_AUTHORS, ratio))
+                if author_hits and ratio >= SIGNAL_AGREEMENT:
+                    agreeing += 1
 
             if parsed.year:
                 same_year = parsed.year == work.year
                 signals["year_match"] = same_year
-                score += 0.15 if same_year else 0.0
+                supplied.append((WEIGHT_YEAR, 1.0 if same_year else 0.0))
+                if same_year:
+                    agreeing += 1
+
+            total_weight = sum(weight for weight, _ in supplied)
+            if not total_weight:
+                continue
+            score = sum(weight * value for weight, value in supplied) / total_weight
+            signals["fields_supplied"] = [
+                name
+                for name, present in (
+                    ("title", bool(title_tokens)),
+                    ("authors", bool(wanted_authors)),
+                    ("year", bool(parsed.year)),
+                )
+                if present
+            ]
+            signals["identity_signals"] = agreeing
 
             if score >= CANDIDATE_FLOOR:
-                scored.append(CitationCandidate(work=work, evidence_score=score, signals=signals))
+                scored.append(
+                    CitationCandidate(
+                        work=work,
+                        evidence_score=score,
+                        signals=signals,
+                        identity_signals=agreeing,
+                    )
+                )
 
         scored.sort(key=lambda item: (-item.evidence_score, item.work.paper_id))
         return scored[:max_candidates]
+
+    def _ambiguous(
+        self,
+        parsed: ParsedCitation,
+        qualified: list[CitationCandidate],
+    ) -> dict[str, Any]:
+        """Several works satisfy the citation equally well.
+
+        Picking the highest-scoring one would be a guess dressed as a
+        verification.  The caller gets every qualifying work and decides.
+        """
+
+        payload = self.navigator.envelope()
+        payload.update(
+            {
+                "status": CitationStatus.AMBIGUOUS.value,
+                "citation": parsed.raw,
+                "parsed_citation": parsed.as_dict(),
+                "match": None,
+                "paper_id": None,
+                "fulltext_available": False,
+                "match_threshold": MATCH_THRESHOLD,
+                "candidate_count": len(qualified),
+                "candidates": [item.as_dict(self.navigator) for item in qualified],
+                "suggested_next_action": "DISAMBIGUATE",
+                "reason": (
+                    "The citation's identity evidence fits more than one WORK equally well. "
+                    "Supply a title fragment or a DOI to resolve it; do not cite any of these "
+                    "as the verified paper."
+                ),
+            }
+        )
+        return payload
 
     def _found(
         self,
@@ -274,7 +447,7 @@ class CitationVerifier:
         resolution = self.navigator.resolution_for(candidate.work)
         payload.update(
             {
-                "status": "IN_LIBRARY",
+                "status": CitationStatus.IN_LIBRARY.value,
                 "citation": parsed.raw,
                 "parsed_citation": parsed.as_dict(),
                 "match_type": match_type,
@@ -297,7 +470,7 @@ class CitationVerifier:
         payload = self.navigator.envelope()
         payload.update(
             {
-                "status": "NOT_IN_LIBRARY",
+                "status": CitationStatus.NOT_IN_LIBRARY.value,
                 "citation": parsed.raw,
                 "parsed_citation": parsed.as_dict(),
                 "match": None,
@@ -327,7 +500,7 @@ def acquisition_handoff(parsed: ParsedCitation) -> dict[str, Any]:
     identity = parsed.handoff_identity()
     query = parsed.title_guess or parsed.raw
     return {
-        "status": "NOT_IN_LIBRARY",
+        "status": CitationStatus.NOT_IN_LIBRARY.value,
         "suggested_next_action": "ACQUISITION",
         "identity": identity,
         "acquisition_request_hint": {
@@ -352,9 +525,16 @@ def acquisition_handoff(parsed: ParsedCitation) -> dict[str, Any]:
 __all__ = [
     "CANDIDATE_FLOOR",
     "CitationCandidate",
+    "CitationStatus",
     "CitationVerifier",
     "MATCH_THRESHOLD",
+    "MIN_IDENTITY_SIGNALS",
     "ParsedCitation",
+    "SIGNAL_AGREEMENT",
+    "WEIGHT_AUTHORS",
+    "WEIGHT_TITLE",
+    "WEIGHT_YEAR",
     "acquisition_handoff",
+    "author_name_matches",
     "parse_citation",
 ]

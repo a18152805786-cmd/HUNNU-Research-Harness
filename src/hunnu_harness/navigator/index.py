@@ -186,6 +186,45 @@ class NavigatorIndex:
         }
         return (IndexStatus.FRESH if fresh else IndexStatus.STALE), detail
 
+    def resolved_status(self, snapshot: CatalogSnapshot) -> tuple[IndexStatus, dict[str, Any]]:
+        """The authoritative index state, and the only one callers should report.
+
+        ``status()`` compares the catalog digests recorded at build time.  That
+        is necessary but not sufficient: a work whose preferred version changed
+        has stale chunks even when the catalog file is byte-identical, and
+        ``load_fulltext()`` used to be the only place that noticed.  A command
+        that never loaded chunks therefore reported FRESH while a command that
+        did reported STALE, for the same index.
+
+        This computes the complete verdict from the manifests alone -- no chunk
+        file is read -- so every command can afford to ask for it.
+        """
+
+        status, detail = self.status(snapshot)
+        if status is not IndexStatus.FRESH:
+            return status, detail
+        stale = self.stale_works(snapshot)
+        if stale:
+            return IndexStatus.STALE, {**detail, "stale_works": sorted(stale)}
+        return status, detail
+
+    def stale_works(self, snapshot: CatalogSnapshot) -> set[str]:
+        """Works whose indexed text came from a version that is no longer preferred."""
+
+        entries = self._read_fulltext_manifest()
+        if not entries:
+            return set()
+        stale: set[str] = set()
+        for work in snapshot.works:
+            entry = entries.get(work.paper_id)
+            if entry is None or entry.get("status") != EXTRACTION_OK:
+                continue
+            resolution = self.resolver.resolve(work)
+            expected = resolution.preferred.version.sha256 if resolution.preferred else ""
+            if str(entry.get("source_sha256")) != expected:
+                stale.add(work.paper_id)
+        return stale
+
     # -- build -------------------------------------------------------------
 
     def build(
@@ -343,18 +382,16 @@ class NavigatorIndex:
     # -- load --------------------------------------------------------------
 
     def load_fulltext(self, snapshot: CatalogSnapshot) -> tuple[FullTextIndex, IndexStatus, dict[str, Any]]:
-        status, detail = self.status(snapshot)
+        """Load chunks, reporting the same status every other command reports."""
+
+        status, detail = self.resolved_status(snapshot)
         if status in (IndexStatus.ABSENT, IndexStatus.UNREADABLE):
             return FullTextIndex(), status, detail
 
         entries = self._read_fulltext_manifest()
-        expected_sha = {}
-        for work in snapshot.works:
-            resolution = self.resolver.resolve(work)
-            expected_sha[work.paper_id] = resolution.preferred.version.sha256 if resolution.preferred else ""
+        stale = self.stale_works(snapshot)
 
         chunks_by_work: dict[str, tuple[Chunk, ...]] = {}
-        stale: set[str] = set()
         for paper_id, entry in entries.items():
             if entry.get("status") != EXTRACTION_OK:
                 continue
@@ -362,17 +399,12 @@ class NavigatorIndex:
             if not loaded:
                 continue
             chunks_by_work[paper_id] = loaded
-            if str(entry.get("source_sha256")) != expected_sha.get(paper_id, ""):
-                stale.add(paper_id)
 
         index = FullTextIndex(
             chunks_by_work=chunks_by_work,
             stale_works=frozenset(stale),
             manifest_entries=entries,
         )
-        if stale and status is IndexStatus.FRESH:
-            status = IndexStatus.STALE
-            detail = {**detail, "stale_works": sorted(stale)}
         return index, status, detail
 
     # -- internals ---------------------------------------------------------

@@ -20,6 +20,9 @@ EXIT_OK = 0
 EXIT_LIBRARY_UNAVAILABLE = 2
 EXIT_NOT_FOUND = 3
 EXIT_INDEX_FAILED = 4
+#: A citation matched several works equally well.  Distinct from NOT_FOUND
+#: because the next action differs: disambiguate, do not acquire.
+EXIT_AMBIGUOUS = 5
 
 
 def add_navigator_subcommands(sub: argparse._SubParsersAction) -> None:
@@ -115,12 +118,34 @@ NAVIGATOR_COMMANDS = frozenset(
 )
 
 
-def _emit(payload: Any) -> None:
-    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-    try:
+def emit_utf8(text: str) -> None:
+    """Write machine-readable output as UTF-8, whatever the console codepage is.
+
+    The corpus is 90% Chinese, so this boundary decides whether an agent can read
+    the answer at all.  The previous implementation printed through the ambient
+    text stream and only fell back to UTF-8 bytes on ``UnicodeEncodeError``.
+    That rescues encodings which fail loudly -- cp1252, ascii -- and misses the
+    one that matters on this machine: GBK *can* encode CJK, so it raises nothing
+    and quietly emits GBK bytes, which any UTF-8 reader sees as mojibake.
+
+    Structured output declares its own encoding rather than inheriting one.
+    This is not a re-encoding guess: the string is already correct Unicode
+    (verified end to end), and it is written once, as UTF-8.
+    """
+
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        # A text-only stream (pytest capture, an in-process harness). It already
+        # holds Unicode, so there is nothing to correct.
         print(text)
-    except UnicodeEncodeError:  # a narrow console codepage must not lose the answer
-        sys.stdout.buffer.write(text.encode("utf-8", errors="replace") + b"\n")
+        return
+    sys.stdout.flush()
+    stream.write(text.encode("utf-8") + b"\n")
+    stream.flush()
+
+
+def _emit(payload: Any) -> None:
+    emit_utf8(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
 def _navigator():
@@ -187,13 +212,17 @@ def run_navigator_command(args: argparse.Namespace) -> int:
             return EXIT_OK
 
         if command == "paper-verify-citation":
-            from .citation import CitationVerifier
+            from .citation import CitationStatus, CitationVerifier
 
             payload = CitationVerifier(navigator).verify(
                 args.citation, max_candidates=args.max_candidates
             )
             _emit(payload)
-            return EXIT_OK if payload["status"] == "IN_LIBRARY" else EXIT_NOT_FOUND
+            if payload["status"] == CitationStatus.IN_LIBRARY.value:
+                return EXIT_OK
+            if payload["status"] == CitationStatus.AMBIGUOUS.value:
+                return EXIT_AMBIGUOUS
+            return EXIT_NOT_FOUND
 
     except LibraryUnavailable as exc:
         _emit({"status": "LIBRARY_UNAVAILABLE", "reason": str(exc)})
@@ -297,11 +326,13 @@ def _run_fingerprint(args: argparse.Namespace) -> int:
 
 
 __all__ = [
+    "EXIT_AMBIGUOUS",
     "EXIT_INDEX_FAILED",
     "EXIT_LIBRARY_UNAVAILABLE",
     "EXIT_NOT_FOUND",
     "EXIT_OK",
     "NAVIGATOR_COMMANDS",
     "add_navigator_subcommands",
+    "emit_utf8",
     "run_navigator_command",
 ]

@@ -50,7 +50,11 @@ All commands print sorted UTF-8 JSON on stdout. Run them with the project venv:
 | `paper-index {status,build,validate,rebuild,drop}` | Manage the derived index |
 | `paper-fingerprint [--output P] [--compare P] [--summary]` | Prove the library is unchanged |
 
-Exit codes: `0` success · `2` library unavailable · `3` not found / `NOT_IN_LIBRARY` · `4` index operation failed.
+Exit codes: `0` success · `2` library unavailable · `3` not found / `NOT_IN_LIBRARY` ·
+`4` index operation failed · `5` citation matched several works (`AMBIGUOUS`).
+
+Structured output is always UTF-8, whatever the console codepage is. Capture
+stdout as bytes and decode it as UTF-8; do not rely on the ambient encoding.
 
 In-process equivalent:
 
@@ -120,7 +124,26 @@ Each search result carries:
 .venv/Scripts/python.exe -m hunnu_harness.cli paper-verify-citation --citation "王海森、李纲(2026). 人工智能漂洗抹杀了企业技术创新吗. 中国工业经济."
 ```
 
-Returns `IN_LIBRARY` with the `paper_id` and the file to read, or:
+Shorthand works too — a surname and a year are enough when they name exactly one
+work in the library:
+
+```bash
+.venv/Scripts/python.exe -m hunnu_harness.cli paper-verify-citation --citation "Biddle et al. 2009"
+```
+
+There are three outcomes, and they need different next actions:
+
+| `status` | Meaning | Next action |
+|---|---|---|
+| `IN_LIBRARY` | Exactly one work matches. `paper_id` and the file to read are returned. | Read the local full text |
+| `AMBIGUOUS` | Several works fit the citation equally well. `paper_id` is `null`. | Add a title fragment or a DOI. **Never pick one from `candidates` yourself.** |
+| `NOT_IN_LIBRARY` | No work clears the evidence bar. | Use the returned `handoff` with the acquisition pipeline |
+
+A citation must carry at least two agreeing identity signals (author, year,
+title) to resolve at all. `"Biddle"` alone returns `NOT_IN_LIBRARY`: one surname
+names no particular paper.
+
+`IN_LIBRARY` returns the `paper_id` and the file to read, or:
 
 ```json
 {
@@ -138,7 +161,9 @@ Returns `IN_LIBRARY` with the `paper_id` and the file to read, or:
 
 `unverified_candidates` are near misses shown for human judgement. **They are not
 the cited paper.** A candidate with `verified: false` must never be reported as
-held, and must never be cited.
+held, and must never be cited. The same rule applies to the `candidates` list on
+an `AMBIGUOUS` result: several works fitting a citation equally well is not
+permission to choose one.
 
 The Navigator does not download. On `NOT_IN_LIBRARY`, hand off to the existing
 acquisition chain (AGENTS.md §38–44), which keeps authorization, Target Identity

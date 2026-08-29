@@ -235,6 +235,22 @@ class PaperNavigator:
             self._bm25 = BM25FIndex(documents, field_weights=DEFAULT_FIELD_WEIGHTS)
         return self._bm25
 
+    def index_status(self) -> tuple[IndexStatus, dict[str, Any]]:
+        """The single authoritative index state for this process.
+
+        Every Navigator command reports what this returns, whether or not it
+        happens to need the full-text layer.  The bug this replaces: the status
+        was read from a lazily-populated cache that only ``search()`` and
+        ``fulltext()`` ever filled, and an unfilled cache was reported as
+        ``ABSENT`` -- so ``paper-lookup`` claimed there was no index while
+        ``paper-search`` on the same index in the same directory said FRESH.
+        A not-yet-loaded cache is not evidence about the filesystem.
+        """
+
+        if self._index_status is None:
+            self._index_status, self._index_detail = self._index.resolved_status(self._snapshot)
+        return self._index_status, self._index_detail
+
     def _load_fulltext(self) -> tuple[FullTextIndex, IndexStatus, dict[str, Any]]:
         if self._fulltext is None:
             self._fulltext, self._index_status, self._index_detail = self._index.load_fulltext(self._snapshot)
@@ -245,9 +261,7 @@ class PaperNavigator:
         """The header every machine response carries."""
 
         degraded = self._snapshot.degraded_dicts()
-        status = index_status
-        if status is None:
-            status = self._index_status or IndexStatus.ABSENT
+        status = index_status if index_status is not None else self.index_status()[0]
         return {
             "schema_version": RESULT_SCHEMA_VERSION,
             "index_status": status.value,
@@ -435,8 +449,10 @@ class PaperNavigator:
         stage1 = self._stage1(parsed)
 
         fulltext_index = FullTextIndex()
-        index_status = IndexStatus.ABSENT
-        index_detail: dict[str, Any] = {}
+        # The reported state is a fact about the index on disk, not about
+        # whether this particular call chose to use it.  ``--no-fulltext`` skips
+        # Stage 2; it does not make the index disappear.
+        index_status, index_detail = self.index_status()
         passages: dict[str, tuple[MatchedPassage, ...]] = {}
         passage_scores: dict[str, float] = {}
 
