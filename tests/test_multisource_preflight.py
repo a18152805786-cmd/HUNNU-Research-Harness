@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from hunnu_harness.agent_entrypoint import (
@@ -690,6 +694,141 @@ class RegistryAndAgentIntegrationTests(unittest.TestCase):
             self.assertEqual(delegated_request.max_search_results, 1)
             self.assertEqual(delegated_request.max_downloads, 1)
             self.assertEqual(result.status, PreflightStatus.READY_FOR_UNATTENDED)
+
+
+class PreflightSessionBoundaryClockTests(unittest.TestCase):
+    """Pins the arithmetic of the current-session download boundary (AGENTS.md 48).
+
+    `st_mtime_ns` is an exact integer, so the boundary it is compared against must
+    be one too. A boundary derived from `datetime.now().timestamp() * 1_000_000_000`
+    is a float64 in seconds scaled to nanoseconds: it needs ~19 significant digits
+    where float64 carries ~15-16, so it can round ahead of the true instant and
+    reject a file written immediately afterwards.
+    """
+
+    @staticmethod
+    def _success_run(path: Path) -> LiteratureRunResult:
+        entry = PreflightEvidenceAndArtifactTests._entry(path)
+        return LiteratureRunResult(status=RunStatus.SUCCESS, records=[], downloads=[entry])
+
+    @staticmethod
+    def _handler() -> LiteratureAdapterPreflightHandler:
+        request = LiteratureSearchRequest.from_mapping(
+            {
+                "OriginalResearchRequest": "boundary probe",
+                "ResearchQuestion": "boundary probe",
+                "MaxSearchResults": 5,
+                "MaxResultsPerSource": 5,
+                "MaxDownloads": 5,
+                "MaxDownloadsPerRun": 5,
+            }
+        )
+
+        async def auth(context):
+            return _auth_ready(context.source)
+
+        return LiteratureAdapterPreflightHandler(
+            adapter=OxfordAcademicAdapter(object()),
+            request=request,
+            authentication_probe=auth,
+        )
+
+    def _run_preflight(self, temporary: str, name: str) -> SourcePreflightResult:
+        output = Path(temporary) / name
+
+        async def run(_request):
+            output.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            return self._success_run(output)
+
+        with patch(
+            "hunnu_harness.literature.preflight.LiteratureAcquisitionWorkflow"
+        ) as workflow_type:
+            workflow_type.return_value.run = AsyncMock(side_effect=run)
+            context = type(
+                "Context",
+                (),
+                {"source": "OxfordAcademic", "run_root": Path(temporary) / "run"},
+            )()
+            return asyncio.run(self._handler().download_preflight(context))
+
+    def test_float_seconds_clock_cannot_represent_epoch_nanoseconds(self) -> None:
+        # Why an integer clock is required: at the current epoch magnitude one
+        # float64 step is far wider than the nanosecond the comparison resolves.
+        now_ns = time.time_ns()
+        self.assertGreater(math.ulp(float(now_ns)), 1.0)
+        float_boundary = datetime.now(timezone.utc).timestamp() * 1_000_000_000
+        self.assertGreater(math.ulp(float_boundary), 1.0)
+        # A float boundary is blind to the nanosecond the mtime comparison resolves:
+        # adding one nanosecond to it rounds straight back to the same value.
+        self.assertEqual(float_boundary + 1.0, float_boundary)
+
+    def test_session_boundary_comes_from_exact_integer_nanosecond_clock(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="v028-clock-", dir=TEMP_DIR) as temporary:
+            # A boundary in the future must reject the download; a boundary in the
+            # past must accept it. Both only hold if time.time_ns() is the source.
+            # create=True so a module that never consults time.time_ns() fails on the
+            # behavioural assertion below rather than on the patch target.
+            future = SimpleNamespace(time_ns=lambda: time.time_ns() + 10_000_000_000)
+            with patch("hunnu_harness.literature.preflight.time", future, create=True):
+                result = self._run_preflight(temporary, "future.pdf")
+            self.assertEqual(
+                result.status,
+                PreflightStatus.NOT_READY,
+                "boundary ignored time.time_ns(); it is not the exact integer clock",
+            )
+            self.assertFalse(result.current_session_download_verified)
+
+            past = SimpleNamespace(time_ns=lambda: time.time_ns() - 10_000_000_000)
+            with patch("hunnu_harness.literature.preflight.time", past, create=True):
+                result = self._run_preflight(temporary, "past.pdf")
+            self.assertEqual(result.status, PreflightStatus.READY_FOR_UNATTENDED)
+            self.assertTrue(result.current_session_download_verified)
+
+    def test_file_written_at_the_boundary_instant_is_current_session(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="v028-edge-", dir=TEMP_DIR) as temporary:
+            path = Path(temporary) / "exact.pdf"
+            path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            result = _result_from_literature_run(
+                "OxfordAcademic",
+                self._success_run(path),
+                started_at_ns=path.stat().st_mtime_ns,
+                research_candidate=True,
+            )
+            self.assertEqual(result.status, PreflightStatus.READY_FOR_UNATTENDED)
+            self.assertTrue(result.current_session_download_verified)
+
+    def test_boundary_has_no_backdating_tolerance(self) -> None:
+        # Rule 48 fails closed: a file older than the boundary is not evidence, and
+        # no tolerance window may be introduced to soften that. One nanosecond is
+        # the tightest statement of the property.
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="v028-tolerance-", dir=TEMP_DIR) as temporary:
+            path = Path(temporary) / "stale.pdf"
+            path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            for backdate_ns in (1, 1_000, 1_000_000, 10_000_000):
+                with self.subTest(backdate_ns=backdate_ns):
+                    result = _result_from_literature_run(
+                        "OxfordAcademic",
+                        self._success_run(path),
+                        started_at_ns=path.stat().st_mtime_ns + backdate_ns,
+                        research_candidate=True,
+                    )
+                    self.assertEqual(result.status, PreflightStatus.NOT_READY)
+                    self.assertFalse(result.current_session_download_verified)
+
+    def test_repeated_download_preflight_never_flakes_on_session_boundary(self) -> None:
+        # The original flake: the file is written immediately after the boundary is
+        # captured. With float64 seconds this failed ~4-5% of the time.
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        not_ready = []
+        with tempfile.TemporaryDirectory(prefix="v028-repeat-", dir=TEMP_DIR) as temporary:
+            for index in range(300):
+                result = self._run_preflight(temporary, f"repeat{index}.pdf")
+                if result.status is not PreflightStatus.READY_FOR_UNATTENDED:
+                    not_ready.append(index)
+        self.assertEqual(not_ready, [], f"session-boundary flake on iterations {not_ready}")
 
 
 if __name__ == "__main__":

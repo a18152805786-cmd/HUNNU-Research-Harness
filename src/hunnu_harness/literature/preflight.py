@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -357,7 +358,13 @@ class LiteratureAdapterPreflightHandler:
             max_downloads_per_run=1,
             require_full_text=True,
         )
-        started_at_ns = datetime.now(timezone.utc).timestamp() * 1_000_000_000
+        # Exact integer nanoseconds. datetime.now().timestamp() is a float64 in
+        # seconds; scaling it to nanoseconds needs ~19 significant digits where
+        # float64 carries ~15-16, so the boundary lands up to one ULP (~400ns at
+        # the current epoch) ahead of the true instant and can reject a file
+        # written immediately afterwards. st_mtime_ns is an exact integer, so the
+        # boundary must be one too.
+        started_at_ns = time.time_ns()
         workflow = LiteratureAcquisitionWorkflow(
             self.adapter,
             run_root=context.run_root,
@@ -377,7 +384,7 @@ class LiteratureAdapterPreflightHandler:
         return _result_from_literature_run(
             context.source,
             result,
-            started_at_ns=int(started_at_ns),
+            started_at_ns=started_at_ns,
             research_candidate=self.research_candidate,
         )
 
