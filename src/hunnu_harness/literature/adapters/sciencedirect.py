@@ -416,12 +416,23 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             raise PermissionError("FULLTEXT_NOT_AUTHORIZED")
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
+        article_match = _ARTICLE_PATH.search(urlsplit(record.source_page).path)
+        download_url = urlsplit(access.download_url)
+        download_match = _ARTICLE_PATH.search(download_url.path)
+        if (
+            article_match is None
+            or download_match is None
+            or article_match.group(1).casefold() != download_match.group(1).casefold()
+            or not any(marker in download_url.path.casefold() for marker in _PDF_PATH_MARKERS)
+        ):
+            raise SourceLayoutChanged("Authorized PDF control is not bound to the locked ScienceDirect article")
+        download_path = download_url.path
+        download_target = f'a[href="{download_path}"], a[href^="{download_path}?"]'
         try:
             artifact = await self.browser.execute(
                 DownloadCommand(
                     target=BrowserTarget(
-                        css=access.download_locator,
-                        text_regex=r"(?:view|download).*pdf",
+                        css=download_target,
                     ),
                     suggested_filename=f"{record.paper_id}.pdf",
                 )

@@ -1,7 +1,10 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
-from hunnu_harness.literature.adapters.base import SourceActionRequired
+from hunnu_harness.browser import DownloadCommand
+from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceLayoutChanged
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.models import AccessType, LiteratureSearchRequest, PublicationStatus
 
@@ -143,6 +146,56 @@ class ScienceDirectAdapterAsyncTests(unittest.IsolatedAsyncioTestCase):
         access = await adapter.check_fulltext_access()
         self.assertEqual(metadata.doi, "10.1016/j.frl.2026.109884")
         self.assertTrue(access.authorized_access)
+
+    async def test_authorized_pdf_download_uses_mcp_representable_css_target(self):
+        class _DownloadBrowser:
+            def __init__(self):
+                self.command = None
+
+            async def execute(self, command):
+                self.command = command
+                return SimpleNamespace(local_path=FIXTURES / "sciencedirect_article_authorized.html")
+
+        browser = _DownloadBrowser()
+        adapter = ScienceDirectAdapter(browser)
+        record = ScienceDirectAdapter.parse_article_html(
+            fixture("sciencedirect_article_authorized.html"),
+            source_url="https://www.sciencedirect.com/science/article/pii/S1544612326004149",
+        )
+        access = ScienceDirectAdapter.check_fulltext_access_html(
+            fixture("sciencedirect_article_authorized.html"),
+            source_url=record.source_page,
+        )
+
+        await adapter.download_fulltext(record, access)
+
+        self.assertIsInstance(browser.command, DownloadCommand)
+        self.assertIn("S1544612326004149", browser.command.target.css)
+        self.assertIn("/pdfft", browser.command.target.css)
+        self.assertNotEqual(browser.command.target.css, access.download_locator)
+        self.assertIsNone(browser.command.target.text_regex)
+
+    async def test_authorized_pdf_download_rejects_control_for_another_article(self):
+        class _DownloadBrowser:
+            async def execute(self, command):
+                raise AssertionError("mismatched PDF control must not reach the browser")
+
+        adapter = ScienceDirectAdapter(_DownloadBrowser())
+        record = ScienceDirectAdapter.parse_article_html(
+            fixture("sciencedirect_article_authorized.html"),
+            source_url="https://www.sciencedirect.com/science/article/pii/S1544612326004149",
+        )
+        access = ScienceDirectAdapter.check_fulltext_access_html(
+            fixture("sciencedirect_article_authorized.html"),
+            source_url=record.source_page,
+        )
+        access = replace(
+            access,
+            download_url="https://www.sciencedirect.com/science/article/pii/S0000000000000000/pdfft",
+        )
+
+        with self.assertRaisesRegex(SourceLayoutChanged, "not bound"):
+            await adapter.download_fulltext(record, access)
 
 
 if __name__ == "__main__":
