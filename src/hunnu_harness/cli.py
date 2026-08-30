@@ -55,6 +55,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     library_import.add_argument("--source", type=Path, required=True)
     library_import.add_argument("--metadata-json", type=Path, required=True)
+
+    confirm_topics = sub.add_parser(
+        "library-confirm-topics",
+        help=(
+            "Confirm the topics a person chose for one WORK after classification "
+            "returned REVIEW_REQUIRED"
+        ),
+    )
+    confirm_topics.add_argument("--paper-id", required=True)
+    confirm_topics.add_argument(
+        "--topic",
+        action="append",
+        required=True,
+        metavar="DOMAIN" + chr(92) + "SUBTOPIC",
+        help="A proposed topic to confirm; repeat the flag to confirm several",
+    )
+    confirm_topics.add_argument(
+        "--allow-taxonomy-override",
+        action="store_true",
+        help=(
+            "Confirm a taxonomy topic that was not proposed for this WORK. "
+            "Off by default so a topic can never be invented"
+        ),
+    )
+    sub.add_parser(
+        "browser-status",
+        help="Report whether a persistent Research Chrome is running, without starting one",
+    )
+    sub.add_parser(
+        "browser-stop",
+        help="Close the persistent Research Chrome, ending its signed-in session",
+    )
+
+    session_restore = sub.add_parser(
+        "browser-configure-session-restore",
+        help=(
+            "Let an institutional sign-in survive closing the dedicated Research "
+            "Chrome profile, so later runs are not anonymous"
+        ),
+    )
+    session_restore.add_argument(
+        "--profile",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "HUNNU_RESEARCH_PROFILE",
+                Path.home() / "ResearchHarness" / "chrome-profile",
+            )
+        ),
+    )
+
+    sub.add_parser(
+        "library-provenance-status",
+        help=(
+            "Report the topic-assignment provenance record and its own digest, "
+            "which is separate from the corpus fingerprint"
+        ),
+    )
+
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
@@ -62,18 +121,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _start(args: argparse.Namespace) -> int:
-    browser = ResearchBrowser(profile_dir=args.profile, downloads_dir=args.downloads, chrome_executable=args.chrome, headless=args.headless)
+    """Start the dedicated browser and leave it running.
+
+    It used to close the browser it had just started, which made the command
+    useless for the thing it is for: an institutional sign-in lives in the
+    browser process, so closing it threw the sign-in away before anyone could
+    use it.  The browser now stays up until `browser-stop`.
+    """
+
+    from .browser.persistent_browser import PersistentBrowserError, start_persistent_browser
+
     try:
-        await browser.start()
-    except PlaywrightUnavailable as exc:
-        print(str(exc))
+        status = start_persistent_browser(
+            profile_dir=args.profile,
+            chrome_executable=args.chrome,
+        )
+    except PersistentBrowserError as exc:
+        print("DedicatedProfileStarted=false")
+        print(f"Reason={exc}")
         return 2
-    state = await browser.status()
-    print(f"CurrentURL={state.url}")
-    print(f"PageTitle={state.title}")
-    print(f"AuthenticationStatus={state.auth_status.value}")
+    for key, value in status.as_dict().items():
+        print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
     print("DedicatedProfileStarted=true")
-    await browser.stop()
+    print("BrowserLeftRunning=true")
     return 0
 
 
@@ -98,6 +168,46 @@ def main() -> int:
             print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
         print("PdfDirectDownloadConfigured=true")
         return 0
+    if args.command == "browser-status":
+        from .browser.persistent_browser import probe
+
+        status = probe()
+        for key, value in status.as_dict().items():
+            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+        return 0
+    if args.command == "browser-stop":
+        import asyncio as _asyncio
+
+        from .browser.persistent_browser import probe
+
+        status = probe()
+        if not status.running:
+            print("PersistentBrowserRunning=false")
+            print("Reason=No persistent Research Chrome is listening")
+            return 0
+
+        async def _shutdown() -> None:
+            from playwright.async_api import async_playwright
+
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.connect_over_cdp(status.endpoint)
+                await browser.close()
+
+        _asyncio.run(_shutdown())
+        print("PersistentBrowserStopped=true")
+        print("SessionEnded=true")
+        return 0
+    if args.command == "browser-configure-session-restore":
+        try:
+            audit = ResearchChromePdfPreference(args.profile).configure_session_restore()
+        except ResearchChromePreferenceError as exc:
+            print("SessionRestoreConfigured=false")
+            print(f"Reason={exc}")
+            return 2
+        for key, value in audit.as_dict().items():
+            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+        print("SessionRestoreConfigured=true")
+        return 0
     if args.command == "agent-route":
         from .agent_entrypoint import route_from_cli_args
 
@@ -108,6 +218,30 @@ def main() -> int:
         staged = ExternalPaperImporter().stage_pdf(args.source)
         print(json.dumps(staged.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
+    if args.command == "library-provenance-status":
+        from .literature.topic_confirmation import TOPIC_PROVENANCE_PATH, TopicProvenanceStore
+
+        fingerprint = TopicProvenanceStore().fingerprint()
+        payload = {"TopicProvenancePath": str(TOPIC_PROVENANCE_PATH), **fingerprint.as_dict()}
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        # A missing sidecar is a legitimate state, not a failure: it means no
+        # assignment has been recorded yet, not that anything is wrong.  Only a
+        # record that will not parse is reported as a problem.
+        return 0 if fingerprint.intact else 2
+
+    if args.command == "library-confirm-topics":
+        from .literature.auto_classification import PostAcquisitionClassifier
+        from .literature.topic_confirmation import ConfirmationStatus
+
+        result = PostAcquisitionClassifier().confirm_topics(
+            args.paper_id,
+            args.topic,
+            allow_taxonomy_override=args.allow_taxonomy_override,
+        )
+        print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        accepted = {ConfirmationStatus.CONFIRMED, ConfirmationStatus.ALREADY_CONFIRMED}
+        return 0 if result.status in accepted else 2
+
     if args.command == "library-import":
         from .literature.library import ExternalPaperImporter, LibraryDisposition
 
