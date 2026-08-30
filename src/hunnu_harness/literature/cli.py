@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--max-results", type=int, default=5)
     live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     live.add_argument("--headless", action="store_true")
+    live.add_argument(
+        "--human-wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Keep Chrome open this long for a person to pass a page gate themselves",
+    )
 
     springer_live = subparsers.add_parser("live-springerlink", help="Run one bounded Springer Link acquisition")
     springer_selector = springer_live.add_mutually_exclusive_group(required=True)
@@ -160,6 +167,7 @@ async def _run_live(args: argparse.Namespace) -> int:
         downloads_dir=staging,
         executable_path=args.chrome,
         headless=args.headless,
+        human_wait_seconds=float(getattr(args, "human_wait", 0.0) or 0.0),
     )
     try:
         await browser.start()
@@ -198,7 +206,19 @@ async def _run_live(args: argparse.Namespace) -> int:
         print(f"Reason={exc}")
         return 2
     finally:
+        # Read the browser's own account of what it did before tearing it down.
+        # An Agent that has to infer this from missing output gets it wrong:
+        # it reported "no browser opened" for a run in which Chrome launched,
+        # reached the article host, and was closed 5 seconds later.
+        try:
+            lifecycle = await browser.lifecycle()
+        except Exception:
+            lifecycle = {}
         await browser.close()
+
+    for key in ("BrowserLaunched", "BrowserHeadless", "FinalURL", "FinalPageTitle"):
+        if key in lifecycle:
+            print(f"{key}={lifecycle[key]}")
 
     print(f"Status={result.status.value}")
     print(f"Results={len(result.records)}")

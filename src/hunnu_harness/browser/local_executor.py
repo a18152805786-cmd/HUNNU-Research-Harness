@@ -167,8 +167,31 @@ class LocalPlaywrightExecutor:
         except TypeError:
             # Small deterministic test pages often expose only goto(url).
             await _maybe_await(goto(command.url))
+        await self._settle_page_gates()
         self._generation += 1
         return await self._observe(ObserveCommand(include_html=False, include_visible_text=False))
+
+    async def _settle_page_gates(self) -> None:
+        """Let the backend wait out a page gate before anything reads the page.
+
+        Navigation here goes straight to Playwright's ``page.goto``, which
+        returns on ``domcontentloaded`` -- for a bot-check interstitial that is
+        while the check is still running, so the very next observation reads
+        the interstitial instead of the site.  The backend owns both the
+        waiting policy and the human-in-the-loop budget, so ask it rather than
+        duplicating either here.
+
+        A backend without this capability, or one that fails, simply gets the
+        previous behaviour: observe immediately.
+        """
+
+        settle = getattr(self._legacy_browser, "settle_page_gates", None)
+        if not callable(settle):
+            return
+        try:
+            await _maybe_await(settle())
+        except Exception:
+            pass
 
     async def _observe(self, command: ObserveCommand) -> BrowserObservation:
         page = self._require_page()
