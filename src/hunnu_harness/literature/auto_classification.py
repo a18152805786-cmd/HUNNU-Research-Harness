@@ -32,6 +32,11 @@ from .classification import (
     WorkClassifier,
 )
 from .models import UNKNOWN
+from .topic_confirmation import (
+    TOPIC_PROVENANCE_PATH,
+    AssignmentSource,
+    TopicProvenanceStore,
+)
 from .topics import (
     TopicLabel,
     TopicStore,
@@ -113,9 +118,13 @@ class PostAcquisitionClassifier:
         view: TopicViewBuilder | None = None,
         catalog_path: Path | None = None,
         fulltext_reader: FullTextReader | None = None,
+        provenance: TopicProvenanceStore | None = None,
     ) -> None:
         self._taxonomy = taxonomy
         self.store = store or TopicStore(taxonomy=taxonomy)
+        self.provenance = provenance or TopicProvenanceStore(
+            path=_provenance_beside(self.store)
+        )
         self.classifier = classifier or WorkClassifier(taxonomy=taxonomy)
         self.view = view or TopicViewBuilder()
         self.catalog_path = Path(catalog_path or LIBRARY_CATALOG_JSONL)
@@ -353,7 +362,52 @@ class PostAcquisitionClassifier:
                 paper_id=paper_id,
                 reason=f"NOT_APPLIED_{result.status.value}" if not dry_run else "DRY_RUN",
             )
-        return self.apply_classification(paper_id, result=result)
+        applied, outcome = self.apply_classification(paper_id, result=result)
+        if applied.applied:
+            self._record_auto_provenance(paper_id, outcome.topics_written, result)
+        return applied, outcome
+
+    def _record_auto_provenance(
+        self,
+        paper_id: str,
+        topics: Sequence[str],
+        result: ClassificationResult,
+    ) -> None:
+        """Note that the harness, not a person, chose these topics.
+
+        Best-effort on purpose, and the opposite of the confirmation path: there
+        the record *is* the operation, here the paper is already archived and
+        classification is an addition to it.  Losing the note is worse than not
+        having it, but neither is worth undoing an archive over.  A work with no
+        record still reads as automatic, which is what it is.
+        """
+
+        if not topics:
+            return
+        try:
+            self.provenance.record(
+                paper_id=paper_id,
+                topics=topics,
+                source=AssignmentSource.AUTO_CLASSIFIED,
+                classification_status_before=result.status.value,
+                proposed_topics=result.proposed_labels,
+            )
+        except OSError:
+            return
+
+
+def _provenance_beside(store: TopicStore) -> Path:
+    """The provenance file that belongs to this topic store's library.
+
+    Derived rather than fixed, because a fixed path made an isolated catalog
+    only half isolated: a caller who redirected the topic store still recorded
+    into the real library unless it remembered to redirect one more thing, and
+    forgetting wrote test entries into the production corpus.  Following the
+    store means redirecting the catalog is enough.
+    """
+
+    catalog = Path(store.jsonl_path)
+    return catalog.parent.parent / Path(TOPIC_PROVENANCE_PATH).name
 
 
 def _absolute_managed(value: str) -> str:
