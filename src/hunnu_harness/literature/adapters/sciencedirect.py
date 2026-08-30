@@ -10,7 +10,13 @@ from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit
 
 from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
-from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
+from .base import (
+    HumanActionReason,
+    LiteratureSourceAdapter,
+    SourceActionRequired,
+    SourceLayoutChanged,
+    SourceUnavailable,
+)
 from ..models import (
     AccessDecision,
     AccessType,
@@ -159,13 +165,51 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         return parser
 
     @classmethod
-    def detect_interruption(cls, html: str, *, url: str = "") -> None:
+    def detect_interruption(
+        cls,
+        html: str,
+        *,
+        url: str = "",
+        observed: bool = False,
+        challenge_visible: bool = False,
+    ) -> None:
+        """Decide whether a human is needed, and say how that was established.
+
+        ``observed`` means this HTML came from a live browser observation of the
+        page rather than from static content. Without it a keyword hit is only
+        challenge *text*: the same scan fires on a footer that mentions CAPTCHAs
+        and on a paper whose own title is about them, so it may not be reported
+        as a challenge the user can see and solve.
+
+        CNKI is deliberately not routed here -- its challenge state has a single
+        owner in ``CNKIChallengeDetector``, which already distinguishes a
+        preloaded off-viewport component from an active one.
+        """
+
         parser = cls._parser(html)
         haystack = f"{url} {_meta_first(parser, 'title', 'og:title')} {parser.body_text}".casefold()
         captcha_markers = ("captcha", "recaptcha", "verify you are human", "security challenge", "滑块", "验证码")
         if any(marker in haystack for marker in captcha_markers):
+            if observed and challenge_visible:
+                raise SourceActionRequired(
+                    "ACTION_REQUIRED_USER_LOGIN=true; "
+                    "Reason=Visible human verification challenge observed on the page; "
+                    "BrowserReadyForManualAction=true",
+                    reason=HumanActionReason.VISIBLE_CHALLENGE,
+                    challenge_observed=True,
+                    challenge_visible=True,
+                    challenge_blocking=True,
+                    browser_ready_for_manual_action=True,
+                )
             raise SourceActionRequired(
-                "ACTION_REQUIRED_USER_LOGIN=true; Reason=CAPTCHA or human verification required; BrowserReadyForManualAction=true"
+                "ACTION_REQUIRED_USER_LOGIN=true; "
+                "Reason=Challenge text present in page content but not confirmed visible by a browser observation; "
+                "BrowserReadyForManualAction=false",
+                reason=HumanActionReason.CHALLENGE_TEXT_UNVERIFIED,
+                challenge_observed=observed,
+                challenge_visible=False,
+                challenge_blocking=False,
+                browser_ready_for_manual_action=False,
             )
         has_article_metadata = _meta_first(parser, "citation_title", "dc.title") != UNKNOWN
         login_url = any(marker in url.casefold() for marker in ("/login", "/signin", "sso", "shibboleth", "cas."))
@@ -182,7 +226,11 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         )
         if (login_url or blocking_login) and not has_article_metadata:
             raise SourceActionRequired(
-                "ACTION_REQUIRED_USER_LOGIN=true; Reason=School or database login required; BrowserReadyForManualAction=true"
+                "ACTION_REQUIRED_USER_LOGIN=true; Reason=School or database login required; "
+                "BrowserReadyForManualAction=true",
+                reason=HumanActionReason.LOGIN_REQUIRED,
+                challenge_observed=observed,
+                browser_ready_for_manual_action=observed,
             )
 
     @classmethod

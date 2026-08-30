@@ -82,7 +82,27 @@ class ScienceDirectFixtureTests(unittest.TestCase):
                 fixture("sciencedirect_captcha.html"),
                 query="AI washing",
             )
-        self.assertIn("CAPTCHA", str(context.exception))
+        # Acquisition still stops, and nothing is bypassed.  Static HTML alone
+        # cannot claim the user is looking at a rendered challenge, so the
+        # verdict says the challenge text was not confirmed by an observation.
+        error = context.exception
+        self.assertFalse(error.challenge_visible)
+        self.assertFalse(error.browser_ready_for_manual_action)
+        self.assertEqual(error.reason.value, "CHALLENGE_TEXT_UNVERIFIED")
+
+    def test_observed_visible_challenge_is_reported_as_visible(self):
+        with self.assertRaises(SourceActionRequired) as context:
+            ScienceDirectAdapter.detect_interruption(
+                fixture("sciencedirect_captcha.html"),
+                url="https://www.sciencedirect.com/search",
+                observed=True,
+                challenge_visible=True,
+            )
+        error = context.exception
+        self.assertEqual(error.reason.value, "VISIBLE_CHALLENGE")
+        self.assertTrue(error.challenge_observed)
+        self.assertTrue(error.challenge_visible)
+        self.assertTrue(error.challenge_blocking)
 
     def test_missing_fields_remain_unknown(self):
         record = ScienceDirectAdapter.parse_article_html(

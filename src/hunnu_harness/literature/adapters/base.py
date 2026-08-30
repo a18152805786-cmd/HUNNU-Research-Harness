@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,61 @@ class LiteratureSourceError(RuntimeError):
     status = RunStatus.SOURCE_UNAVAILABLE
 
 
+class HumanActionReason(str, Enum):
+    """Why a human is needed, kept separate from what was actually seen."""
+
+    LOGIN_REQUIRED = "LOGIN_REQUIRED"
+    VISIBLE_CHALLENGE = "VISIBLE_CHALLENGE"
+    CHALLENGE_TEXT_UNVERIFIED = "CHALLENGE_TEXT_UNVERIFIED"
+    UNSPECIFIED = "UNSPECIFIED"
+
+
 class SourceActionRequired(LiteratureSourceError):
+    """A human must act before acquisition can continue.
+
+    The reason and the evidence behind it are separate facts.  Challenge words
+    in a page body are not a seen challenge: the same scan fires on a footer
+    that mentions CAPTCHAs and on a paper whose own title is about them.  A
+    verdict may only claim a visible challenge when a live browser observation
+    actually reported one, so ``challenge_observed`` records whether the HTML
+    came from an observed page at all, and ``challenge_visible`` whether that
+    observation found the challenge rendered and blocking.
+
+    Static analysis therefore yields CHALLENGE_TEXT_UNVERIFIED, never
+    VISIBLE_CHALLENGE, and an Agent must not upgrade the former into a claim
+    that the user is looking at a CAPTCHA.
+    """
+
     status = RunStatus.ACTION_REQUIRED_USER_LOGIN
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: "HumanActionReason" = HumanActionReason.UNSPECIFIED,
+        challenge_observed: bool = False,
+        challenge_visible: bool = False,
+        challenge_blocking: bool = False,
+        browser_ready_for_manual_action: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.challenge_observed = challenge_observed
+        # A challenge cannot be visible or blocking unless it was observed.
+        self.challenge_visible = challenge_visible and challenge_observed
+        self.challenge_blocking = challenge_blocking and challenge_observed
+        self.browser_ready_for_manual_action = browser_ready_for_manual_action
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "HumanActionRequired": True,
+            "HumanActionReason": self.reason.value,
+            "ChallengeActuallyObserved": self.challenge_observed,
+            "ChallengeVisible": self.challenge_visible,
+            "ChallengeBlocking": self.challenge_blocking,
+            "BrowserReadyForManualAction": self.browser_ready_for_manual_action,
+            "Detail": str(self),
+        }
 
 
 class SourceUserDownloadRequired(LiteratureSourceError):
