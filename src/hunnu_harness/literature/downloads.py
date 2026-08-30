@@ -28,6 +28,12 @@ class InvalidPDFDownload(InvalidFullTextDownload):
 class LiteratureDownloadManager:
     """Preserve the original download and create a normalized, validated copy."""
 
+    # Keep generated managed paths below the legacy Windows MAX_PATH boundary
+    # with room for runtime/internal suffixes.  The budget is applied to the
+    # complete destination path in UTF-16 code units, not merely the filename.
+    CANONICAL_PATH_SAFE_BUDGET = 240
+    _DIGEST_SUFFIX_LENGTHS = (12, 24, 64)
+
     def __init__(
         self,
         downloads_root: Path,
@@ -208,11 +214,105 @@ class LiteratureDownloadManager:
         )
 
     @staticmethod
-    def _copy_unique(source: Path, destination: Path, digest: str) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            if sha256_file(destination) == digest:
-                return destination
-            destination = destination.with_name(f"{destination.stem}_{digest[:12]}{destination.suffix}")
-        shutil.copy2(source, destination)
-        return destination
+    def _windows_path_units(value: Path | str) -> int:
+        return len(str(value).encode("utf-16-le")) // 2
+
+    @classmethod
+    def _truncate_to_windows_units(cls, value: str, maximum: int) -> str:
+        if maximum <= 0:
+            return ""
+        result: list[str] = []
+        used = 0
+        for character in value:
+            width = cls._windows_path_units(character)
+            if used + width > maximum:
+                break
+            result.append(character)
+            used += width
+        return "".join(result)
+
+    @classmethod
+    def _bounded_destination(
+        cls,
+        parent: Path,
+        filename: str,
+        digest: str,
+        *,
+        force_digest_suffix: bool = False,
+        digest_length: int = 12,
+    ) -> Path:
+        parent = Path(parent).resolve()
+        safe_name = Path(filename).name
+        suffix = Path(safe_name).suffix
+        stem = Path(safe_name).stem.rstrip(" ._") or "artifact"
+        direct = parent / safe_name
+        if (
+            not force_digest_suffix
+            and cls._windows_path_units(direct) <= cls.CANONICAL_PATH_SAFE_BUDGET
+        ):
+            return direct
+
+        token = f"__{digest[:digest_length]}"
+        fixed_units = (
+            cls._windows_path_units(parent)
+            + 1
+            + cls._windows_path_units(token)
+            + cls._windows_path_units(suffix)
+        )
+        readable_budget = cls.CANONICAL_PATH_SAFE_BUDGET - fixed_units
+        if readable_budget < 1:
+            raise InvalidFullTextDownload(
+                "Managed archive parent leaves no safe deterministic filename budget"
+            )
+        readable = cls._truncate_to_windows_units(stem, readable_budget).rstrip(" ._")
+        if not readable:
+            readable = "a"
+        candidate = parent / f"{readable}{token}{suffix}"
+        if candidate.parent.resolve() != parent:
+            raise InvalidFullTextDownload("Canonical archive destination escaped its managed parent")
+        if cls._windows_path_units(candidate) > cls.CANONICAL_PATH_SAFE_BUDGET:
+            raise InvalidFullTextDownload("Canonical archive destination exceeds the safe path budget")
+        return candidate
+
+    @classmethod
+    def _copy_unique(cls, source: Path, destination: Path, digest: str) -> Path:
+        source = Path(source).resolve()
+        parent = destination.parent.resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+        candidates = [cls._bounded_destination(parent, destination.name, digest)]
+        for length in cls._DIGEST_SUFFIX_LENGTHS:
+            try:
+                candidate = cls._bounded_destination(
+                    parent,
+                    destination.name,
+                    digest,
+                    force_digest_suffix=True,
+                    digest_length=length,
+                )
+            except InvalidFullTextDownload:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            if candidate.exists():
+                if sha256_file(candidate) == digest:
+                    return candidate
+                continue
+            try:
+                with source.open("rb") as source_handle, candidate.open("xb") as destination_handle:
+                    shutil.copyfileobj(source_handle, destination_handle)
+                shutil.copystat(source, candidate)
+                return candidate
+            except FileExistsError:
+                if candidate.exists() and sha256_file(candidate) == digest:
+                    return candidate
+                continue
+            except Exception:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        raise InvalidFullTextDownload(
+            "Canonical archive filename collision could not be resolved deterministically"
+        )

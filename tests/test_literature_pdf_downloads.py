@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from hunnu_harness.literature.downloads import (
@@ -7,7 +8,13 @@ from hunnu_harness.literature.downloads import (
     LiteratureDownloadManager,
     UnauthorizedFullTextError,
 )
-from hunnu_harness.literature.models import AccessDecision, AccessType, LiteratureRecord, RunStatus
+from hunnu_harness.literature.models import (
+    AccessDecision,
+    AccessType,
+    FullTextFormat,
+    LiteratureRecord,
+    RunStatus,
+)
 from hunnu_harness.literature.normalization import sha256_file
 from hunnu_harness.literature.pdf import PDFValidator
 
@@ -58,6 +65,26 @@ class PDFValidationTests(unittest.TestCase):
 
 
 class LiteratureDownloadManagerTests(unittest.TestCase):
+    @staticmethod
+    def _long_download_root(root: Path, *, components: int = 6) -> Path:
+        current = root
+        for index in range(components):
+            current /= f"managed-segment-{index:02d}"
+        return current / "downloads"
+
+    @staticmethod
+    def _long_record(*, title_tail: str = "A") -> LiteratureRecord:
+        return LiteratureRecord(
+            paper_id=f"P-LONG-{title_tail}",
+            title=("A very long canonical literature title prefix " * 5) + title_tail,
+            authors=("Gary C. Biddle",),
+            year="2009",
+            doi=f"10.1000/long-{title_tail}",
+            source_database="ScienceDirect",
+            stable_identifier=f"S-LONG-{title_tail}",
+            target_identity_confirmed=True,
+        )
+
     def test_authorized_pdf_preserves_original_and_creates_normalized_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -116,6 +143,201 @@ class LiteratureDownloadManagerTests(unittest.TestCase):
             with self.assertRaises(InvalidPDFDownload):
                 manager.archive_authorized_pdf(source, LiteratureRecord("P1"), authorized_access())
             self.assertEqual(list(manager.raw_dir.iterdir()), [])
+
+    def test_short_canonical_filename_is_not_changed_unnecessarily(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "short.pdf")
+            record = LiteratureRecord(
+                paper_id="P-SHORT",
+                title="Short title",
+                authors=("A. Smith",),
+                year="2026",
+            )
+            manager = LiteratureDownloadManager(
+                root / "downloads", allow_outside_project_for_tests=True, make_archive_read_only=False
+            )
+            entry = manager.archive_authorized_pdf(source, record, authorized_access())
+            self.assertEqual(Path(entry.local_path).name, "2026_Smith_Short_title.pdf")
+            self.assertNotIn("__", Path(entry.local_path).stem)
+
+    def test_li11_style_long_path_is_shortened_and_archived_within_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "li11.pdf")
+            manager = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            record = LiteratureRecord(
+                paper_id="P48F6ACEC90DC",
+                title="How does financial reporting quality relate to investment efficiency?",
+                authors=("Gary C. Biddle", "Gilles Hilary", "Rodrigo S. Verdi"),
+                year="2009",
+                doi="10.1016/j.jacceco.2009.09.001",
+                source_database="ScienceDirect",
+                stable_identifier="S0165410109000469",
+                target_identity_confirmed=True,
+            )
+            unbounded = manager.archive_dir / "2009_Biddle_How_does_financial_reporting_quality_relate_to_investment_efficiency.pdf"
+            self.assertGreater(manager._windows_path_units(unbounded), manager.CANONICAL_PATH_SAFE_BUDGET)
+            entry = manager.archive_authorized_pdf(source, record, authorized_access())
+            archived = Path(entry.local_path)
+            self.assertTrue(archived.is_file())
+            self.assertLessEqual(
+                manager._windows_path_units(archived), manager.CANONICAL_PATH_SAFE_BUDGET
+            )
+            self.assertIn(f"__{sha256_file(source)[:12]}", archived.stem)
+            self.assertEqual(archived.suffix, ".pdf")
+
+    def test_long_path_filename_is_deterministic_for_repeat_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "repeat.pdf")
+            manager = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            first = manager.archive_authorized_pdf(source, self._long_record(), authorized_access())
+            second = manager.archive_authorized_pdf(source, self._long_record(), authorized_access())
+            self.assertEqual(first.local_path, second.local_path)
+            self.assertEqual(first.sha256, second.sha256)
+
+    def test_long_prefix_different_artifacts_have_distinct_canonical_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source = write_minimal_pdf(root / "one.pdf")
+            second_source = write_minimal_pdf(root / "two.pdf")
+            second_source.write_bytes(second_source.read_bytes() + b"\n% distinct artifact\n")
+            manager = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            first = manager.archive_authorized_pdf(first_source, self._long_record(title_tail="A"), authorized_access())
+            second = manager.archive_authorized_pdf(second_source, self._long_record(title_tail="B"), authorized_access())
+            self.assertNotEqual(Path(first.local_path).name, Path(second.local_path).name)
+            self.assertTrue(Path(first.local_path).is_file())
+            self.assertTrue(Path(second.local_path).is_file())
+
+    def test_windows_invalid_title_characters_remain_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "invalid.pdf")
+            record = LiteratureRecord(
+                paper_id="P-INVALID",
+                title='Question?: star* quote" less< greater> pipe| slash/ back\\',
+                authors=("A: Author",),
+                year="2026",
+            )
+            manager = LiteratureDownloadManager(
+                root / "downloads", allow_outside_project_for_tests=True, make_archive_read_only=False
+            )
+            entry = manager.archive_authorized_pdf(source, record, authorized_access())
+            self.assertFalse(any(character in Path(entry.local_path).name for character in '<>:"/\\|?*'))
+
+    def test_shortening_preserves_pdf_and_caj_extensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            pdf = write_minimal_pdf(root / "long.pdf")
+            caj = root / "long.caj"
+            caj.write_bytes(b"KDH 2.00 Copyright(C) 2000 CAJCD\ncontent\n")
+            pdf_entry = manager.archive_authorized_pdf(pdf, self._long_record(title_tail="PDF"), authorized_access())
+            caj_access = replace(authorized_access(), full_text_format=FullTextFormat.CAJ)
+            caj_entry = manager.archive_authorized_fulltext(
+                caj,
+                self._long_record(title_tail="CAJ"),
+                caj_access,
+                full_text_format=FullTextFormat.CAJ,
+            )
+            self.assertEqual(Path(pdf_entry.local_path).suffix, ".pdf")
+            self.assertEqual(Path(caj_entry.local_path).suffix, ".caj")
+
+    def test_long_chinese_unicode_title_is_deterministic_and_within_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "unicode.pdf")
+            record = LiteratureRecord(
+                paper_id="P-UNICODE",
+                title="人工智能赋能企业全球价值链韧性提升与供应链风险治理机制研究" * 5,
+                authors=("王小明",),
+                year="2026",
+                doi="10.1000/unicode",
+                target_identity_confirmed=True,
+            )
+            manager = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            first = manager.archive_authorized_pdf(source, record, authorized_access())
+            second = manager.archive_authorized_pdf(source, record, authorized_access())
+            self.assertEqual(first.local_path, second.local_path)
+            self.assertLessEqual(
+                manager._windows_path_units(first.local_path), manager.CANONICAL_PATH_SAFE_BUDGET
+            )
+
+    def test_parent_depth_changes_dynamic_filename_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "depth.pdf")
+            record = self._long_record(title_tail="DEPTH")
+            shallow = LiteratureDownloadManager(
+                root / "shallow", allow_outside_project_for_tests=True, make_archive_read_only=False
+            )
+            deep = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            shallow_entry = shallow.archive_authorized_pdf(source, record, authorized_access())
+            deep_entry = deep.archive_authorized_pdf(source, record, authorized_access())
+            self.assertGreater(len(Path(shallow_entry.local_path).name), len(Path(deep_entry.local_path).name))
+            self.assertLessEqual(
+                deep._windows_path_units(deep_entry.local_path), deep.CANONICAL_PATH_SAFE_BUDGET
+            )
+
+    def test_same_sha_reuses_existing_destination_and_different_sha_does_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source = write_minimal_pdf(root / "one.pdf")
+            second_source = write_minimal_pdf(root / "two.pdf")
+            second_source.write_bytes(second_source.read_bytes() + b"\n% different\n")
+            record = LiteratureRecord(
+                paper_id="P-COLLISION",
+                title="Same canonical title",
+                authors=("A. Smith",),
+                year="2026",
+            )
+            manager = LiteratureDownloadManager(
+                root / "downloads", allow_outside_project_for_tests=True, make_archive_read_only=False
+            )
+            first = manager.archive_authorized_pdf(first_source, record, authorized_access())
+            repeated = manager.archive_authorized_pdf(first_source, record, authorized_access())
+            second = manager.archive_authorized_pdf(second_source, record, authorized_access())
+            self.assertEqual(first.local_path, repeated.local_path)
+            self.assertNotEqual(first.local_path, second.local_path)
+            self.assertEqual(sha256_file(Path(first.local_path)), sha256_file(first_source))
+            self.assertEqual(sha256_file(Path(second.local_path)), sha256_file(second_source))
+
+    def test_bounded_destination_remains_inside_managed_archive_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = write_minimal_pdf(root / "containment.pdf")
+            manager = LiteratureDownloadManager(
+                self._long_download_root(root),
+                allow_outside_project_for_tests=True,
+                make_archive_read_only=False,
+            )
+            entry = manager.archive_authorized_pdf(source, self._long_record(title_tail="../escape"), authorized_access())
+            self.assertEqual(Path(entry.local_path).resolve().parent, manager.archive_dir.resolve())
 
 
 if __name__ == "__main__":
