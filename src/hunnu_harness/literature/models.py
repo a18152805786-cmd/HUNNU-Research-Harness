@@ -581,6 +581,18 @@ class DownloadManifestEntry:
     library_notes_path: str = UNKNOWN
     library_catalog_path: str = UNKNOWN
     library_reason: str = UNKNOWN
+    classification_status: str = UNKNOWN
+    assigned_topics: tuple[str, ...] = ()
+    assigned_primary_topic: str = UNKNOWN
+    assigned_secondary_topics: tuple[str, ...] = ()
+    proposed_topics: tuple[str, ...] = ()
+    topic_review_required: bool = False
+    navigator_metadata_ready: bool = False
+    navigator_topic_ready: bool = False
+    navigator_fulltext_index_status: str = UNKNOWN
+    topic_metadata_updated: bool = False
+    topic_view_updated: bool = False
+    classification_reason: str = UNKNOWN
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -637,6 +649,18 @@ class DownloadManifestEntry:
             "LibraryNotesPath": self.library_notes_path,
             "LibraryCatalogPath": self.library_catalog_path,
             "LibraryReason": self.library_reason,
+            "ClassificationStatus": self.classification_status,
+            "AssignedTopics": list(self.assigned_topics),
+            "AssignedPrimaryTopic": self.assigned_primary_topic,
+            "AssignedSecondaryTopics": list(self.assigned_secondary_topics),
+            "ProposedTopics": list(self.proposed_topics),
+            "TopicReviewRequired": self.topic_review_required,
+            "NavigatorMetadataReady": self.navigator_metadata_ready,
+            "NavigatorTopicReady": self.navigator_topic_ready,
+            "NavigatorFulltextIndexStatus": self.navigator_fulltext_index_status,
+            "TopicMetadataUpdated": self.topic_metadata_updated,
+            "TopicViewUpdated": self.topic_view_updated,
+            "ClassificationReason": self.classification_reason,
         }
 
 

@@ -29,6 +29,7 @@ from .downloads import (
     UnauthorizedFullTextError,
 )
 from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
+from .auto_classification import PostAcquisitionClassifier
 from .library import GlobalPaperLibrary
 from .models import (
     AccessDecision,
@@ -69,11 +70,16 @@ def _download_manager_for_run(
         )
     else:
         library = GlobalPaperLibrary()
+    # Topic classification writes canonical metadata, so it is attached only to
+    # the real Library.  An isolated test run archives into its own tree and
+    # must never reach the frozen taxonomy or the shared topic store.
+    classifier = None if isolated_test_library else PostAcquisitionClassifier()
     return LiteratureDownloadManager(
         writer.downloads_dir,
         allow_outside_project_for_tests=allow_outside_project_for_tests,
         make_archive_read_only=not allow_outside_project_for_tests,
         global_library=library,
+        topic_classifier=classifier,
     )
 
 

@@ -4,9 +4,12 @@ import shutil
 import stat
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from ..paths import require_output_path
 from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
+from .auto_classification import PostAcquisitionClassifier
+from .classification import ClassificationStatus
 from .library import GlobalPaperLibrary
 from .models import AccessDecision, DownloadManifestEntry, FullTextFormat, LiteratureRecord, UNKNOWN
 from .normalization import normalized_fulltext_filename, sha256_file
@@ -41,6 +44,7 @@ class LiteratureDownloadManager:
         allow_outside_project_for_tests: bool = False,
         make_archive_read_only: bool = True,
         global_library: GlobalPaperLibrary | None = None,
+        topic_classifier: PostAcquisitionClassifier | None = None,
     ):
         self.downloads_root = Path(downloads_root).resolve()
         if not allow_outside_project_for_tests:
@@ -55,6 +59,7 @@ class LiteratureDownloadManager:
             directory.mkdir(parents=True, exist_ok=True)
         self.make_archive_read_only = make_archive_read_only
         self.global_library = global_library
+        self.topic_classifier = topic_classifier
 
     def archive_authorized_pdf(
         self,
@@ -130,6 +135,18 @@ class LiteratureDownloadManager:
         library_notes_path = UNKNOWN
         library_catalog_path = UNKNOWN
         library_reason = UNKNOWN
+        classification_status = UNKNOWN
+        assigned_topics: tuple[str, ...] = ()
+        assigned_primary_topic = UNKNOWN
+        assigned_secondary_topics: tuple[str, ...] = ()
+        proposed_topics: tuple[str, ...] = ()
+        topic_review_required = False
+        topic_metadata_updated = False
+        topic_view_updated = False
+        classification_reason = UNKNOWN
+        navigator_metadata_ready = False
+        navigator_topic_ready = False
+        navigator_fulltext_index_status = UNKNOWN
         if self.global_library is not None:
             try:
                 library_result = self.global_library.ingest_acquired_fulltext(
@@ -148,6 +165,23 @@ class LiteratureDownloadManager:
                 if library_result.catalog_jsonl_path is not None:
                     library_catalog_path = str(library_result.catalog_jsonl_path)
                 library_reason = library_result.reason
+                if self.topic_classifier is not None and library_result.status != "REJECTED":
+                    classified = self._classify_archived_work(
+                        library_result.paper_id,
+                        library_disposition,
+                    )
+                    classification_status = classified["status"]
+                    assigned_topics = classified["assigned"]
+                    assigned_primary_topic = classified["primary"]
+                    assigned_secondary_topics = classified["secondary"]
+                    proposed_topics = classified["proposed"]
+                    topic_review_required = classified["review_required"]
+                    topic_metadata_updated = classified["metadata_updated"]
+                    topic_view_updated = classified["view_updated"]
+                    classification_reason = classified["reason"]
+                    navigator_metadata_ready = classified["nav_metadata_ready"]
+                    navigator_topic_ready = classified["nav_topic_ready"]
+                    navigator_fulltext_index_status = classified["nav_fulltext_status"]
             except Exception as exc:
                 # The already-validated run archive remains acquisition evidence.
                 # The manifest makes a Library failure explicit rather than
@@ -211,7 +245,88 @@ class LiteratureDownloadManager:
             library_notes_path=library_notes_path,
             library_catalog_path=library_catalog_path,
             library_reason=library_reason,
+            classification_status=classification_status,
+            assigned_topics=assigned_topics,
+            assigned_primary_topic=assigned_primary_topic,
+            assigned_secondary_topics=assigned_secondary_topics,
+            proposed_topics=proposed_topics,
+            topic_review_required=topic_review_required,
+            navigator_metadata_ready=navigator_metadata_ready,
+            navigator_topic_ready=navigator_topic_ready,
+            navigator_fulltext_index_status=navigator_fulltext_index_status,
+            topic_metadata_updated=topic_metadata_updated,
+            topic_view_updated=topic_view_updated,
+            classification_reason=classification_reason,
         )
+
+    def _classify_archived_work(
+        self,
+        paper_id: str,
+        disposition: str,
+    ) -> dict[str, Any]:
+        """Classify one just-archived WORK after its identity lock and ingest.
+
+        A classification failure is a metadata outcome, never an acquisition
+        one: the authorized download and the archived file are already valid
+        evidence and stay untouched whatever happens here.
+
+        Navigator readiness is reported capability by capability.  A newly
+        archived work is immediately visible to catalog and topic lookups but is
+        not in the derived full-text index until that index is rebuilt, so the
+        index keeps its own STALE/FRESH verdict rather than being folded into a
+        single "ready" flag.
+        """
+
+        failed = {
+            "status": "FAILED_SAFE",
+            "assigned": (),
+            "primary": UNKNOWN,
+            "secondary": (),
+            "proposed": (),
+            "review_required": True,
+            "metadata_updated": False,
+            "view_updated": False,
+            "reason": UNKNOWN,
+            "nav_metadata_ready": False,
+            "nav_topic_ready": False,
+            "nav_fulltext_status": UNKNOWN,
+        }
+        try:
+            result, outcome = self.topic_classifier.classify_after_ingest(
+                paper_id,
+                disposition=disposition,
+            )
+        except Exception as exc:
+            return {**failed, "reason": f"Topic classification failed: {type(exc).__name__}"}
+
+        if result.status is ClassificationStatus.SKIPPED_EXISTING:
+            assigned = tuple(result.existing_topics)
+            primary = assigned[0] if assigned else UNKNOWN
+            secondary = assigned[1:]
+        else:
+            assigned = result.assigned_labels
+            primary = result.primary_topic
+            secondary = result.secondary_labels
+
+        readiness = None
+        try:
+            readiness = self.topic_classifier.navigator_readiness(paper_id)
+        except Exception:
+            readiness = None
+        return {
+            "status": result.status.value,
+            "assigned": assigned,
+            "primary": primary,
+            "secondary": secondary,
+            "proposed": result.proposed_labels,
+            "review_required": result.review_required,
+            "metadata_updated": outcome.topic_metadata_updated,
+            "view_updated": outcome.topic_view_updated,
+            "reason": outcome.reason,
+            "nav_metadata_ready": bool(readiness and readiness.metadata_ready),
+            "nav_topic_ready": bool(readiness and readiness.topic_ready),
+            "nav_fulltext_status": readiness.fulltext_index_status if readiness else UNKNOWN,
+        }
 
     @staticmethod
     def _windows_path_units(value: Path | str) -> int:
