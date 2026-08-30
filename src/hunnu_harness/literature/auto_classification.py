@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from ..paths import LIBRARY_CATALOG_JSONL
+from ..paths import LIBRARY_CATALOG_JSONL, OUTPUT_ROOT
 from .classification import (
     ClassificationInput,
     ClassificationMode,
@@ -136,11 +136,15 @@ class PostAcquisitionClassifier:
         catalog = self._catalog_entry(paper_id)
         if catalog is None:
             return None
+        managed = str(
+            catalog.get("managed_pdf_path") or catalog.get("managed_fulltext_path") or ""
+        )
         return WorkTopicRow(
             paper_id=paper_id,
             title=str(catalog.get("title", UNKNOWN)),
-            human_readable_name=str(catalog.get("human_readable_name", "")),
-            canonical_path=str(catalog.get("managed_pdf_path") or catalog.get("managed_fulltext_path") or ""),
+            human_readable_name=str(catalog.get("human_readable_name", ""))
+            or _readable_name(catalog, paper_id, managed),
+            canonical_path=_absolute_managed(managed),
             canonical_sha256=str(catalog.get("sha256", "")),
         )
 
@@ -350,6 +354,37 @@ class PostAcquisitionClassifier:
                 reason=f"NOT_APPLIED_{result.status.value}" if not dry_run else "DRY_RUN",
             )
         return self.apply_classification(paper_id, result=result)
+
+
+def _absolute_managed(value: str) -> str:
+    """Resolve a catalog managed path against the Output Root.
+
+    The catalog stores managed paths Output-Root-relative (AGENTS.md 54).
+    Treating one as absolute leaves a path that does not exist, and the view
+    then silently records the entry as unavailable instead of hardlinking it --
+    a work filed with no readable file behind it.
+    """
+
+    if not value:
+        return ""
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((OUTPUT_ROOT / candidate).resolve())
+
+
+def _readable_name(catalog: Mapping[str, Any], paper_id: str, managed: str) -> str:
+    """A filename for the view when the catalog carries no human-readable one."""
+
+    suffix = Path(managed).suffix or ".pdf"
+    first = str(catalog.get("first_author") or "").strip()
+    year = str(catalog.get("year") or "").strip()
+    title = str(catalog.get("title") or "").strip()
+    if not title or title == UNKNOWN:
+        return f"{paper_id}{suffix}"
+    stem = " - ".join(part for part in (f"{first}({year})" if first and year else "", title) if part)
+    cleaned = "".join(" " if character in '<>:"/\\|?*' else character for character in stem)
+    return f"{cleaned.strip()[:120]} [{paper_id}]{suffix}"
 
 
 def _labels_from(values: Sequence[str]) -> tuple[TopicLabel, ...]:
