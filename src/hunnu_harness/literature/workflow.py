@@ -43,7 +43,7 @@ from .models import (
     UNKNOWN,
 )
 from .planning import LiteratureSearchPlanner
-from .normalization import normalize_doi, normalize_title
+from .normalization import normalize_doi, normalize_person, normalize_title
 from .screening import LiteratureScreener
 from .security import LiteratureAuditLogger, scan_files_for_sensitive_leaks
 
@@ -99,6 +99,73 @@ def _lock_search_result_to_detail(
             ):
                 return candidate
     return None
+
+
+def _matches_requested_target_identity(
+    record: LiteratureRecord,
+    request: LiteratureSearchRequest,
+) -> bool:
+    """Fail closed when an explicit citation request does not match a detail page.
+
+    Search/detail relocking only proves that the opened page belongs to the
+    selected search result.  Explicit DOI, title, author, and year constraints
+    separately identify the citation requested by the user.
+    """
+
+    requested_dois = {
+        normalized
+        for value in request.dois
+        if (normalized := normalize_doi(value)) != UNKNOWN
+    }
+    requested_titles = {
+        normalized
+        for value in request.exact_titles
+        if (normalized := normalize_title(value)) != UNKNOWN
+    }
+    requested_authors = tuple(
+        normalized
+        for value in request.authors
+        if (normalized := normalize_person(value)) != UNKNOWN
+    )
+    has_explicit_identity = bool(requested_dois or requested_titles or requested_authors)
+    if not has_explicit_identity:
+        return True
+
+    if requested_dois and normalize_doi(record.doi) not in requested_dois:
+        return False
+    if requested_titles and normalize_title(record.title) not in requested_titles:
+        return False
+
+    if request.year_start is not None or request.year_end is not None:
+        if not str(record.year).isdigit():
+            return False
+        year = int(record.year)
+        if request.year_start is not None and year < request.year_start:
+            return False
+        if request.year_end is not None and year > request.year_end:
+            return False
+
+    record_authors = tuple(
+        normalized
+        for value in record.authors
+        if (normalized := normalize_person(value)) != UNKNOWN
+    )
+    if requested_authors and record_authors:
+        def author_matches(requested: str) -> bool:
+            return any(
+                requested == observed or requested in observed.split()
+                for observed in record_authors
+            )
+
+        if requested_dois or requested_titles:
+            if not any(author_matches(author) for author in requested_authors):
+                return False
+        elif not all(author_matches(author) for author in requested_authors):
+            return False
+    elif requested_authors and not (requested_dois or requested_titles):
+        return False
+
+    return True
 
 
 def _is_fulltext_acquisition_candidate(record: LiteratureRecord) -> bool:
@@ -198,7 +265,10 @@ class LiteratureAcquisitionWorkflow:
                             raise SourceLayoutChanged(
                                 "Search/detail target identity lock failed before acquisition"
                             )
-                        extracted.target_identity_confirmed = True
+                        extracted.target_identity_confirmed = _matches_requested_target_identity(
+                            extracted,
+                            request,
+                        )
                         extracted.canonical_paper_id = extracted.paper_id
                         access = await self.adapter.check_fulltext_access()
                         extracted.full_text_accessible = access.full_text_accessible
@@ -214,6 +284,7 @@ class LiteratureAcquisitionWorkflow:
                             stable_identifier=extracted.stable_identifier,
                             full_text_accessible=access.full_text_accessible,
                             access_type=access.access_type.value,
+                            target_identity_confirmed=extracted.target_identity_confirmed,
                         )
                     except SourceUserDownloadRequired as exc:
                         query_error = str(exc)

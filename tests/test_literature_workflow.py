@@ -527,6 +527,98 @@ class LiteratureWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(adapter.download_calls, [])
             self.assertEqual(result.downloads, [])
 
+    async def test_explicit_target_identity_blocks_related_keep_candidate_before_acquisition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_title = "How Does Financial Reporting Quality Relate to Investment Efficiency?"
+            target = identity_candidate(
+                "TARGET",
+                target_title,
+                authors=("Gary C. Biddle", "Gilles Hilary", "Rodrigo S. Verdi"),
+                year="2009",
+            )
+            target.doi = "10.1016/j.jacceco.2009.09.001"
+            related = identity_candidate(
+                "RELATED",
+                "Financial reporting quality and investment efficiency in private companies",
+                authors=("Unrelated Author",),
+                year="2009",
+            )
+            related.doi = "10.1016/j.example.2009.01.001"
+            related.abstract = "Financial reporting quality investment efficiency accrual audit."
+            adapter = _IdentityGateAdapter(
+                root,
+                [target, related],
+                accessible_ids={target.paper_id, related.paper_id},
+            )
+            explicit_request = LiteratureSearchRequest.from_mapping(
+                {
+                    "OriginalResearchRequest": target_title,
+                    "Authors": ["Biddle", "Hilary", "Verdi"],
+                    "ExactTitles": [target_title],
+                    "DOIs": ["10.1016/j.jacceco.2009.09.001"],
+                    "KeywordsEN": ["financial reporting quality", "investment efficiency"],
+                    "YearStart": 2009,
+                    "YearEnd": 2009,
+                    "MaxSearchResults": 2,
+                    "MaxResultsPerSource": 2,
+                    "MaxDownloads": 1,
+                    "MaxDownloadsPerRun": 1,
+                    "RequireFullText": True,
+                }
+            )
+
+            result = await LiteratureAcquisitionWorkflow(
+                adapter,
+                run_root=root / "run",
+                human_like_delay_seconds=0,
+                allow_outside_project_for_tests=True,
+            ).run(explicit_request)
+
+            by_id = {record.paper_id: record for record in result.records}
+            self.assertTrue(by_id[target.paper_id].target_identity_confirmed)
+            self.assertFalse(by_id[related.paper_id].target_identity_confirmed)
+            self.assertEqual(adapter.access_calls.count(target.paper_id), 2)
+            self.assertEqual(adapter.access_calls.count(related.paper_id), 1)
+            self.assertEqual(adapter.fulltext_entry_calls, 1)
+            self.assertEqual(adapter.download_calls, [target.paper_id])
+            self.assertEqual([entry.paper_id for entry in result.downloads], [target.paper_id])
+
+    async def test_authors_only_explicit_identity_requires_all_requested_authors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = identity_candidate(
+                "AUTHORS",
+                "Artificial intelligence and global value chain resilience",
+                authors=("John Sullivan", "Samuel Fosso Wamba"),
+                year="2022",
+            )
+            unrelated = identity_candidate(
+                "OTHER",
+                "Artificial intelligence and global value chain resilience",
+                authors=("Unrelated Author",),
+                year="2022",
+            )
+            adapter = _IdentityGateAdapter(
+                root,
+                [target, unrelated],
+                accessible_ids={target.paper_id, unrelated.paper_id},
+            )
+
+            result = await LiteratureAcquisitionWorkflow(
+                adapter,
+                run_root=root / "run",
+                human_like_delay_seconds=0,
+                allow_outside_project_for_tests=True,
+            ).run(identity_request(2))
+
+            by_id = {record.paper_id: record for record in result.records}
+            self.assertTrue(by_id[target.paper_id].target_identity_confirmed)
+            self.assertFalse(by_id[unrelated.paper_id].target_identity_confirmed)
+            self.assertEqual(adapter.access_calls.count(unrelated.paper_id), 1)
+            self.assertEqual(adapter.fulltext_entry_calls, 1)
+            self.assertEqual(adapter.download_calls, [target.paper_id])
+
 
 if __name__ == "__main__":
     unittest.main()
