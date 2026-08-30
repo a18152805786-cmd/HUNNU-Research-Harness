@@ -16,3 +16,11 @@ class AuthClassificationTests(unittest.TestCase):
     def test_expired_session_wins(self):
         state = BrowserState(url="https://example.test", title="会话已过期", body_text="学校账号")
         self.assertEqual(classify_auth_state(state), AuthStatus.SESSION_EXPIRED)
+
+    def test_unrecognisable_page_stays_unknown(self):
+        """No marker either way means UNKNOWN -- never a guess in either direction."""
+
+        state = BrowserState(
+            url="https://example.test/article", title="Some article", body_text="plain body text"
+        )
+        self.assertEqual(classify_auth_state(state), AuthStatus.AUTH_UNKNOWN)

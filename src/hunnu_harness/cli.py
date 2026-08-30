@@ -83,24 +83,17 @@ def build_parser() -> argparse.ArgumentParser:
         "browser-status",
         help="Report whether a persistent Research Chrome is running, without starting one",
     )
-    auth_status = sub.add_parser(
-        "browser-auth-status",
-        help=(
-            "Report institutional sign-in freshness from cookie metadata only: "
-            "names, hosts, and expiry times, never values; read-only and immutable, "
-            "no browser started, nothing navigated"
-        ),
-    )
-    auth_status.add_argument(
-        "--profile",
-        type=Path,
-        default=Path(
-            os.environ.get(
-                "HUNNU_RESEARCH_PROFILE",
-                Path.home() / "ResearchHarness" / "chrome-profile",
-            )
-        ),
-    )
+    # There is deliberately no "browser-auth-status" command.  One existed
+    # briefly, reading cookie names and expiry times from the profile's
+    # Cookies database -- values untouched, but still a second authentication
+    # oracle doing exactly what AGENTS.md 6/22 and classify_auth_state()'s own
+    # contract rule out.  Under the frozen boundary (no cookie inspection, no
+    # navigation, no starting a browser) a pre-run probe can only answer
+    # AUTH_UNKNOWN whenever the browser is closed -- which is precisely when a
+    # pre-run check happens -- so the command could not serve its purpose.
+    # Sign-in staleness is surfaced where it is actually observable: a live
+    # run stops with ACTION_REQUIRED_USER_LOGIN on the page state it sees, and
+    # the write-ahead fetch ledger keeps an interrupted run from burning quota.
     sub.add_parser(
         "browser-stop",
         help="Close the persistent Research Chrome, ending its signed-in session",
@@ -201,18 +194,6 @@ def main() -> int:
         for key, value in status.as_dict().items():
             print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
         return 0
-    if args.command == "browser-auth-status":
-        from .auth.freshness import read_auth_freshness
-        from .browser.persistent_browser import probe
-
-        report = read_auth_freshness(args.profile)
-        payload = report.as_dict()
-        # The persistent-browser probe explains an immutable read of a locked
-        # database; it neither starts a browser nor navigates anywhere.
-        payload["PersistentBrowserRunning"] = probe().running
-        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if report.readable else 2
-
     if args.command == "browser-stop":
         import asyncio as _asyncio
 
