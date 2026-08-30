@@ -183,7 +183,7 @@ class AutomaticPathTests(unittest.TestCase):
 
         with temp_root("prov-review-") as tmp:
             fixture = _Fixture(Path(tmp))
-            fixture.add_work("PR1", "AI washing: strategic disclosure and backlash")
+            fixture.add_work("PR1", "The talk-walk gap in corporate technology narratives")
 
             result, outcome = fixture.service().classify_after_ingest(
                 "PR1", disposition="NEW_WORK"

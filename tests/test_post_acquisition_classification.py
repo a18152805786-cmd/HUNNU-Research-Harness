@@ -181,10 +181,12 @@ class ClassifyTests(unittest.TestCase):
     def test_a_single_uncorroborated_signal_is_not_enough_to_auto_assign(self) -> None:
         # One concept hit in the title alone reaches confidence 0.5, below the
         # calibrated 0.75 gate.  Precision is bought exactly here: a lone signal
-        # goes to review rather than becoming a silent assignment.
+        # goes to review rather than becoming a silent assignment.  The title
+        # uses a lexicon surface form that is not an English subtopic alias, so
+        # the lexicon really is the only evidence family firing.
         with tempfile.TemporaryDirectory(prefix="cls-weak-", dir=TEMP_DIR) as tmp:
             fixture = _Fixture(Path(tmp))
-            fixture.add_work("PW", "AI washing and corporate disclosure quality")
+            fixture.add_work("PW", "The talk-walk gap in corporate technology narratives")
             result = fixture.classifier().classify_work("PW")
             self.assertEqual(result.status, ClassificationStatus.REVIEW_REQUIRED)
             self.assertEqual(result.reason, "BELOW_AUTO_ASSIGN_THRESHOLD")
@@ -554,6 +556,56 @@ class CanonicalLibraryBacktestTests(unittest.TestCase):
         # real precision regression fails.
         self.assertGreaterEqual(measured["precision"], 0.93, measured)
         self.assertGreaterEqual(measured["top1"], 0.95, measured)
+
+    def test_english_aliases_hold_their_own_calibration(self) -> None:
+        """Per-language floors for the English alias table, plus stability.
+
+        The alias calibration measured Chinese coverage 0.654 (bit-identical
+        with the table on and off), English coverage 0.895, and precision 1.000
+        for both languages over the 181-work corpus.  The floors sit below
+        those numbers the same way the global precision floor does, and the
+        run is repeated to prove the backtest is deterministic -- the numbers
+        an alias edit is judged by must not wobble between runs.
+        """
+
+        from hunnu_harness.navigator.tokenize import contains_cjk
+
+        classifier = WorkClassifier(taxonomy=self.taxonomy)
+
+        def measure() -> dict[str, dict[str, float]]:
+            buckets = {
+                lang: {"works": 0, "auto": 0, "tp": 0, "fp": 0}
+                for lang in ("cjk", "latin")
+            }
+            for paper_id, row in sorted(self.rows.items()):
+                truth = {label.label for label in row.topics}
+                result = classifier.classify(
+                    ClassificationInput(
+                        paper_id=paper_id,
+                        title=row.title or "",
+                        keywords=(row.keywords or "").replace(";", " "),
+                    )
+                )
+                bucket = buckets["cjk" if contains_cjk(row.title or "") else "latin"]
+                bucket["works"] += 1
+                if not result.is_classified:
+                    continue
+                bucket["auto"] += 1
+                predicted = set(result.assigned_labels)
+                bucket["tp"] += len(predicted & truth)
+                bucket["fp"] += len(predicted - truth)
+            return buckets
+
+        first = measure()
+        self.assertEqual(first, measure(), "the backtest must be deterministic")
+
+        for lang, coverage_floor in (("cjk", 0.60), ("latin", 0.75)):
+            bucket = first[lang]
+            self.assertGreaterEqual(
+                bucket["auto"] / bucket["works"], coverage_floor, (lang, bucket)
+            )
+            assigned = bucket["tp"] + bucket["fp"]
+            self.assertGreaterEqual(bucket["tp"] / assigned, 0.95, (lang, bucket))
 
     def test_review_absorbs_what_cannot_be_classified_confidently(self) -> None:
         measured = self._measure()

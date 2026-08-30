@@ -51,6 +51,22 @@ abstract 1.5, full text 1.0 capped at three hits per concept, journal 0.5):
    `供应链与产业链` when the truth was `全球价值链与国际化` — the subtopic whose
    own name the title contained. It lifted top-1 precision from 0.636 to 0.974.
 
+   The name signal also fires on **English aliases** of the frozen values
+   (`literature/taxonomy_aliases.py`) — the frozen names are Chinese, so an
+   English title could never corroborate anything and 16 of 19 English works
+   sat in review on a lone lexicon signal. An alias is the standard English
+   term for the same construct, never a term fitted to one paper; it matches
+   on word boundaries, credits at most one hit per subtopic per field, and one
+   English word weighs as a two-character Chinese term in the specificity
+   formula. Measured on the 181-work corpus: English coverage 0.158 → 0.895
+   with per-language precision 1.000, and the Chinese results bit-identical
+   with the table on and off (162 works, coverage 0.654). The taxonomy file
+   itself is untouched — an alias can never create a topic — and the alias
+   table is a calibration artifact: an edit is acceptable only with the
+   per-language backtest
+   (`CanonicalLibraryBacktestTests::test_english_aliases_hold_their_own_calibration`)
+   held or improved.
+
 Confidence saturates as `score / (score + 3.0)`. One title concept hit alone
 reaches 0.5 and is therefore *not* auto-assigned: a lone uncorroborated signal
 goes to review by construction.

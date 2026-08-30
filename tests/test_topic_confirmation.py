@@ -93,9 +93,17 @@ class _Fixture:
 
 
 def _review_work(fixture: _Fixture, paper_id: str = "PR1") -> tuple[str, ...]:
-    """An English-titled work: one lexicon signal each, so it lands in review."""
+    """An English-titled work with one lexicon-only signal, so it lands in review.
 
-    fixture.add_work(paper_id, "AI washing: strategic disclosure and backlash")
+    The surface form is deliberately not an English subtopic alias -- an
+    aliased phrase like "AI washing" now corroborates the taxonomy-name signal
+    and classifies outright, which is the wrong starting state for a
+    confirmation test.
+    """
+
+    fixture.add_work(
+        paper_id, "The talk-walk gap and information asymmetry in technology narratives"
+    )
     result = fixture.service().classify_work(paper_id)
     assert result.status is ClassificationStatus.REVIEW_REQUIRED, result.status
     return result.proposed_labels

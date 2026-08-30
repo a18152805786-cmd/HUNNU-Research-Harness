@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..navigator.lexicon import ConceptMatch, match_concepts
 from ..navigator.tokenize import fold
 from .models import UNKNOWN
+from .taxonomy_aliases import ALIAS_WORD_CJK_EQUIVALENT, alias_word_count, best_alias_hit
 from .topics import TopicLabel, TopicTaxonomy
 
 # Evidence weight by where a concept was seen.  A term in the title states what
@@ -333,6 +334,27 @@ class WorkClassifier:
                     concept=f"taxonomy:{label.subtopic}",
                     field_name=field_name,
                     term=term,
+                    signal=SIGNAL_TAXONOMY_NAME,
+                )
+            # An English alias is the same construct as the subtopic's own name,
+            # so it earns the same signal at the same thresholds.  One hit at
+            # most per field: aliases are synonymous variants, and stacking them
+            # would count a single piece of evidence several times over.  An
+            # English word weighs as ALIAS_WORD_CJK_EQUIVALENT CJK characters in
+            # the specificity formula; see literature/taxonomy_aliases.py.
+            alias = best_alias_hit(folded, label.subtopic)
+            if alias is not None:
+                specificity = min(
+                    alias_word_count(alias)
+                    * ALIAS_WORD_CJK_EQUIVALENT
+                    * NAME_TERM_UNIT_WEIGHT,
+                    MAX_NAME_TERM_WEIGHT,
+                )
+                totals.setdefault(label, _TopicAccumulator()).add(
+                    weight=weight * specificity / FIELD_WEIGHTS["title"],
+                    concept=f"taxonomy-alias:{label.subtopic}",
+                    field_name=field_name,
+                    term=alias,
                     signal=SIGNAL_TAXONOMY_NAME,
                 )
 
