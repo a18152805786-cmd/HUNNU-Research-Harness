@@ -114,6 +114,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    sub.add_parser(
+        "library-fetch-budget",
+        help=(
+            "Report today's full-text fetch budget: attempts used, remaining "
+            "allowance, and per-identifier counts, so a run can check before it starts"
+        ),
+    )
+
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
@@ -228,6 +236,21 @@ def main() -> int:
         # assignment has been recorded yet, not that anything is wrong.  Only a
         # record that will not parse is reported as a problem.
         return 0 if fingerprint.intact else 2
+
+    if args.command == "library-fetch-budget":
+        from .literature.fetch_ledger import FetchLedgerError, FulltextFetchLedger
+
+        try:
+            usage = FulltextFetchLedger().usage_today()
+        except FetchLedgerError as exc:
+            # A ledger that cannot be read refuses fetches (fail closed), so
+            # say that plainly instead of printing a half-true budget.
+            print("LedgerReadable=false")
+            print(f"Reason={exc}")
+            print("FetchesWillBeRefused=true")
+            return 2
+        print(json.dumps(usage, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
 
     if args.command == "library-confirm-topics":
         from .literature.auto_classification import PostAcquisitionClassifier

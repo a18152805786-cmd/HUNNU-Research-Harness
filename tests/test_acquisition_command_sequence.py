@@ -160,6 +160,11 @@ def run_acquisition(browser_factory, *, max_downloads: int = 1):
         tmp = Path(raw)
         browser = browser_factory(tmp)
         adapter = ScienceDirectAdapter(browser)
+        # An isolated write-ahead fetch ledger: every run here fetches the same
+        # fixture PII, which the real audit ledger would rightly refuse.
+        from hunnu_harness.literature.fetch_ledger import FulltextFetchLedger
+
+        adapter.fetch_ledger = FulltextFetchLedger(path=tmp / "fetch_ledger.jsonl")
         # run_root under TEMP_DIR keeps the download manager on an isolated
         # library, so no test run can reach the frozen corpus or the taxonomy.
         workflow = LiteratureAcquisitionWorkflow(

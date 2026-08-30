@@ -47,7 +47,7 @@ from hunnu_harness.literature.models import (
 from hunnu_harness.literature.normalization import normalize_title, sha256_file
 from hunnu_harness.literature.workflow import finalize_captured_cnki_acceptance
 
-from literature_test_support import write_minimal_pdf
+from literature_test_support import isolated_fetch_ledger, write_minimal_pdf
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "literature"
@@ -1001,7 +1001,9 @@ class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
             adapter = CNKIAdapter(browser)
             record = CNKIAdapter.parse_article_snapshot(snapshot, source_url=ARTICLE_URL)
             access = CNKIAdapter.check_fulltext_access_snapshot(snapshot, source_url=ARTICLE_URL)
-            path = await adapter.download_fulltext(record, access)
+            with isolated_fetch_ledger() as ledger:
+                adapter.fetch_ledger = ledger
+                path = await adapter.download_fulltext(record, access)
             self.assertEqual(path, downloaded.resolve())
             command = next(item for item in browser.commands if isinstance(item, DownloadCommand))
             self.assertIsNone(command.target.css)
@@ -1041,8 +1043,10 @@ class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
         adapter = CNKIAdapter(browser)
         record = CNKIAdapter.parse_article_snapshot(snapshot, source_url=ARTICLE_URL)
         access = CNKIAdapter.check_fulltext_access_snapshot(snapshot, source_url=ARTICLE_URL)
-        with self.assertRaises(SourceUnavailable):
-            await adapter.download_fulltext(record, access)
+        with isolated_fetch_ledger() as ledger:
+            adapter.fetch_ledger = ledger
+            with self.assertRaises(SourceUnavailable):
+                await adapter.download_fulltext(record, access)
 
         downloads = [item for item in browser.commands if isinstance(item, DownloadCommand)]
         self.assertEqual(len(downloads), 1)

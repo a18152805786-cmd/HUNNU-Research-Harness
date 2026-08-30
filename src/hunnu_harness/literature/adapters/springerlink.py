@@ -634,6 +634,9 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
                 raise SourceLayoutChanged("Springer target identity is not confirmed")
             if not self._gateway_url_is_bound(access.download_url) or not _PDF_PATH.search(parsed.path):
                 raise SourceLayoutChanged("Institutional PDF URL is outside the bound Springer gateway")
+            # Authorization and gateway binding have passed; budget the fetch
+            # before the click is issued.
+            ticket = self.authorize_publisher_fetch(record)
             try:
                 artifact = await self.browser.execute(
                     DownloadCommand(
@@ -655,8 +658,12 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
                 )
                 result = authorized_capture_result_from_artifact(artifact)
             except Exception as exc:
+                ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
                 raise SourceUnavailable(str(exc)) from exc
             if result.acquisition_method != AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT:
+                ticket.record_outcome(
+                    ok=False, detail="acquisition emitted no download event"
+                )
                 raise SourceUnavailable("Institutional Springer acquisition emitted no download event")
             self._last_capture = result
             record.acquisition_method = result.acquisition_method.value
@@ -682,13 +689,23 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
             record.target_identity_confirmed = identity.confirmed
             if not identity.confirmed:
                 quarantined = self._quarantine(result.path)
+                # The bytes arrived and then failed validation -- the exact
+                # failure shape the write-ahead ledger exists to count.
+                ticket.record_outcome(
+                    ok=False,
+                    detail=f"fetched bytes failed identity validation; quarantined as {quarantined.name}",
+                )
                 raise SourceLayoutChanged(
                     "Captured Springer PDF failed local target identity validation; "
                     f"Quarantine=true; QuarantineFile={quarantined.name}"
                 )
+            ticket.record_outcome(ok=True, detail="gateway download completed")
             return result.path
         if parsed.hostname != "link.springer.com" or not _PDF_PATH.search(parsed.path):
             raise SourceLayoutChanged("Download URL is not a stable official Springer PDF path")
+        # The public official-PDF request is still a publisher fetch; budget it
+        # the same way before it is issued.
+        ticket = self.authorize_publisher_fetch(record)
         try:
             response = await self.browser.execute(
                 AuthenticatedFetchCommand(
@@ -700,13 +717,16 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
                 raise SourceUnavailable(f"Official Springer PDF returned HTTP {response.status}")
             if response.artifact is None:
                 raise SourceUnavailable("Official Springer PDF response produced no local artifact")
-            return response.artifact.local_path
-        except SourceUnavailable:
+        except SourceUnavailable as exc:
+            ticket.record_outcome(ok=False, detail=str(exc))
             raise
         except Exception as exc:
+            ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
             raise SourceUnavailable(
                 f"Authorized Springer PDF request failed: {type(exc).__name__}"
             ) from exc
+        ticket.record_outcome(ok=True, detail="official PDF request completed")
+        return response.artifact.local_path
 
     async def get_citation(self) -> dict[str, Any]:
         record = await self.extract_metadata(search_query=UNKNOWN)

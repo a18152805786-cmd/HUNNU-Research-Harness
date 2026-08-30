@@ -1,0 +1,374 @@
+"""Write-ahead ledger of full-text fetches against real publishers.
+
+The three existing checks each answer a different question and none of them
+answers this one:
+
+* the Navigator answers "is this work already in the Library" *before* search;
+* ``LibraryDisposition`` answers "was this file archived before" *at* archive
+  time;
+* nothing answered "have we already asked this publisher for these bytes
+  today".
+
+That gap is what let one PDF be fetched 13 times in a single day: every fetch
+failed *after* the bytes arrived, the paper never reached the Library, so
+every in-library check truthfully said NOT_IN_LIBRARY and waved the next
+attempt through.  The missing fact is the attempt itself, so the ledger
+records it **before the fetch action is issued** -- a ledger written on
+success would have recorded none of those 13 and waved through the 14th.
+
+The ledger is runtime state, not corpus: it lives in ``Output Root/audit/``
+and is deliberately outside every corpus-fingerprint input (the fingerprint
+reads ``library/catalog``, ``library/papers`` and ``papers_by_topic`` only).
+Fetching a paper twice today must not make the Library look changed.
+
+Records are append-only JSONL, two kinds:
+
+* ``attempt`` -- written before the fetch action; this alone supports the
+  guard's decision;
+* ``outcome`` -- appended after the action ends, with success/failure and the
+  reason, so the *next* refusal can say what happened last time.
+
+No personal identity ever enters a record: no username, no account, no device
+name.  A record carries the source, the publisher-side stable identifier, the
+Harness paper id, timestamps, and outcome text only.
+
+Days are UTC calendar days, matching every other Harness audit timestamp.
+
+Failure posture is closed in every direction that gates a fetch: an
+unreadable or corrupt ledger, a record that cannot be appended, and a missing
+identifier all refuse the fetch.  Only the after-the-fact ``outcome`` append
+is best-effort, because failing it would misreport a download that already
+happened.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from ..paths import AUDIT_DIR, require_output_path
+from .models import UNKNOWN
+from .normalization import normalize_doi
+
+FETCH_LEDGER_PATH = AUDIT_DIR / "fulltext_fetch_ledger.jsonl"
+
+# Two attempts per identifier per day: the second is a genuine transient
+# retry, a third is debugging against a live publisher.  The global ceiling
+# reuses AGENTS.md 62's single-batch limit of 25 rather than inventing a
+# second number.
+PER_IDENTIFIER_DAILY_LIMIT = 2
+GLOBAL_DAILY_LIMIT = 25
+
+STATUS_ALREADY_FETCHED = "FULLTEXT_ALREADY_FETCHED_TODAY"
+STATUS_BUDGET_EXHAUSTED = "DAILY_FETCH_BUDGET_EXHAUSTED"
+STATUS_IDENTIFIER_MISSING = "FETCH_IDENTIFIER_MISSING"
+
+_RECORD_TYPES = ("attempt", "outcome")
+
+
+class FetchLedgerError(RuntimeError):
+    """The ledger cannot be trusted or written; the fetch must not proceed."""
+
+
+class FetchIdentifierMissing(FetchLedgerError):
+    """No stable identifier could be derived; the fetch must not proceed."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"{STATUS_IDENTIFIER_MISSING}: {message}")
+        self.status = STATUS_IDENTIFIER_MISSING
+
+
+class FetchBudgetExceeded(FetchLedgerError):
+    """The guard refused the fetch; ``status`` says which limit was hit."""
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(f"{status}: {message}")
+        self.status = status
+
+
+def ledger_identifier(record: Any, *, prefer: str | None = None) -> str:
+    """The publisher-side stable identifier for one fetch, or fail closed.
+
+    Preference order: the adapter's own identifier (ScienceDirect's PII, a
+    CNKI stable identifier), then the record's ``stable_identifier``, then the
+    normalized DOI.  A fetch with no identifier at all cannot be budgeted, so
+    it is refused rather than waved through -- an unbudgeted fetch is exactly
+    the hole this ledger closes.
+    """
+
+    for candidate in (
+        prefer,
+        str(getattr(record, "stable_identifier", "") or ""),
+        normalize_doi(str(getattr(record, "doi", "") or "")),
+    ):
+        value = (candidate or "").strip()
+        if value and value != UNKNOWN:
+            return value
+    raise FetchIdentifierMissing(
+        "no stable identifier, no DOI; refusing an unbudgetable publisher fetch"
+    )
+
+
+@dataclass(frozen=True)
+class FetchTicket:
+    """Proof that one attempt is on the ledger; carries the outcome back."""
+
+    ledger: "FulltextFetchLedger"
+    source: str
+    identifier: str
+    paper_id: str
+
+    def record_outcome(self, *, ok: bool, detail: str) -> bool:
+        """Append the outcome; best-effort by design.
+
+        The fetch has already happened by the time this runs.  Refusing to
+        report a completed download because the outcome row could not be
+        written would misstate what occurred, so a failed append returns
+        ``False`` instead of raising.
+        """
+
+        try:
+            self.ledger.append_record(
+                record_type="outcome",
+                source=self.source,
+                identifier=self.identifier,
+                paper_id=self.paper_id,
+                ok=ok,
+                detail=detail,
+            )
+        except (OSError, FetchLedgerError):
+            return False
+        return True
+
+
+class FulltextFetchLedger:
+    """The append-only daily budget for real publisher full-text fetches."""
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        now: Callable[[], datetime] | None = None,
+        per_identifier_limit: int = PER_IDENTIFIER_DAILY_LIMIT,
+        global_limit: int = GLOBAL_DAILY_LIMIT,
+    ) -> None:
+        self.path = require_output_path(
+            Path(path or FETCH_LEDGER_PATH), label="Full-text fetch ledger"
+        )
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self.per_identifier_limit = per_identifier_limit
+        self.global_limit = global_limit
+
+    # -- reading -----------------------------------------------------------
+
+    def _today(self) -> str:
+        return self._now().astimezone(timezone.utc).date().isoformat()
+
+    def read_records(self) -> list[dict[str, Any]]:
+        """Every record in the ledger, or raise on the first line that lies.
+
+        A malformed line means something other than this module wrote the
+        ledger, and a guard that skips what it cannot read is a guard that can
+        be talked past.  Detection is loud on purpose.
+        """
+
+        if not self.path.exists():
+            return []
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FetchLedgerError(f"fetch ledger is unreadable: {exc}") from exc
+        records: list[dict[str, Any]] = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                item = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise FetchLedgerError(
+                    f"fetch ledger line {line_number} is not JSON: {exc}"
+                ) from exc
+            if (
+                not isinstance(item, Mapping)
+                or item.get("record_type") not in _RECORD_TYPES
+                or not str(item.get("source", "")).strip()
+                or not str(item.get("identifier", "")).strip()
+                or not str(item.get("date", "")).strip()
+            ):
+                raise FetchLedgerError(
+                    f"fetch ledger line {line_number} is not a ledger record"
+                )
+            records.append(dict(item))
+        return records
+
+    def _attempts_today(self) -> list[dict[str, Any]]:
+        today = self._today()
+        return [
+            item
+            for item in self.read_records()
+            if item["record_type"] == "attempt" and item["date"] == today
+        ]
+
+    def _last_outcome_today(self, source: str, identifier: str) -> dict[str, Any] | None:
+        today = self._today()
+        last = None
+        for item in self.read_records():
+            if (
+                item["record_type"] == "outcome"
+                and item["date"] == today
+                and item["source"] == source
+                and item["identifier"] == identifier
+            ):
+                last = item
+        return last
+
+    # -- writing -----------------------------------------------------------
+
+    def append_record(
+        self,
+        *,
+        record_type: str,
+        source: str,
+        identifier: str,
+        paper_id: str,
+        **extra: Any,
+    ) -> None:
+        if record_type not in _RECORD_TYPES:
+            raise FetchLedgerError(f"unknown ledger record type {record_type!r}")
+        moment = self._now().astimezone(timezone.utc)
+        record = {
+            "record_type": record_type,
+            "date": moment.date().isoformat(),
+            "timestamp": moment.isoformat(),
+            "source": source,
+            "identifier": identifier,
+            "paper_id": paper_id,
+            **extra,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+
+    # -- the guard ---------------------------------------------------------
+
+    def authorize_fetch(
+        self,
+        *,
+        source: str,
+        identifier: str,
+        paper_id: str,
+        allow_refetch: bool = False,
+    ) -> FetchTicket:
+        """Check the daily budget, then write the attempt, then permit.
+
+        The attempt row is on disk before this returns; the caller may only
+        issue the fetch action against the returned ticket.  A refusal writes
+        nothing -- a blocked fetch consumed no budget.
+        """
+
+        identifier = (identifier or "").strip()
+        if not identifier or identifier == UNKNOWN:
+            raise FetchIdentifierMissing(
+                "no stable identifier, no DOI; refusing an unbudgetable publisher fetch"
+            )
+
+        attempts = self._attempts_today()
+        same = [
+            item
+            for item in attempts
+            if item["source"] == source and item["identifier"] == identifier
+        ]
+        if len(same) >= self.per_identifier_limit and not allow_refetch:
+            outcome = self._last_outcome_today(source, identifier)
+            last_seen = same[-1].get("timestamp", UNKNOWN)
+            last_result = (
+                f"ok={outcome.get('ok')} detail={outcome.get('detail', UNKNOWN)}"
+                if outcome
+                else "no outcome was recorded (the fetch action may not have finished)"
+            )
+            raise FetchBudgetExceeded(
+                STATUS_ALREADY_FETCHED,
+                f"{source} already fetched {identifier} {len(same)} times today; "
+                f"last attempt {last_seen}, last outcome: {last_result}. "
+                "Diagnose offline from the first fetched file; pass "
+                "--allow-refetch to explicitly fetch it again.",
+            )
+        if len(attempts) >= self.global_limit and not allow_refetch:
+            raise FetchBudgetExceeded(
+                STATUS_BUDGET_EXHAUSTED,
+                f"{len(attempts)} publisher fetch attempts already recorded today "
+                f"(daily ceiling {self.global_limit}, AGENTS.md 62). Pass "
+                "--allow-refetch to explicitly continue.",
+            )
+        self.append_record(
+            record_type="attempt",
+            source=source,
+            identifier=identifier,
+            paper_id=paper_id,
+            allow_refetch=bool(allow_refetch),
+        )
+        return FetchTicket(
+            ledger=self, source=source, identifier=identifier, paper_id=paper_id
+        )
+
+    # -- reporting ---------------------------------------------------------
+
+    def usage_today(self) -> dict[str, Any]:
+        """What the budget looks like right now, for people and Agents."""
+
+        attempts = self._attempts_today()
+        per_identifier: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in attempts:
+            key = (str(item["source"]), str(item["identifier"]))
+            entry = per_identifier.setdefault(
+                key,
+                {
+                    "source": key[0],
+                    "identifier": key[1],
+                    "paper_id": str(item.get("paper_id", UNKNOWN)),
+                    "attempts": 0,
+                    "last_attempt": UNKNOWN,
+                    "last_outcome": UNKNOWN,
+                },
+            )
+            entry["attempts"] += 1
+            entry["last_attempt"] = str(item.get("timestamp", UNKNOWN))
+        for key, entry in per_identifier.items():
+            outcome = self._last_outcome_today(*key)
+            if outcome is not None:
+                entry["last_outcome"] = (
+                    f"ok={outcome.get('ok')} detail={outcome.get('detail', UNKNOWN)}"
+                )
+        return {
+            "LedgerPath": str(self.path),
+            "LedgerDateUTC": self._today(),
+            "PerIdentifierDailyLimit": self.per_identifier_limit,
+            "GlobalDailyLimit": self.global_limit,
+            "AttemptsToday": len(attempts),
+            "RemainingGlobalBudget": max(self.global_limit - len(attempts), 0),
+            "Identifiers": sorted(
+                per_identifier.values(),
+                key=lambda entry: (entry["source"], entry["identifier"]),
+            ),
+        }
+
+
+__all__ = [
+    "FETCH_LEDGER_PATH",
+    "GLOBAL_DAILY_LIMIT",
+    "PER_IDENTIFIER_DAILY_LIMIT",
+    "STATUS_ALREADY_FETCHED",
+    "STATUS_BUDGET_EXHAUSTED",
+    "STATUS_IDENTIFIER_MISSING",
+    "FetchBudgetExceeded",
+    "FetchIdentifierMissing",
+    "FetchLedgerError",
+    "FetchTicket",
+    "FulltextFetchLedger",
+    "ledger_identifier",
+]

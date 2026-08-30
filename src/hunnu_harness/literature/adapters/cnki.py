@@ -1631,6 +1631,10 @@ class CNKIAdapter(LiteratureSourceAdapter):
         label = access.download_locator
         if label in ("", UNKNOWN) or any(marker in label for marker in _REJECT_DOWNLOAD_LABELS):
             raise SourceLayoutChanged("No safe single-paper CNKI download control was locked")
+        # Authorization, identity lock, and control vetting have passed; budget
+        # the fetch before the click is issued.  CNKI's own stable identifier
+        # is the ledger key, with the normalized DOI as the fallback.
+        ticket = self.authorize_publisher_fetch(record)
         try:
             suffix = {FullTextFormat.PDF: ".pdf", FullTextFormat.CAJ: ".caj"}.get(access.full_text_format, ".bin")
             artifact = await self.browser.execute(
@@ -1642,11 +1646,13 @@ class CNKIAdapter(LiteratureSourceAdapter):
                     suggested_filename=f"{record.paper_id}{suffix}",
                 )
             )
-            return artifact.local_path
         except Exception as exc:
+            ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
             raise SourceUnavailable(
                 f"Authorized CNKI control did not produce a browser download: {type(exc).__name__}"
             ) from exc
+        ticket.record_outcome(ok=True, detail="browser download completed")
+        return artifact.local_path
 
     async def get_citation(self) -> dict[str, Any]:
         record = await self.extract_metadata(search_query=UNKNOWN)

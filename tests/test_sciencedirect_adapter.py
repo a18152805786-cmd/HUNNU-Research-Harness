@@ -8,6 +8,8 @@ from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceL
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.models import AccessType, LiteratureSearchRequest, PublicationStatus
 
+from literature_test_support import isolated_fetch_ledger
+
 
 FIXTURES = Path(__file__).parent / "fixtures" / "literature"
 
@@ -187,7 +189,9 @@ class ScienceDirectAdapterAsyncTests(unittest.IsolatedAsyncioTestCase):
             source_url=record.source_page,
         )
 
-        await adapter.download_fulltext(record, access)
+        with isolated_fetch_ledger() as ledger:
+            adapter.fetch_ledger = ledger
+            await adapter.download_fulltext(record, access)
 
         self.assertIsInstance(browser.command, DownloadCommand)
         self.assertIn("S1544612326004149", browser.command.target.css)

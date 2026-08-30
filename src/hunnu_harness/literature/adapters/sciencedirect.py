@@ -854,6 +854,12 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             raise SourceLayoutChanged("Authorized PDF control is not bound to the locked ScienceDirect article")
         download_path = download_url.path
         download_target = f'a[href="{download_path}"], a[href^="{download_path}?"]'
+        # Authorization and PII binding have passed; budget the fetch before
+        # the click is issued.  The PII is the ScienceDirect-side stable
+        # identity of these bytes, so it is the ledger key.
+        ticket = self.authorize_publisher_fetch(
+            record, identifier=f"pii:{article_match.group(1).casefold()}"
+        )
         try:
             artifact = await self.browser.execute(
                 DownloadCommand(
@@ -863,16 +869,18 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                     suggested_filename=f"{record.paper_id}.pdf",
                 )
             )
-            return artifact.local_path
         except Exception as exc:
             # The message, not just the class.  "DownloadFailure" alone sent two
             # rounds of investigation looking in the wrong place while the real
             # reason -- which step of the download did not happen -- was already
             # known to the layer that raised it.
             detail = str(exc).strip() or type(exc).__name__
+            ticket.record_outcome(ok=False, detail=detail)
             raise SourceUnavailable(
                 f"Authorized PDF control did not produce a browser download: {detail}"
             ) from exc
+        ticket.record_outcome(ok=True, detail="browser download completed")
+        return artifact.local_path
 
     async def get_citation(self) -> dict[str, Any]:
         record = await self.extract_metadata(search_query=UNKNOWN)

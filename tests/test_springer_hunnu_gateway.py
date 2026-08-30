@@ -29,6 +29,8 @@ from hunnu_harness.literature.security import scan_text_for_sensitive_leaks
 from hunnu_harness.literature.workflow import finalize_captured_hunnu_springer_acceptance
 from hunnu_harness.paths import TEMP_DIR
 
+from hunnu_harness.literature.fetch_ledger import FulltextFetchLedger
+
 from literature_test_support import minimal_pdf_with_text_bytes, write_minimal_pdf_with_text
 
 
@@ -238,6 +240,7 @@ class SpringerHUNNUGatewayTests(unittest.IsolatedAsyncioTestCase):
             allow_capture_outside_output_for_tests=True,
             capture_timeout_ms=2_000,
         )
+        adapter.fetch_ledger = FulltextFetchLedger(path=root / "fetch_ledger.jsonl")
         adapter.bind_institutional_route(gateway_route())
         record = target_record()
         await adapter.open_result(record)
@@ -257,6 +260,7 @@ class SpringerHUNNUGatewayTests(unittest.IsolatedAsyncioTestCase):
                 pdf_text=f"Direct OA fixture Sebastian Wagener DOI: {doi}",
             )
             adapter = SpringerLinkAdapter(browser)
+            adapter.fetch_ledger = FulltextFetchLedger(path=root / "fetch_ledger.jsonl")
             record = LiteratureRecord(
                 paper_id="DIRECT",
                 title=title,

@@ -1,4 +1,23 @@
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+
+
+@contextmanager
+def isolated_fetch_ledger():
+    """A write-ahead fetch ledger in a throwaway TEMP_DIR directory.
+
+    Every adapter test that reaches ``download_fulltext``'s fetch guard must
+    inject one of these onto the adapter (``adapter.fetch_ledger = ledger``),
+    so no test ever writes -- or is refused by -- the real audit ledger.
+    """
+
+    from hunnu_harness.literature.fetch_ledger import FulltextFetchLedger
+    from hunnu_harness.paths import TEMP_DIR
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="fetch-ledger-", dir=TEMP_DIR) as tmp:
+        yield FulltextFetchLedger(path=Path(tmp) / "fulltext_fetch_ledger.jsonl")
 
 
 def minimal_pdf_bytes() -> bytes:

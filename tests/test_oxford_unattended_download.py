@@ -36,7 +36,7 @@ from hunnu_harness.literature.models import (
 from hunnu_harness.literature.normalization import sha256_file
 from hunnu_harness.literature.workflow import finalize_unattended_download_acceptance
 
-from literature_test_support import write_minimal_pdf_with_text
+from literature_test_support import isolated_fetch_ledger, write_minimal_pdf_with_text
 
 
 TITLE = "Double/debiased machine learning for treatment and structural parameters"
@@ -233,6 +233,9 @@ class OxfordUnattendedStateTests(unittest.IsolatedAsyncioTestCase):
                 allow_capture_outside_output_for_tests=True,
                 research_chrome_direct_pdf_download_configured=True,
             )
+            ledger_scope = isolated_fetch_ledger()
+            adapter.fetch_ledger = ledger_scope.__enter__()
+            self.addCleanup(ledger_scope.__exit__, None, None, None)
 
             async def capture(*_: object, **kwargs: object) -> AuthorizedFileCaptureResult:
                 await kwargs["official_action"]()

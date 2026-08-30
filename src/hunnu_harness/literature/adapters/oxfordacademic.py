@@ -832,6 +832,9 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             raise SourceUnavailable("Browser command port is unavailable")
         source_route = "HUNNU_GATEWAY_TO_OXFORD" if self._gateway_trusted() else "OXFORD_DIRECT"
         provenance_host = self.hunnu_gateway_host if _host(access.download_url) == self.hunnu_gateway_host else self.official_host
+        # Authorization, identity confirmation, and URL trust have passed;
+        # budget the fetch before the click is issued.
+        ticket = self.authorize_publisher_fetch(record)
         try:
             artifact = await self.browser.execute(
                 DownloadCommand(
@@ -868,12 +871,18 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
                     access,
                     pdf_viewer_opened=True,
                 )
+                # The PDF has been served into the viewer, so publisher bytes
+                # were fetched even though no file landed yet.
+                ticket.record_outcome(
+                    ok=False, detail="PDF opened in viewer; manual download handoff armed"
+                )
                 raise SourceUserDownloadRequired(
                     "ACTION_REQUIRED_USER_DOWNLOAD=true; ACTION_REQUIRED_USER_LOGIN=false; "
                     "BrowserReadyForManualDownload=true; PDF is open in Chrome PDF Viewer; "
                     "click the native Download button once while Harness waits for the file",
                     handoff_state=state,
                 ) from exc
+            ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
             raise SourceUnavailable(str(exc)) from exc
         self._last_capture = result
         record.acquisition_method = result.acquisition_method.value
@@ -902,10 +911,17 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         record.target_identity_confirmed = identity.confirmed
         if not identity.confirmed:
             quarantined = self._quarantine(result.path)
+            # The bytes arrived and then failed validation -- the exact failure
+            # shape the write-ahead ledger exists to count.
+            ticket.record_outcome(
+                ok=False,
+                detail=f"fetched bytes failed identity validation; quarantined as {quarantined.name}",
+            )
             raise SourceLayoutChanged(
                 f"Captured Oxford PDF failed local target identity validation; Quarantine=true; "
                 f"QuarantineFile={quarantined.name}"
             )
+        ticket.record_outcome(ok=True, detail="download completed")
         return result.path
 
     async def get_citation(self) -> dict[str, Any]:

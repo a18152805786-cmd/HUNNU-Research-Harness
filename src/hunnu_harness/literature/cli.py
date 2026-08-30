@@ -70,6 +70,14 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     live.add_argument("--headless", action="store_true")
     live.add_argument(
+        "--allow-refetch",
+        action="store_true",
+        help=(
+            "Explicitly permit a fetch the daily full-text budget would refuse "
+            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+        ),
+    )
+    live.add_argument(
         "--human-wait",
         type=float,
         default=0.0,
@@ -88,6 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
     springer_live.add_argument("--max-results", type=int, default=5)
     springer_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     springer_live.add_argument("--headless", action="store_true")
+    springer_live.add_argument(
+        "--allow-refetch",
+        action="store_true",
+        help=(
+            "Explicitly permit a fetch the daily full-text budget would refuse "
+            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+        ),
+    )
 
     cnki_live = subparsers.add_parser("live-cnki", help="Run one bounded CNKI acquisition")
     cnki_selector = cnki_live.add_mutually_exclusive_group(required=True)
@@ -100,6 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
     cnki_live.add_argument("--max-results", type=int, default=3)
     cnki_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     cnki_live.add_argument("--headless", action="store_true")
+    cnki_live.add_argument(
+        "--allow-refetch",
+        action="store_true",
+        help=(
+            "Explicitly permit a fetch the daily full-text budget would refuse "
+            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+        ),
+    )
 
     oxford_live = subparsers.add_parser(
         "live-oxfordacademic",
@@ -115,6 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
     oxford_live.add_argument("--max-results", type=int, default=1)
     oxford_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     oxford_live.add_argument("--headless", action="store_true")
+    oxford_live.add_argument(
+        "--allow-refetch",
+        action="store_true",
+        help=(
+            "Explicitly permit a fetch the daily full-text budget would refuse "
+            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+        ),
+    )
 
     capture = subparsers.add_parser(
         "finalize-sciencedirect-capture",
@@ -178,6 +210,9 @@ async def _run_live(args: argparse.Namespace) -> int:
             "live-oxfordacademic": OxfordAcademicAdapter,
         }[args.command]
         adapter = adapter_type(browser)
+        # The write-ahead fetch budget refuses a repeat by default; the flag is
+        # the explicit, per-run override and is recorded on the attempt row.
+        adapter.allow_refetch = bool(getattr(args, "allow_refetch", False))
         resolver = None
         trigger = None
         if args.command == "live-springerlink":

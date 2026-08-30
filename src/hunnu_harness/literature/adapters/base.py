@@ -12,6 +12,7 @@ from ...browser.authorized_file_capture import (
 from ...browser.commands import DownloadArtifact
 from ...browser.port import BrowserCommandPort, ensure_browser_command_port
 from ...browser.transport import BrowserTransportError
+from ..fetch_ledger import FetchTicket, FulltextFetchLedger, ledger_identifier
 from ..models import AccessDecision, LiteratureRecord, LiteratureSearchRequest, RunStatus
 
 
@@ -103,6 +104,14 @@ class LiteratureSourceAdapter(ABC):
     supports_unattended_download: bool = False
     supports_preflight: bool = False
 
+    # The write-ahead fetch budget (literature/fetch_ledger.py).  ``None``
+    # means the real ledger in the Output Root's audit directory -- there is
+    # deliberately no way to construct an adapter whose publisher fetches are
+    # unbudgeted.  Tests inject an isolated ledger here; ``allow_refetch`` is
+    # the explicit CLI override for a refused fetch.
+    fetch_ledger: FulltextFetchLedger | None = None
+    allow_refetch: bool = False
+
     def __init__(self, browser: BrowserCommandPort | Any | None):
         # ``None`` remains valid for parser-only/finalizer construction.  Any
         # live adapter path is normalized here so source adapters only ever
@@ -173,6 +182,31 @@ class LiteratureSourceAdapter(ABC):
     @abstractmethod
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
         raise NotImplementedError
+
+    def authorize_publisher_fetch(
+        self, record: LiteratureRecord, *, identifier: str | None = None
+    ) -> FetchTicket:
+        """Put this fetch on the write-ahead ledger, or refuse it.
+
+        Called inside ``download_fulltext`` after the authorization and target
+        identity checks have passed and before the fetch action is issued --
+        never around search (cheap and legitimate) and never at archive time
+        (the bytes have already been fetched).  The attempt row is on disk
+        before this returns, so a fetch whose later steps fail is still
+        counted; that failure shape is exactly what the ledger exists to see.
+
+        Raises ``FetchBudgetExceeded`` when today's budget refuses the fetch
+        and ``FetchIdentifierMissing``/``FetchLedgerError`` when the fetch
+        cannot be budgeted at all; both fail the download, never bypass it.
+        """
+
+        ledger = self.fetch_ledger or FulltextFetchLedger()
+        return ledger.authorize_fetch(
+            source=self.name,
+            identifier=ledger_identifier(record, prefer=identifier),
+            paper_id=str(getattr(record, "paper_id", "") or ""),
+            allow_refetch=self.allow_refetch,
+        )
 
     @abstractmethod
     async def get_citation(self) -> dict[str, Any]:

@@ -28,6 +28,7 @@ from .downloads import (
     LiteratureDownloadManager,
     UnauthorizedFullTextError,
 )
+from .fetch_ledger import FetchLedgerError
 from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
 from .auto_classification import PostAcquisitionClassifier
 from .library import GlobalPaperLibrary
@@ -493,7 +494,12 @@ class LiteratureAcquisitionWorkflow:
                     record.error_status = RunStatus.FULLTEXT_NOT_AUTHORIZED.value
                     record.error_reason = str(exc)
                     status = RunStatus.PARTIAL_SUCCESS
-                except (InvalidFullTextDownload, LiteratureSourceError, OSError) as exc:
+                except (
+                    InvalidFullTextDownload,
+                    LiteratureSourceError,
+                    FetchLedgerError,
+                    OSError,
+                ) as exc:
                     record.error_status = RunStatus.DOWNLOAD_FAILED.value
                     record.error_reason = str(exc)
                     errors.append(str(exc))

@@ -108,6 +108,13 @@ class OxfordWorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             run_root = Path(temporary) / "run"
             browser = _Browser(run_root / "downloads" / "staging")
             adapter = OxfordAcademicAdapter(browser)
+            # An isolated write-ahead fetch ledger, so this run never records
+            # into -- or is refused by -- the real audit ledger.
+            from hunnu_harness.literature.fetch_ledger import FulltextFetchLedger
+
+            adapter.fetch_ledger = FulltextFetchLedger(
+                path=Path(temporary) / "fetch_ledger.jsonl"
+            )
             request = LiteratureSearchRequest.from_mapping(
                 {
                     "OriginalResearchRequest": f"Find exact Oxford paper: {TITLE}",
