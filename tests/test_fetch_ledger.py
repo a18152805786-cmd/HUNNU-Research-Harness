@@ -28,7 +28,7 @@ from hunnu_harness.literature.fetch_ledger import (
     FETCH_LEDGER_PATH,
     GLOBAL_DAILY_LIMIT,
     PER_IDENTIFIER_DAILY_LIMIT,
-    STATUS_ALREADY_FETCHED,
+    STATUS_ATTEMPT_LIMIT_REACHED,
     STATUS_BUDGET_EXHAUSTED,
     FetchBudgetExceeded,
     FetchIdentifierMissing,
@@ -140,7 +140,7 @@ class WriteAheadOrderingTests(unittest.TestCase):
             asyncio.run(
                 adapter.download_fulltext(_sciencedirect_record(), _sciencedirect_access())
             )
-        self.assertEqual(caught.exception.status, STATUS_ALREADY_FETCHED)
+        self.assertEqual(caught.exception.status, STATUS_ATTEMPT_LIMIT_REACHED)
         # The refusal reports what happened last time, so "run it again to
         # see" is never the only diagnostic left.
         self.assertIn("last outcome", str(caught.exception))
@@ -153,7 +153,7 @@ class BudgetRuleTests(unittest.TestCase):
             ledger.authorize_fetch(source="ScienceDirect", identifier="pii:x", paper_id="P1")
         with self.assertRaises(FetchBudgetExceeded) as caught:
             ledger.authorize_fetch(source="ScienceDirect", identifier="pii:x", paper_id="P1")
-        self.assertEqual(caught.exception.status, STATUS_ALREADY_FETCHED)
+        self.assertEqual(caught.exception.status, STATUS_ATTEMPT_LIMIT_REACHED)
 
     def test_a_refusal_writes_no_attempt(self) -> None:
         """A blocked fetch consumed no budget and must not eat the ledger."""
@@ -172,6 +172,30 @@ class BudgetRuleTests(unittest.TestCase):
             ledger.authorize_fetch(source="ScienceDirect", identifier="10.1/x", paper_id="P1")
         # The same identifier under another source is another publisher ask.
         ledger.authorize_fetch(source="SpringerLink", identifier="10.1/x", paper_id="P1")
+
+    def test_a_sciencedirect_dead_end_does_not_lock_the_paper_everywhere(self) -> None:
+        """The budget key is (source, stable document identity), not the paper.
+
+        Two failed ScienceDirect attempts exhaust *ScienceDirect's* budget for
+        that document; the same work through Springer -- its own source and,
+        as in real life, its own identifier (a DOI rather than a PII) -- must
+        still be a legitimate first ask.
+        """
+
+        ledger = _ledger(_tmp(self))
+        for _ in range(PER_IDENTIFIER_DAILY_LIMIT):
+            ticket = ledger.authorize_fetch(
+                source="ScienceDirect", identifier="pii:s15446123", paper_id="P1"
+            )
+            ticket.record_outcome(ok=False, detail="validation failed after bytes")
+        with self.assertRaises(FetchBudgetExceeded):
+            ledger.authorize_fetch(
+                source="ScienceDirect", identifier="pii:s15446123", paper_id="P1"
+            )
+        # Same paper, different legitimate source: not blocked.
+        ledger.authorize_fetch(
+            source="SpringerLink", identifier="10.1016/j.frl.2026.109884", paper_id="P1"
+        )
 
     def test_global_daily_ceiling_is_refused(self) -> None:
         ledger = _ledger(_tmp(self))

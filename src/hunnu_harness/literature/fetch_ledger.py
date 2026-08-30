@@ -62,7 +62,10 @@ FETCH_LEDGER_PATH = AUDIT_DIR / "fulltext_fetch_ledger.jsonl"
 PER_IDENTIFIER_DAILY_LIMIT = 2
 GLOBAL_DAILY_LIMIT = 25
 
-STATUS_ALREADY_FETCHED = "FULLTEXT_ALREADY_FETCHED_TODAY"
+# "attempted", never "fetched": the refused third try usually follows two
+# FAILED attempts, and a name claiming success would misdescribe exactly the
+# situation the ledger exists to catch.
+STATUS_ATTEMPT_LIMIT_REACHED = "FULLTEXT_FETCH_ATTEMPT_LIMIT_REACHED"
 STATUS_BUDGET_EXHAUSTED = "DAILY_FETCH_BUDGET_EXHAUSTED"
 STATUS_IDENTIFIER_MISSING = "FETCH_IDENTIFIER_MISSING"
 
@@ -292,7 +295,7 @@ class FulltextFetchLedger:
                 else "no outcome was recorded (the fetch action may not have finished)"
             )
             raise FetchBudgetExceeded(
-                STATUS_ALREADY_FETCHED,
+                STATUS_ATTEMPT_LIMIT_REACHED,
                 f"{source} already fetched {identifier} {len(same)} times today; "
                 f"last attempt {last_seen}, last outcome: {last_result}. "
                 "Diagnose offline from the first fetched file; pass "
@@ -362,7 +365,7 @@ __all__ = [
     "FETCH_LEDGER_PATH",
     "GLOBAL_DAILY_LIMIT",
     "PER_IDENTIFIER_DAILY_LIMIT",
-    "STATUS_ALREADY_FETCHED",
+    "STATUS_ATTEMPT_LIMIT_REACHED",
     "STATUS_BUDGET_EXHAUSTED",
     "STATUS_IDENTIFIER_MISSING",
     "FetchBudgetExceeded",
