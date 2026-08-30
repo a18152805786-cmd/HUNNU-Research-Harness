@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 import json
 import re
+import time
+from enum import Enum
 from collections import defaultdict
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -10,7 +14,12 @@ from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit
 
 from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
+from ...browser.playwright_backend import (
+    _INTERSTITIAL_BODY_MARKERS,
+    _INTERSTITIAL_TITLE_MARKERS,
+)
 from .base import (
+    LiteratureSourceError,
     HumanActionReason,
     LiteratureSourceAdapter,
     SourceActionRequired,
@@ -31,6 +40,37 @@ from ..security import sanitize_url
 
 
 _ARTICLE_PATH = re.compile(r"/science/article/(?:abs/)?pii/([A-Za-z0-9]+)")
+_SCIENCEDIRECT_HOSTS = frozenset({"www.sciencedirect.com", "sciencedirect.com"})
+
+# ScienceDirect renders its result list after the document is ready, so the
+# first readable version of a perfectly good search page contains no results at
+# all.  These are the landmarks that say the page has finished deciding.
+_NO_RESULTS_MARKERS = (
+    "No results found",
+    "Your search for",
+    "did not match any",
+    "\u672a\u627e\u5230\u7ed3\u679c",
+)
+# A bounded wait on those landmarks, never a fixed sleep: a page that has
+# already rendered is read immediately.
+SEARCH_RENDER_TIMEOUT_SECONDS = 20.0
+SEARCH_RENDER_POLL_SECONDS = 0.5
+
+# An article page renders the same way, and its PDF control arrives last of
+# all.  The strings 'View PDF' and '/pdfft' are already in the early HTML;
+# what is missing is an anchor carrying both, which is exactly what the
+# access decision looks for -- so readiness waits on that same anchor rather
+# than on any proxy for it.
+ARTICLE_RENDER_TIMEOUT_SECONDS = 20.0
+ARTICLE_RENDER_POLL_SECONDS = 0.5
+# The publisher saying, in so many words, that there is no full text here.
+_NO_FULLTEXT_MARKERS = (
+    "get access through your institution",
+    "purchase pdf",
+    "get access",
+    "check for this article elsewhere",
+    "rent this article",
+)
 _PDF_PATH_MARKERS = ("/pdfft", "/pdf", ".pdf")
 
 
@@ -39,6 +79,25 @@ class _Anchor:
     href: str
     text: str
     attributes: dict[str, str]
+    in_results: bool = False
+
+
+# The list that holds search results.  Both the current page and the archived
+# fixture use ``ol.search-result-wrapper``; the id is carried too because the
+# live page also stamps one on the same element.
+_RESULTS_LIST_CLASSES = frozenset({"search-result-wrapper"})
+_RESULTS_LIST_IDS = frozenset({"srp-results-list"})
+
+
+def _classes(attributes: dict[str, str]) -> frozenset[str]:
+    """Class tokens, never a substring test.
+
+    The results list also carries ``li.LoginMessageResultItem`` -- a sign-in
+    notice sitting among the cards.  Matching ``ResultItem`` as a substring
+    would count that notice as a paper.
+    """
+
+    return frozenset(attributes.get("class", "").split())
 
 
 class _ScienceDirectHTMLParser(HTMLParser):
@@ -52,6 +111,16 @@ class _ScienceDirectHTMLParser(HTMLParser):
         self._anchor_stack: list[tuple[str, dict[str, str], list[str]]] = []
         self._json_ld_depth = 0
         self._json_ld_parts: list[str] = []
+        # Where the results actually live.  Anchors are recorded with whether
+        # they sat inside this region, so recommendations, navigation and
+        # footer links can never be mistaken for search results.
+        self._list_stack: list[bool] = []
+        self._item_depth = 0
+        self.result_cards = 0
+
+    @property
+    def _in_results(self) -> bool:
+        return any(self._list_stack)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {key.casefold(): (value or "") for key, value in attrs}
@@ -65,6 +134,15 @@ class _ScienceDirectHTMLParser(HTMLParser):
                 self.meta[name].append(content)
         elif lowered == "link":
             self.links.append(attributes)
+        elif lowered == "ol":
+            self._list_stack.append(
+                bool(_classes(attributes) & _RESULTS_LIST_CLASSES)
+                or attributes.get("id", "") in _RESULTS_LIST_IDS
+            )
+        elif lowered == "li":
+            if self._in_results and self._item_depth == 0:
+                self.result_cards += 1
+            self._item_depth += 1
         elif lowered == "a":
             self._anchor_stack.append((attributes.get("href", ""), attributes, []))
         elif lowered == "script" and "ld+json" in attributes.get("type", "").casefold():
@@ -74,7 +152,18 @@ class _ScienceDirectHTMLParser(HTMLParser):
         lowered = tag.casefold()
         if lowered == "a" and self._anchor_stack:
             href, attributes, parts = self._anchor_stack.pop()
-            self.anchors.append(_Anchor(href=href, text=" ".join(parts).strip(), attributes=attributes))
+            self.anchors.append(
+                _Anchor(
+                    href=href,
+                    text=" ".join(parts).strip(),
+                    attributes=attributes,
+                    in_results=self._in_results,
+                )
+            )
+        elif lowered == "ol" and self._list_stack:
+            self._list_stack.pop()
+        elif lowered == "li" and self._item_depth:
+            self._item_depth -= 1
         elif lowered == "script" and self._json_ld_depth:
             self._json_ld_depth -= 1
 
@@ -144,11 +233,88 @@ def _json_name(value: Any) -> str:
     return str(value).strip()
 
 
+class SearchPageType(str, Enum):
+    """What a page claiming to be search results actually is."""
+
+    RESULTS_PRESENT = "RESULTS_PRESENT"
+    GENUINE_ZERO_RESULTS = "GENUINE_ZERO_RESULTS"
+    # Neither the results list nor a no-results notice has rendered yet.  This
+    # is the state the adapter used to read the page in, and report as though
+    # the search had come back empty.
+    PENDING = "PENDING"
+    NON_SEARCH_PAGE = "NON_SEARCH_PAGE"
+
+
+@dataclass(frozen=True)
+class SearchPageObservation:
+    """What the page says about itself, separately from what was parsed.
+
+    Kept apart from the parsed records on purpose.  An empty result list and a
+    page whose results could not be read are the same thing to a caller that
+    only sees a count, and telling them apart is the difference between "this
+    paper is not on ScienceDirect" and "the Harness cannot read ScienceDirect
+    any more".  A lower-tier Agent should never have to guess which it was.
+    """
+
+    page_type: SearchPageType
+    result_cards: int = 0
+    article_links: int = 0
+
+    @property
+    def decided(self) -> bool:
+        return self.page_type is not SearchPageType.PENDING
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "SearchPageObserved": True,
+            "SearchPageType": self.page_type.value,
+            "ResultContainersObserved": self.result_cards,
+            "ArticleLinksObserved": self.article_links,
+        }
+
+
+class ArticleReadiness(str, Enum):
+    """What an article page has managed to say about its full text yet."""
+
+    FULLTEXT_AUTHORIZED = "FULLTEXT_AUTHORIZED"
+    FULLTEXT_NOT_AUTHORIZED = "FULLTEXT_NOT_AUTHORIZED"
+    # Still assembling.  The distinction that matters: this is not a refusal,
+    # and reporting it as one told callers a paper they are entitled to was out
+    # of reach.
+    PENDING_RENDER = "PENDING_RENDER"
+    INTERRUPTED = "INTERRUPTED"
+    READINESS_TIMEOUT = "READINESS_TIMEOUT"
+
+
+@dataclass(frozen=True)
+class ArticleReadinessObservation:
+    readiness: ArticleReadiness
+    pdf_control_url: str = UNKNOWN
+    pdf_control_pii: str = UNKNOWN
+    page_pii: str = UNKNOWN
+
+    @property
+    def decided(self) -> bool:
+        return self.readiness is not ArticleReadiness.PENDING_RENDER
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ArticleReadiness": self.readiness.value,
+            "DownloadControlResolved": self.pdf_control_url,
+            "DownloadControlPII": self.pdf_control_pii,
+            "ArticlePII": self.page_pii,
+        }
+
+
 class ScienceDirectAdapter(LiteratureSourceAdapter):
     name = "ScienceDirect"
     supports_unattended_download = True
     supports_preflight = True
     search_origin = "https://www.sciencedirect.com"
+    # What the last search page said about itself, for the run report.
+    last_search_observation: SearchPageObservation | None = None
+    last_article_readiness: ArticleReadinessObservation | None = None
+    last_article_readiness_wait_ms: int = 0
 
     @staticmethod
     def _parser(html: str) -> _ScienceDirectHTMLParser:
@@ -247,6 +413,12 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         records: list[LiteratureRecord] = []
         seen: set[str] = set()
         for anchor in parser.anchors:
+            # Only anchors inside the results list.  A ScienceDirect page also
+            # carries recommendations and related articles that point at real
+            # papers; treating those as results would hand the workflow
+            # candidates the search never returned.
+            if not anchor.in_results:
+                continue
             match = _ARTICLE_PATH.search(anchor.href)
             title = re.sub(r"\s+", " ", anchor.text).strip()
             if not match or not title:
@@ -254,8 +426,14 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             stable_identifier = match.group(1)
             if stable_identifier in seen:
                 continue
-            seen.add(stable_identifier)
             page = urljoin(cls.search_origin, anchor.href)
+            # An absolute href on another host resolves to that host, so the
+            # article path alone is not enough to say this is a ScienceDirect
+            # paper.  ``open_result`` already refuses such a URL; refusing it
+            # here keeps it from ever becoming a candidate.
+            if urlsplit(page).hostname not in _SCIENCEDIRECT_HOSTS:
+                continue
+            seen.add(stable_identifier)
             records.append(
                 LiteratureRecord(
                     paper_id=stable_paper_id(title=title, year=UNKNOWN),
@@ -269,6 +447,48 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             if len(records) >= max_results:
                 break
         return records
+
+    @classmethod
+    def observe_search_page(cls, html: str, *, source_url: str) -> SearchPageObservation:
+        """Classify the page without parsing it, so an empty result is explainable.
+
+        Deliberately does not raise for a login or challenge page: the caller
+        polls this while the page is still settling, and ``detect_interruption``
+        remains the one place that stops a run.
+        """
+
+        parser = cls._parser(html)
+        article_links = sum(
+            1
+            for anchor in parser.anchors
+            if anchor.in_results and _ARTICLE_PATH.search(anchor.href)
+        )
+        if article_links or parser.result_cards:
+            return SearchPageObservation(
+                page_type=SearchPageType.RESULTS_PRESENT,
+                result_cards=parser.result_cards,
+                article_links=article_links,
+            )
+        try:
+            # The one detector, rather than a second list of markers to drift
+            # out of step with it.  Here its verdict is turned into a page type;
+            # raising stays the caller's job.
+            cls.detect_interruption(html, url=source_url)
+        except LiteratureSourceError:
+            return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
+        body = parser.body_text.casefold()
+        # A bot-check interstitial is the browser layer's to wait out, but if it
+        # is still on screen when the page is read, this is not a search page and
+        # polling it for twenty seconds would only delay saying so.  The markers
+        # are that layer's, borrowed rather than copied.
+        if any(
+            marker in body
+            for marker in _INTERSTITIAL_TITLE_MARKERS + _INTERSTITIAL_BODY_MARKERS
+        ):
+            return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
+        if any(marker.casefold() in body for marker in _NO_RESULTS_MARKERS):
+            return SearchPageObservation(page_type=SearchPageType.GENUINE_ZERO_RESULTS)
+        return SearchPageObservation(page_type=SearchPageType.PENDING)
 
     @classmethod
     def parse_article_html(
@@ -364,12 +584,18 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         )
 
     @classmethod
-    def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
-        cls.detect_interruption(html, url=source_url)
-        parser = cls._parser(html)
+    def _pdf_control(
+        cls, parser: _ScienceDirectHTMLParser, *, source_url: str
+    ) -> tuple[_Anchor | None, str]:
+        """The enabled, official PDF control, or nothing.
+
+        Extracted so the access decision and the readiness wait cannot drift
+        apart: waiting on some proxy for "the page looks ready" and then
+        deciding on something else is how a page gets read one moment too
+        early.  Readiness now ends exactly when this returns a control.
+        """
+
         article_host = urlsplit(source_url).hostname or ""
-        candidate: _Anchor | None = None
-        candidate_url = UNKNOWN
         for anchor in parser.anchors:
             absolute = urljoin(source_url, anchor.href)
             parsed = urlsplit(absolute)
@@ -378,9 +604,14 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             has_pdf_label = "pdf" in text and any(action in text for action in ("view", "download", "查看", "下载"))
             same_source = parsed.hostname in {article_host, "www.sciencedirect.com", "sciencedirect.com"}
             if same_source and has_pdf_path and has_pdf_label:
-                candidate = anchor
-                candidate_url = absolute
-                break
+                return anchor, absolute
+        return None, UNKNOWN
+
+    @classmethod
+    def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
+        cls.detect_interruption(html, url=source_url)
+        parser = cls._parser(html)
+        candidate, candidate_url = cls._pdf_control(parser, source_url=source_url)
 
         if candidate is None:
             return AccessDecision(
@@ -428,7 +659,8 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
         await self.browser.execute(NavigateCommand(url))
-        html, current_url = await self._content()
+        html, current_url, observation = await self._settled_search_page(source_url=url)
+        self.last_search_observation = observation
         results = self.parse_search_results_html(
             html,
             query=query,
@@ -437,11 +669,103 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         )
         if not results and "sciencedirect" not in current_url.casefold():
             raise SourceUnavailable("ScienceDirect search navigation did not reach the expected source")
+        if not results and observation.page_type is SearchPageType.RESULTS_PRESENT:
+            # The page has results and the parser produced none.  Reporting this
+            # as an empty search would tell the caller the paper is not on
+            # ScienceDirect, which is the opposite of what the page says.
+            raise SourceLayoutChanged(
+                "ScienceDirect search results could not be read: "
+                f"ResultContainersObserved={observation.result_cards}; "
+                f"ArticleLinksObserved={observation.article_links}; "
+                "ParsedResultCount=0; ParserFailureDetected=true"
+            )
         return results
+
+    @classmethod
+    def observe_article_readiness(
+        cls, html: str, *, source_url: str
+    ) -> ArticleReadinessObservation:
+        """Whether the article page has said anything decisive about full text.
+
+        The authorized landmark is the access decision's own control, found
+        through the same predicate, and it must belong to the article being
+        read: a PDF control for some other paper is not this paper's full text,
+        so it leaves the page undecided rather than authorising anything.
+        """
+
+        page_match = _ARTICLE_PATH.search(urlsplit(source_url).path)
+        page_pii = page_match.group(1) if page_match else UNKNOWN
+        try:
+            cls.detect_interruption(html, url=source_url)
+        except LiteratureSourceError:
+            return ArticleReadinessObservation(
+                readiness=ArticleReadiness.INTERRUPTED, page_pii=page_pii
+            )
+
+        parser = cls._parser(html)
+        control, control_url = cls._pdf_control(parser, source_url=source_url)
+        if control is not None:
+            control_match = _ARTICLE_PATH.search(urlsplit(control_url).path)
+            control_pii = control_match.group(1) if control_match else UNKNOWN
+            if page_pii != UNKNOWN and control_pii.casefold() != page_pii.casefold():
+                # Someone else's PDF.  Not a refusal and certainly not an
+                # authorisation, so keep waiting for this article's own control.
+                return ArticleReadinessObservation(
+                    readiness=ArticleReadiness.PENDING_RENDER,
+                    pdf_control_url=control_url,
+                    pdf_control_pii=control_pii,
+                    page_pii=page_pii,
+                )
+            return ArticleReadinessObservation(
+                readiness=ArticleReadiness.FULLTEXT_AUTHORIZED,
+                pdf_control_url=control_url,
+                pdf_control_pii=control_pii,
+                page_pii=page_pii,
+            )
+
+        body = parser.body_text.casefold()
+        if any(marker in body for marker in _NO_FULLTEXT_MARKERS):
+            return ArticleReadinessObservation(
+                readiness=ArticleReadiness.FULLTEXT_NOT_AUTHORIZED, page_pii=page_pii
+            )
+        return ArticleReadinessObservation(
+            readiness=ArticleReadiness.PENDING_RENDER, page_pii=page_pii
+        )
+
+    async def _observe_until_decided(self, classify, *, timeout: float, poll: float):
+        """Read the page, then keep reading until it says something decisive.
+
+        Shared by the search page and the article page because they fail the
+        same way: ``page.goto`` returns while ScienceDirect is still building
+        the part that answers the question, and a page read there looks exactly
+        like a page with nothing to give.  A page that has already rendered
+        costs one observation, so this never becomes a fixed delay.
+        """
+
+        started = time.monotonic()
+        deadline = started + timeout
+        html, current_url = await self._content()
+        verdict = classify(html, current_url)
+        while not verdict.decided and time.monotonic() < deadline:
+            await asyncio.sleep(poll)
+            html, current_url = await self._content()
+            verdict = classify(html, current_url)
+        waited_ms = int((time.monotonic() - started) * 1000)
+        return html, current_url, verdict, waited_ms
+
+    async def _settled_search_page(self, *, source_url: str) -> tuple[str, str, SearchPageObservation]:
+        """Read the search page once it has decided what it is."""
+
+        html, current_url, observation, _waited = await self._observe_until_decided(
+            lambda body, url: self.observe_search_page(body, source_url=url),
+            timeout=SEARCH_RENDER_TIMEOUT_SECONDS,
+            poll=SEARCH_RENDER_POLL_SECONDS,
+        )
+        return html, current_url, observation
 
     async def open_result(self, record: LiteratureRecord) -> None:
         parsed = urlsplit(record.source_page)
-        if parsed.hostname not in {"www.sciencedirect.com", "sciencedirect.com"} or not _ARTICLE_PATH.search(parsed.path):
+        if parsed.hostname not in _SCIENCEDIRECT_HOSTS or not _ARTICLE_PATH.search(parsed.path):
             raise SourceLayoutChanged("Result URL is not a stable ScienceDirect article page")
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
@@ -465,7 +789,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             current = urlsplit(observation.url)
         except Exception:
             return False
-        if current.hostname not in {"www.sciencedirect.com", "sciencedirect.com"}:
+        if current.hostname not in _SCIENCEDIRECT_HOSTS:
             return False
         actual = _ARTICLE_PATH.search(current.path)
         if actual is None:
@@ -481,7 +805,36 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         return self.parse_article_html(html, source_url=current_url).abstract
 
     async def check_fulltext_access(self) -> AccessDecision:
-        html, current_url = await self._content()
+        """Decide access, but only once the page has finished saying what it is.
+
+        The decision itself is untouched: the same HTML yields the same verdict
+        it always did.  What changed is that the page is no longer read while
+        ScienceDirect is still rendering the control the decision looks for --
+        a moment at which an entitled, open-access article was indistinguishable
+        from one behind a paywall, and was reported as the latter.
+        """
+
+        html, current_url, observation, waited_ms = await self._observe_until_decided(
+            lambda body, url: self.observe_article_readiness(body, source_url=url),
+            timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
+            poll=ARTICLE_RENDER_POLL_SECONDS,
+        )
+        self.last_article_readiness = observation
+        self.last_article_readiness_wait_ms = waited_ms
+        if observation.readiness is ArticleReadiness.PENDING_RENDER:
+            # Out of time with nothing decisive on the page.  Guessing either
+            # way would be inventing an answer the publisher never gave.
+            return AccessDecision(
+                full_text_accessible=False,
+                access_type=AccessType.UNKNOWN,
+                authorized_access=False,
+                status=RunStatus.SOURCE_LAYOUT_CHANGED,
+                reason=(
+                    "ARTICLE_READINESS_TIMEOUT: the article page never presented "
+                    "either an enabled PDF control for this article or an explicit "
+                    f"no-full-text notice within {ARTICLE_RENDER_TIMEOUT_SECONDS:g}s"
+                ),
+            )
         return self.check_fulltext_access_html(html, source_url=current_url)
 
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
@@ -512,7 +865,14 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             )
             return artifact.local_path
         except Exception as exc:
-            raise SourceUnavailable(f"Authorized PDF control did not produce a browser download: {type(exc).__name__}") from exc
+            # The message, not just the class.  "DownloadFailure" alone sent two
+            # rounds of investigation looking in the wrong place while the real
+            # reason -- which step of the download did not happen -- was already
+            # known to the layer that raised it.
+            detail = str(exc).strip() or type(exc).__name__
+            raise SourceUnavailable(
+                f"Authorized PDF control did not produce a browser download: {detail}"
+            ) from exc
 
     async def get_citation(self) -> dict[str, Any]:
         record = await self.extract_metadata(search_query=UNKNOWN)
