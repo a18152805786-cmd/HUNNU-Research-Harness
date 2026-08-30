@@ -14,6 +14,9 @@ from ..paths import require_output_path
 
 class AcquisitionMethod(str, Enum):
     PLAYWRIGHT_DOWNLOAD_EVENT = "PLAYWRIGHT_DOWNLOAD_EVENT"
+    # The browser was told where to put the file and reported doing so.  Used
+    # only for a browser this process attached to rather than launched.
+    BROWSER_DIRECTED_DOWNLOAD = "BROWSER_DIRECTED_DOWNLOAD"
     AUTHORIZED_PDF_RESPONSE = "AUTHORIZED_PDF_RESPONSE"
     MANUAL_NATIVE_VIEWER_DOWNLOAD_HANDOFF = "MANUAL_NATIVE_VIEWER_DOWNLOAD_HANDOFF"
 

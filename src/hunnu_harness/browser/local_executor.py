@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-from .authorized_file_capture import BrowserAuthorizedFileCapture
+from .authorized_file_capture import (
+    AcquisitionMethod,
+    AuthorizedFileCaptureResult,
+    BrowserAuthorizedFileCapture,
+)
 from .commands import (
     AuthenticatedFetchCommand,
     AuthenticatedFetchFailure,
@@ -45,6 +49,32 @@ from .transport import BrowserTransportError
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
+
+
+# A publisher's PDF link is signed: it carries an access token and a signature
+# in its query string.  Those must never reach a log or a run artifact, which is
+# why failures here used to report only the exception's class name.
+_QUERY_IN_TEXT = re.compile(r"(https?://[^\s\"'<>]+?)\?[^\s\"'<>]*")
+_REASON_LIMIT = 600
+
+
+def _redacted_reason(exc: BaseException) -> str:
+    """Why something failed, with signed URLs stripped of their credentials.
+
+    Reporting only the class name kept the secrets out but told the caller
+    nothing: a bare ``TimeoutError`` gives no way to tell a missing control from
+    an unclickable one, so the only way to learn anything was to run the whole
+    acquisition again -- against the publisher, for a file already on disk.
+    Redacting the query string keeps the diagnosis and drops the token.
+    """
+
+    message = " ".join(str(exc).split())
+    if not message:
+        return type(exc).__name__
+    message = _QUERY_IN_TEXT.sub(r"\1?<redacted>", message)
+    if len(message) > _REASON_LIMIT:
+        message = message[:_REASON_LIMIT] + " ..."
+    return f"{type(exc).__name__}: {message}"
 
 
 class LocalPlaywrightExecutor:
@@ -79,6 +109,9 @@ class LocalPlaywrightExecutor:
         self.session = session or SessionHandle("local")
         self.page_handle = page_handle or PageHandle("main")
         self._generation = 0
+        # Set when a download was proven by the browser even though the click
+        # that triggered it did not settle.  Reported, never silently dropped.
+        self.last_post_click_warning: str | None = None
 
     @property
     def navigation_provenance(self) -> tuple[str, ...]:
@@ -556,6 +589,27 @@ class LocalPlaywrightExecutor:
                     },
                 )
             else:
+                # A download command without a capture specification still
+                # needs the directed path on an attached browser: Playwright's
+                # download event does not reach the page there, so waiting for
+                # it times out while the file arrives regardless.  Adapters
+                # issue plain download commands, so this branch carries real
+                # acquisitions and not only the specified-capture ones.
+                directed = await self._directed_capture(locator, command)
+                if directed is not None:
+                    artifact = DownloadArtifact.from_path(
+                        directed.path,
+                        suggested_filename=command.suggested_filename,
+                        source_url=self._page_url(page),
+                        page=self.page_handle,
+                        mime_type="application/pdf",
+                        metadata={
+                            "AcquisitionMethod": directed.acquisition_method.value,
+                            "SourceHost": directed.source_host,
+                        },
+                    )
+                    self._generation += 1
+                    return artifact
                 async with page.expect_download(timeout=command.timeout_ms) as download_info:
                     await _maybe_await(click())
                 download = await _maybe_await(download_info.value)
@@ -576,7 +630,9 @@ class LocalPlaywrightExecutor:
         except (BrowserCommandError, UnsupportedCommand, InvalidTarget, DownloadFailure):
             raise
         except Exception as exc:
-            raise DownloadFailure(f"Local browser download failed: {type(exc).__name__}") from exc
+            raise DownloadFailure(
+                f"Local browser download failed: {_redacted_reason(exc)}"
+            ) from exc
         self._generation += 1
         return artifact
 
@@ -586,6 +642,9 @@ class LocalPlaywrightExecutor:
             raise DownloadFailure("Authorized PDF capture specification is missing")
         if self.downloads_dir is None:
             raise DownloadFailure("Local browser downloads_dir is unavailable")
+        directed = await self._directed_capture(locator, command)
+        if directed is not None:
+            return directed
         capture = BrowserAuthorizedFileCapture(
             self.downloads_dir,
             allow_outside_output_for_tests=spec.allow_outside_output_for_tests,
@@ -600,6 +659,114 @@ class LocalPlaywrightExecutor:
             source_route=spec.source_route,
             timeout_ms=command.timeout_ms,
             require_download_event=spec.require_download_event or not spec.allow_response_capture,
+        )
+
+    async def _directed_capture(self, locator: Any, command: DownloadCommand):
+        """Catch the download through the browser itself, when we only attached.
+
+        Returns ``None`` for a browser this process launched, which keeps its
+        existing Playwright download capture exactly as it was.  The attached
+        case is the one where that capture cannot work: the event never reaches
+        the page, so the file is waited for and never arrives.
+        """
+
+        backend = self._legacy_browser
+        if not getattr(backend, "attached", False):
+            return None
+        session = getattr(backend, "_cdp", None)
+        if session is None or self.downloads_dir is None:
+            return None
+
+        from . import browser_directed_download as directed_module
+        from .browser_directed_download import (
+            BrowserDirectedDownload,
+            DirectedDownloadFailure,
+            lease_for,
+            pii_from_url,
+        )
+
+        spec = command.capture
+        # The locked identity, in order of directness: the authorized URL when
+        # the caller supplied one, otherwise the control the caller bound the
+        # command to, otherwise the article the page is on.  All three are the
+        # same paper by the time a download command is issued -- the adapter has
+        # already refused any control not bound to the locked article.
+        locked_pii = pii_from_url(getattr(spec, "expected_url", "") or "")
+        if not locked_pii:
+            locked_pii = pii_from_url(command.target.css or "")
+        if not locked_pii:
+            locked_pii = pii_from_url(self._page_url(self._require_page()))
+        if not locked_pii:
+            # Nothing to bind the download to.  A file that cannot be tied to
+            # the locked target must not be accepted merely for arriving.
+            raise DownloadFailure(
+                "Directed download requires a target naming the paper being downloaded"
+            )
+
+        directed = BrowserDirectedDownload(
+            session=session,
+            download_dir=self.downloads_dir,
+            locked_pii=locked_pii,
+            lease=lease_for(backend),
+            # Read from the module rather than taken as dataclass defaults, so
+            # the waits are one adjustable place instead of values frozen when
+            # the class was defined.
+            will_begin_timeout=directed_module.DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS,
+            completion_timeout=directed_module.DEFAULT_COMPLETION_TIMEOUT_SECONDS,
+        )
+        await directed.arm()
+        click_error: BaseException | None = None
+        try:
+            # The click's job is to operate the authorized control.  Whether a
+            # download happened is answered by the browser, not by the click
+            # returning, so a click that fails to settle is recorded and judged
+            # afterwards rather than ending the attempt here.
+            #
+            # no_wait_after is measured, not assumed: on a page whose control
+            # redirects before delivering, it cuts the click from 1546ms to 47ms.
+            try:
+                await _maybe_await(locator.click(no_wait_after=True))
+            except TypeError:
+                # Simple test doubles expose click() with no keyword arguments.
+                await _maybe_await(locator.click())
+            except Exception as exc:
+                click_error = exc
+            result = await directed.await_download()
+        except DirectedDownloadFailure as exc:
+            # No download, or not this paper's.  If the click also failed, that
+            # is the more useful account of why nothing was downloaded.
+            if click_error is not None:
+                raise DownloadFailure(
+                    f"Authorized control could not be operated: "
+                    f"{_redacted_reason(click_error)}"
+                ) from click_error
+            raise DownloadFailure(str(exc)) from exc
+        finally:
+            await directed.release()
+
+        if click_error is not None:
+            # Reaching here means the browser itself reported a completed
+            # download whose source URL names the locked paper.  That evidence
+            # is stronger than the click's own idea of whether it settled, so
+            # the click failure is recorded rather than allowed to deny a file
+            # that demonstrably arrived.  Nothing is swallowed: without matching
+            # download evidence the branch above has already failed the attempt.
+            self.last_post_click_warning = (
+                "TRIGGER_COMPLETED_WITH_POST_CLICK_TIMEOUT: "
+                f"{_redacted_reason(click_error)}"
+            )
+
+        if not BrowserAuthorizedFileCapture._is_valid_pdf_file(result.path):
+            raise DownloadFailure(
+                "Directed download completed but the file is not a readable PDF"
+            )
+        return AuthorizedFileCaptureResult(
+            path=result.path,
+            acquisition_method=AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,
+            source_host=result.source_url_host,
+            source_route=getattr(spec, "source_route", "browser-directed"),
+            download_event_emitted=True,
+            authorized_pdf_response_captured=False,
         )
 
     async def _authenticated_fetch(self, command: AuthenticatedFetchCommand) -> AuthenticatedFetchResult:
