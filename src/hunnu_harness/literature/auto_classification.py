@@ -35,7 +35,10 @@ from .models import UNKNOWN
 from .topic_confirmation import (
     TOPIC_PROVENANCE_PATH,
     AssignmentSource,
+    ConfirmationResult,
+    ConfirmationStatus,
     TopicProvenanceStore,
+    human_confirmed_result,
 )
 from .topics import (
     TopicLabel,
@@ -287,6 +290,198 @@ class PostAcquisitionClassifier:
             links_removed=view_outcome["links_removed"],
             links_unavailable=view_outcome["links_unavailable"],
             reason="APPLIED",
+        )
+
+    # -- human confirmation ----------------------------------------------
+
+    def confirm_topics(
+        self,
+        paper_id: str,
+        topics: Sequence[str],
+        *,
+        allow_taxonomy_override: bool = False,
+    ) -> ConfirmationResult:
+        """Record the topics a person chose after REVIEW_REQUIRED.
+
+        This decides nothing.  It checks that the work is genuinely awaiting
+        review, that every chosen topic was actually proposed for *this* work,
+        and that the frozen taxonomy still recognises it -- then writes through
+        the same path automatic classification uses, and records who settled it.
+
+        Proposals are regenerated rather than read back: classification is a
+        pure function of the work's own text, so re-running it yields the same
+        candidates, and it doubles as the check that the work is still in
+        review.  Confirming a different set later fails closed; changing a
+        settled assignment is a reclassification, not a confirmation.
+        """
+
+        selected = _labels_from(topics)
+        rows = self.store.load()
+        row = self._row_for(paper_id, rows)
+        if row is None:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.WORK_NOT_FOUND,
+                reason="No such WORK in the catalog or the topic store",
+            )
+
+        existing = tuple(label.label for label in row.topics)
+        if existing:
+            return self._already_settled(paper_id, existing, selected)
+
+        outcome = self.classifier.classify(self._build_input(row))
+        if outcome.status is not ClassificationStatus.REVIEW_REQUIRED:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.NOT_REVIEW_REQUIRED,
+                original_classification_status=outcome.status.value,
+                reason="Classification does not currently ask for review of this WORK",
+            )
+
+        proposed = outcome.proposed_labels
+        if not proposed:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.NO_CONFIRMABLE_PROPOSALS,
+                original_classification_status=outcome.status.value,
+                reason="Nothing was proposed for this WORK; it needs taxonomy review, not confirmation",
+            )
+        if not selected:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.EMPTY_SELECTION,
+                proposed_topics=proposed,
+                original_classification_status=outcome.status.value,
+                reason="No topic was selected",
+            )
+
+        try:
+            self.taxonomy.require_known(selected)
+        except Exception as exc:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.UNKNOWN_TOPIC,
+                proposed_topics=proposed,
+                original_classification_status=outcome.status.value,
+                reason=str(exc),
+            )
+
+        unproposed = [label.label for label in selected if label.label not in set(proposed)]
+        if unproposed and not allow_taxonomy_override:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.SELECTED_TOPIC_NOT_PROPOSED,
+                proposed_topics=proposed,
+                original_classification_status=outcome.status.value,
+                reason=(
+                    "Not proposed for this WORK: "
+                    + ", ".join(sorted(unproposed))
+                    + ". Pass the override flag to confirm a taxonomy topic that was not proposed."
+                ),
+            )
+
+        # Provenance is part of the confirmation, not a footnote to it, so prove
+        # it can be written before the canonical write happens.  Failing the
+        # other way round leaves the topics in place with no record of who
+        # settled them, which is exactly the state this workflow exists to
+        # prevent.
+        try:
+            self.provenance.ensure_writable()
+        except OSError as exc:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.FAILED_SAFE,
+                proposed_topics=proposed,
+                original_classification_status=outcome.status.value,
+                reason=f"Provenance is not writable, nothing was changed: {exc}",
+            )
+
+        confirmed = human_confirmed_result(
+            paper_id,
+            selected,
+            proposed=proposed,
+            original_status=outcome.status.value,
+        )
+        applied, apply_outcome = self.apply_classification(paper_id, result=confirmed)
+        written = tuple(label.label for label in self.store.topics_for(paper_id))
+        if not applied.applied or set(written) != {label.label for label in selected}:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.FAILED_SAFE,
+                confirmed_topics=written,
+                proposed_topics=proposed,
+                original_classification_status=outcome.status.value,
+                reason=f"Canonical apply did not complete cleanly: {apply_outcome.reason}",
+            )
+
+        self.provenance.record(
+            paper_id=paper_id,
+            topics=written,
+            source=AssignmentSource.HUMAN_CONFIRMED,
+            classification_status_before=outcome.status.value,
+            proposed_topics=proposed,
+            human_override=bool(unproposed),
+        )
+        return ConfirmationResult(
+            paper_id=paper_id,
+            status=ConfirmationStatus.CONFIRMED,
+            confirmed_topics=written,
+            proposed_topics=proposed,
+            assignment_source=AssignmentSource.HUMAN_CONFIRMED.value,
+            original_classification_status=outcome.status.value,
+            topic_metadata_updated=apply_outcome.topic_metadata_updated,
+            topic_view_updated=apply_outcome.topic_view_updated,
+            pdf_copies_created=apply_outcome.pdf_copies_created,
+            provenance_recorded=True,
+            human_override=bool(unproposed),
+            reason="APPLIED",
+        )
+
+    def _already_settled(
+        self,
+        paper_id: str,
+        existing: tuple[str, ...],
+        selected: Sequence[TopicLabel],
+    ) -> ConfirmationResult:
+        """A work that already carries topics is not awaiting confirmation."""
+
+        record = self.provenance.latest_for(paper_id) or {}
+        # No record means nobody wrote one, which is not the same as the harness
+        # having decided.  The 179 works predating provenance carry none, and at
+        # least one of them was in fact settled by a person after REVIEW_REQUIRED
+        # -- reading absence as AUTO_CLASSIFIED would have quietly overwritten
+        # that history with a claim no evidence supports.
+        source = str(record.get("assignment_source", AssignmentSource.UNKNOWN_LEGACY.value))
+        if source != AssignmentSource.HUMAN_CONFIRMED.value:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.NOT_REVIEW_REQUIRED,
+                confirmed_topics=existing,
+                assignment_source=source,
+                reason="This WORK already carries topics and is not awaiting review",
+            )
+        if selected and set(existing) == {label.label for label in selected}:
+            return ConfirmationResult(
+                paper_id=paper_id,
+                status=ConfirmationStatus.ALREADY_CONFIRMED,
+                confirmed_topics=existing,
+                proposed_topics=tuple(record.get("proposed_topics", ())),
+                assignment_source=AssignmentSource.HUMAN_CONFIRMED.value,
+                original_classification_status=str(
+                    record.get("classification_status_before", UNKNOWN)
+                ),
+                provenance_recorded=True,
+                reason="These exact topics were already confirmed for this WORK",
+            )
+        return ConfirmationResult(
+            paper_id=paper_id,
+            status=ConfirmationStatus.TOPIC_CONFIRMATION_CONFLICT,
+            confirmed_topics=existing,
+            assignment_source=AssignmentSource.HUMAN_CONFIRMED.value,
+            reason=(
+                "This WORK already carries confirmed topics; changing them is a "
+                "reclassification, not a confirmation"
+            ),
         )
 
     # -- acquisition entry point -----------------------------------------

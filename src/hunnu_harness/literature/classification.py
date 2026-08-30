@@ -96,6 +96,7 @@ REQUIRE_TAXONOMY_NAME_FOR_SECONDARY = True
 class ClassificationStatus(str, Enum):
     CLASSIFIED = "CLASSIFIED"
     CLASSIFIED_WITH_REVIEW_SUGGESTIONS = "CLASSIFIED_WITH_REVIEW_SUGGESTIONS"
+    HUMAN_CONFIRMED = "HUMAN_CONFIRMED"
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
     SKIPPED_EXISTING = "SKIPPED_EXISTING"
     FAILED_SAFE = "FAILED_SAFE"
@@ -170,11 +171,18 @@ class ClassificationResult:
 
     @property
     def is_classified(self) -> bool:
-        """A primary topic was assigned, whatever remains for review."""
+        """A primary topic is settled, whatever remains for review.
+
+        HUMAN_CONFIRMED belongs here so a decision a person made reaches the
+        same canonical write path as an automatic one, instead of needing a
+        second writer.  It never arises from classification itself -- only the
+        confirmation workflow constructs it.
+        """
 
         return self.status in (
             ClassificationStatus.CLASSIFIED,
             ClassificationStatus.CLASSIFIED_WITH_REVIEW_SUGGESTIONS,
+            ClassificationStatus.HUMAN_CONFIRMED,
         )
 
     def as_dict(self) -> dict[str, Any]:

@@ -1,19 +1,21 @@
-"""How each work's topics came to be assigned.
+"""Accepting a human's decision after classification returned REVIEW_REQUIRED.
 
-A topic a person chose and a topic a classifier inferred are not the same fact,
-and the catalog cannot tell them apart: it records what a work is filed under,
-never who decided.  This is the record that answers "how did this get here".
+Classification stops at REVIEW_REQUIRED on purpose: roughly two papers in five
+land there, and a wrong automatic assignment is silent where a missing one is
+visible.  Stopping safely is right.  Having no way to continue afterwards is
+not -- an Agent could be told which topics were proposed and had no operation
+for reporting back which one a person chose.
 
-It is a sidecar rather than a column on the topic row.  The works that predate
-it carry no provenance and must stay readable without a migration, and the
-canonical schema is what the Navigator and the corpus fingerprint depend on --
-nothing here is required in order to read a topic.
+This is that operation.  It does not decide anything: the person decides, and
+this records their decision through the same canonical write path automatic
+classification uses, so metadata, the hardlink view and the links manifest stay
+in step.  What it adds is provenance, because a topic a human settled and a
+topic a classifier inferred should not look identical in the catalog.
 
-The file lives beside the catalog rather than inside it on purpose.  The corpus
-fingerprint hashes every file in the catalog directory, so a note about how an
-assignment was made would otherwise register as a change to the corpus itself.
-Its own digest is kept separately, for the same reason in reverse: changing the
-record should be visible, without pretending the papers changed.
+Confirmation is deliberately narrow.  Only topics this work's own classification
+proposed may be confirmed, so a lower-tier Agent cannot invent a label; the
+frozen taxonomy is re-checked regardless; and confirming a second, different set
+fails closed rather than quietly editing what was already settled.
 """
 
 from __future__ import annotations
@@ -25,9 +27,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..paths import LIBRARY_ROOT
+from .classification import (
+    ClassificationEvidence,
+    ClassificationResult,
+    ClassificationStatus,
+)
+from .models import UNKNOWN
+from .topics import TopicLabel, parse_topic_label
 
 # Deliberately outside library/catalog: the library fingerprint hashes every
 # file in that directory, so a provenance record written there would register as
@@ -38,6 +47,7 @@ TOPIC_PROVENANCE_PATH = LIBRARY_ROOT / "topic_assignment_provenance.jsonl"
 # Independent of the corpus fingerprint schema on purpose: the two answer
 # different questions and must be able to move separately.
 PROVENANCE_FINGERPRINT_SCHEMA_VERSION = "topic-provenance-fingerprint-0.1"
+
 
 class AssignmentSource(str, Enum):
     """Who settled a topic.
@@ -53,6 +63,59 @@ class AssignmentSource(str, Enum):
     AUTO_CLASSIFIED = "AUTO_CLASSIFIED"
     HUMAN_CONFIRMED = "HUMAN_CONFIRMED"
     UNKNOWN_LEGACY = "UNKNOWN_LEGACY"
+
+
+class ConfirmationStatus(str, Enum):
+    CONFIRMED = "CONFIRMED"
+    ALREADY_CONFIRMED = "ALREADY_CONFIRMED"
+    NOT_REVIEW_REQUIRED = "NOT_REVIEW_REQUIRED"
+    NO_CONFIRMABLE_PROPOSALS = "NO_CONFIRMABLE_PROPOSALS"
+    EMPTY_SELECTION = "EMPTY_SELECTION"
+    SELECTED_TOPIC_NOT_PROPOSED = "SELECTED_TOPIC_NOT_PROPOSED"
+    UNKNOWN_TOPIC = "UNKNOWN_TOPIC"
+    TOPIC_CONFIRMATION_CONFLICT = "TOPIC_CONFIRMATION_CONFLICT"
+    WORK_NOT_FOUND = "WORK_NOT_FOUND"
+    FAILED_SAFE = "FAILED_SAFE"
+
+
+@dataclass(frozen=True)
+class ConfirmationResult:
+    paper_id: str
+    status: ConfirmationStatus
+    confirmed_topics: tuple[str, ...] = ()
+    proposed_topics: tuple[str, ...] = ()
+    assignment_source: str = UNKNOWN
+    original_classification_status: str = UNKNOWN
+    topic_metadata_updated: bool = False
+    topic_view_updated: bool = False
+    pdf_copies_created: int = 0
+    provenance_recorded: bool = False
+    human_override: bool = False
+    reason: str = UNKNOWN
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status in (
+            ConfirmationStatus.CONFIRMED,
+            ConfirmationStatus.ALREADY_CONFIRMED,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "PaperID": self.paper_id,
+            "ConfirmationStatus": self.status.value,
+            "ConfirmedTopics": list(self.confirmed_topics),
+            "ProposedTopics": list(self.proposed_topics),
+            "AssignmentSource": self.assignment_source,
+            "OriginalClassificationStatus": self.original_classification_status,
+            "TopicMetadataUpdated": self.topic_metadata_updated,
+            "TopicViewUpdated": self.topic_view_updated,
+            "PDFCopiesCreated": self.pdf_copies_created,
+            "ProvenanceRecorded": self.provenance_recorded,
+            "HumanOverride": self.human_override,
+            "Reason": self.reason,
+        }
+
 
 @dataclass(frozen=True)
 class TopicProvenanceFingerprint:
@@ -79,6 +142,7 @@ class TopicProvenanceFingerprint:
             "TopicProvenanceSources": dict(self.sources),
             "TopicProvenanceFingerprint": self.sha256,
         }
+
 
 @dataclass
 class TopicProvenanceStore:
@@ -242,10 +306,60 @@ class TopicProvenanceStore:
         return entry
 
 
+def _labels(values: Iterable[str]) -> tuple[TopicLabel, ...]:
+    out: list[TopicLabel] = []
+    for value in values:
+        label = parse_topic_label(value)
+        if label is not None and label not in out:
+            out.append(label)
+    return tuple(out)
+
+
+def human_confirmed_result(
+    paper_id: str,
+    topics: Sequence[TopicLabel],
+    *,
+    proposed: Sequence[str],
+    original_status: str,
+) -> ClassificationResult:
+    """A ClassificationResult standing for a decision a person already made.
+
+    Built so the confirmation path can hand it to the same apply step automatic
+    classification uses, rather than growing a second writer.  Confidence is 1.0
+    because a human settled it; the evidence names the person, not a score.
+    """
+
+    evidence = tuple(
+        ClassificationEvidence(
+            topic=label.label,
+            confidence=1.0,
+            score=0.0,
+            concepts=("human_confirmation",),
+            fields=("human",),
+            terms=(),
+            signals=("HUMAN",),
+        )
+        for label in topics
+    )
+    return ClassificationResult(
+        paper_id=paper_id,
+        status=ClassificationStatus.HUMAN_CONFIRMED,
+        assigned_topics=evidence,
+        proposed_topics=(),
+        overall_confidence=1.0,
+        metadata_used=("human",),
+        review_required=False,
+        reason=f"HUMAN_CONFIRMED_FROM_{original_status}",
+    )
+
+
 __all__ = [
     "PROVENANCE_FINGERPRINT_SCHEMA_VERSION",
     "TOPIC_PROVENANCE_PATH",
     "AssignmentSource",
+    "ConfirmationResult",
+    "ConfirmationStatus",
     "TopicProvenanceFingerprint",
     "TopicProvenanceStore",
+    "human_confirmed_result",
 ]
