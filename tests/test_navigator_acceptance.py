@@ -26,10 +26,20 @@ from hunnu_harness.paths import (
     PAPERS_BY_TOPIC_DIR,
 )
 
-# The sealed audit numbers this corpus was frozen at.
-EXPECTED_WORKS = 179
-EXPECTED_VERSIONS = 192
-EXPECTED_TOPIC_ASSIGNMENTS = 337
+# The sealed audit numbers this corpus is frozen at.
+#
+# Resealed at 181/194/339 on 2026-08-30, from 179/192/337.  Two papers were
+# acquired through the full chain -- searched, identity-locked, downloaded from
+# the publisher, archived -- and each was given its topic by a person after
+# classification stopped at REVIEW_REQUIRED.  The numbers are read from the
+# library itself; they are recorded here so that any *further* drift fails, and
+# moving them is a deliberate act rather than a way to get a green suite.
+#
+# Unique topics stays 39 on purpose: both papers were filed under a topic that
+# already existed, and nothing here may create a fortieth.
+EXPECTED_WORKS = 181
+EXPECTED_VERSIONS = 194
+EXPECTED_TOPIC_ASSIGNMENTS = 339
 EXPECTED_UNIQUE_TOPICS = 39
 
 # Known fixtures in the real corpus, verified during discovery.
