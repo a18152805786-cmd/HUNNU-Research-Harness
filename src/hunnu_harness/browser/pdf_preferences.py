@@ -13,6 +13,11 @@ from typing import Callable
 
 
 PDF_DIRECT_DOWNLOAD_PREFERENCE = "plugins.always_open_pdf_externally"
+SESSION_RESTORE_PREFERENCE = "session.restore_on_startup"
+# Chrome keeps session cookies across a restart only under "continue where
+# you left off".  Under the default it drops them, which is why an
+# authenticated publisher session did not survive a single Harness run.
+SESSION_RESTORE_LAST_SESSION = 1
 DEFAULT_RESEARCH_CHROME_PROFILE = Path.home() / "ResearchHarness" / "chrome-profile"
 
 
@@ -27,8 +32,8 @@ class ResearchChromeProfileInUse(ResearchChromePreferenceError):
 @dataclass(frozen=True)
 class PdfPreferenceAudit:
     preference_name: str
-    previous_value: bool | None
-    new_value: bool
+    previous_value: bool | int | None
+    new_value: bool | int
     scope: str = "ResearchChromeOnly"
     same_profile_reused: bool = True
     cookies_preserved: bool = True
@@ -122,7 +127,7 @@ class ResearchChromePdfPreference:
         self.preferences_path = self.profile_dir / "Default" / "Preferences"
         self._profile_process_check = profile_process_check or _default_profile_process_check
 
-    def inspect(self) -> bool | None:
+    def _payload(self) -> dict:
         if not self.preferences_path.is_file():
             raise ResearchChromePreferenceError(
                 f"Research Chrome Preferences file is unavailable: {self.preferences_path}"
@@ -131,19 +136,73 @@ class ResearchChromePdfPreference:
             payload = json.loads(self.preferences_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ResearchChromePreferenceError("Research Chrome Preferences is not valid JSON") from exc
-        plugins = payload.get("plugins")
-        if not isinstance(plugins, dict):
+        return payload
+
+    def _read(self, container: str, key: str, kind: type) -> bool | int | None:
+        section = self._payload().get(container)
+        if not isinstance(section, dict):
             return None
-        value = plugins.get("always_open_pdf_externally")
+        value = section.get(key)
+        # bool is a subclass of int, so an exact type check keeps a stray
+        # ``true`` from reading as the integer 1.
+        return value if type(value) is kind else None
+
+    def inspect(self) -> bool | None:
+        value = self._read("plugins", "always_open_pdf_externally", bool)
         return value if isinstance(value, bool) else None
 
-    def configure_direct_download(self) -> PdfPreferenceAudit:
+    def inspect_session_restore(self) -> int | None:
+        value = self._read("session", "restore_on_startup", int)
+        return value if isinstance(value, int) else None
+
+    def _require_stopped(self) -> None:
+        """Chrome rewrites Preferences as it exits, so edit it only when stopped."""
+
         if tuple(self.profile_dir.glob("Singleton*")):
             raise ResearchChromeProfileInUse("Research Chrome profile lock is present")
         in_use = self._profile_process_check(self.profile_dir)
         if in_use is not False:
             detail = "in use" if in_use else "running-state check unavailable"
             raise ResearchChromeProfileInUse(f"Research Chrome profile is {detail}")
+
+    def configure_session_restore(self) -> PdfPreferenceAudit:
+        """Let an authenticated publisher session survive closing the browser.
+
+        The session cookies a publisher issues after institutional sign-in --
+        ``sd_session_id`` and friends -- have no expiry, so Chrome discards them
+        at startup unless the profile is set to continue where it left off.  The
+        Harness closes the browser at the end of every run, so without this the
+        sign-in cannot outlive one run and every later run arrives anonymous.
+
+        This is an ordinary Chrome setting, the one a person gets from the
+        Settings page.  It changes what the profile remembers, never how it
+        presents itself.
+        """
+
+        self._require_stopped()
+        previous = self.inspect_session_restore()
+        if previous == SESSION_RESTORE_LAST_SESSION:
+            return PdfPreferenceAudit(
+                preference_name=SESSION_RESTORE_PREFERENCE,
+                previous_value=previous,
+                new_value=SESSION_RESTORE_LAST_SESSION,
+            )
+        self._apply(
+            container="session",
+            key="restore_on_startup",
+            value=SESSION_RESTORE_LAST_SESSION,
+            literal=str(SESSION_RESTORE_LAST_SESSION),
+        )
+        if self.inspect_session_restore() != SESSION_RESTORE_LAST_SESSION:
+            raise ResearchChromePreferenceError("Session restore preference verification failed")
+        return PdfPreferenceAudit(
+            preference_name=SESSION_RESTORE_PREFERENCE,
+            previous_value=previous,
+            new_value=SESSION_RESTORE_LAST_SESSION,
+        )
+
+    def configure_direct_download(self) -> PdfPreferenceAudit:
+        self._require_stopped()
 
         previous = self.inspect()
         if previous is True:
@@ -153,20 +212,41 @@ class ResearchChromePdfPreference:
                 new_value=True,
             )
 
+        self._apply(
+            container="plugins",
+            key="always_open_pdf_externally",
+            value=True,
+            literal="true",
+        )
+        if self.inspect() is not True:
+            raise ResearchChromePreferenceError("PDF direct-download preference verification failed")
+        return PdfPreferenceAudit(
+            preference_name=PDF_DIRECT_DOWNLOAD_PREFERENCE,
+            previous_value=previous,
+            new_value=True,
+        )
+
+    def _apply(self, *, container: str, key: str, value: bool | int, literal: str) -> None:
+        """Set one preference and prove nothing else in the file moved."""
+
         original = self.preferences_path.read_text(encoding="utf-8")
         current_payload = json.loads(original)
         expected_payload = dict(current_payload)
-        expected_plugins = dict(current_payload.get("plugins") or {})
-        expected_plugins["always_open_pdf_externally"] = True
-        expected_payload["plugins"] = expected_plugins
+        expected_section = dict(current_payload.get(container) or {})
+        expected_section[key] = value
+        expected_payload[container] = expected_section
 
-        updated = self._surgical_set(original, True)
+        updated = self._surgical_set(original, container, key, literal)
         try:
             updated_payload = json.loads(updated)
         except json.JSONDecodeError as exc:
-            raise ResearchChromePreferenceError("Targeted PDF preference edit produced invalid JSON") from exc
+            raise ResearchChromePreferenceError(
+                f"Targeted {container}.{key} edit produced invalid JSON"
+            ) from exc
         if updated_payload != expected_payload:
-            raise ResearchChromePreferenceError("Targeted edit changed content beyond the PDF preference")
+            raise ResearchChromePreferenceError(
+                f"Targeted edit changed content beyond {container}.{key}"
+            )
 
         mode = stat.S_IMODE(self.preferences_path.stat().st_mode)
         temp_path: Path | None = None
@@ -191,38 +271,36 @@ class ResearchChromePdfPreference:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-        if self.inspect() is not True:
-            raise ResearchChromePreferenceError("PDF direct-download preference verification failed")
-        return PdfPreferenceAudit(
-            preference_name=PDF_DIRECT_DOWNLOAD_PREFERENCE,
-            previous_value=previous,
-            new_value=True,
-        )
-
     @classmethod
-    def _surgical_set(cls, source: str, value: bool) -> str:
-        replacement = "true" if value else "false"
-        plugins_span = cls._object_span(source, "plugins")
-        if plugins_span is None:
+    def _surgical_set(cls, source: str, container: str, key: str, replacement: str) -> str:
+        """Edit one value in place, leaving the rest of the file byte for byte.
+
+        Chrome's Preferences file carries far more than the Harness knows about,
+        so it is never re-serialised from a parsed object: only the one value is
+        rewritten, and the caller re-parses to prove nothing else moved.
+        """
+
+        span = cls._object_span(source, container)
+        if span is None:
             root_start = source.find("{")
             if root_start < 0:
                 raise ResearchChromePreferenceError("Preferences root object was not found")
             remainder = source[root_start + 1 :]
             comma = "" if remainder.lstrip().startswith("}") else ","
-            insertion = f'"plugins":{{"always_open_pdf_externally":{replacement}}}{comma}'
+            insertion = f'"{container}":{{"{key}":{replacement}}}{comma}'
             return source[: root_start + 1] + insertion + source[root_start + 1 :]
 
-        start, end = plugins_span
+        start, end = span
         body = source[start + 1 : end]
         match = re.search(
-            r'("always_open_pdf_externally"\s*:\s*)(true|false)',
+            rf'("{re.escape(key)}"\s*:\s*)(true|false|-?\d+)',
             body,
         )
         if match:
             body = body[: match.start(2)] + replacement + body[match.end(2) :]
         else:
             comma = "" if not body.strip() else ","
-            body = f'"always_open_pdf_externally":{replacement}{comma}' + body
+            body = f'"{key}":{replacement}{comma}' + body
         return source[: start + 1] + body + source[end:]
 
     @staticmethod
@@ -258,6 +336,8 @@ class ResearchChromePdfPreference:
 __all__ = [
     "DEFAULT_RESEARCH_CHROME_PROFILE",
     "PDF_DIRECT_DOWNLOAD_PREFERENCE",
+    "SESSION_RESTORE_LAST_SESSION",
+    "SESSION_RESTORE_PREFERENCE",
     "PdfPreferenceAudit",
     "ResearchChromePdfPreference",
     "ResearchChromePreferenceError",

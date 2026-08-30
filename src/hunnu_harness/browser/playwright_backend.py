@@ -88,6 +88,17 @@ class PlaywrightBrowser:
         self._playwright: Any = None
         self.context: Any = None
         self.page: Any = None
+        self._browser: Any = None
+        self._cdp: Any = None
+        # Where downloads are sent, and what the browser said about them, when
+        # this run attached to a browser instead of launching one.
+        self.downloads_directed = False
+        self.download_events: list[dict[str, str]] = []
+        # True when this run attached to a browser somebody else started.  It
+        # decides whether close() may end that browser, and getting it wrong
+        # would defeat the point: the first run would kill the signed-in session
+        # every later run depends on.
+        self.attached = False
 
     async def lifecycle(self) -> dict[str, Any]:
         """What the browser actually did, for the agent-facing report.
@@ -119,6 +130,24 @@ class PlaywrightBrowser:
             raise PlaywrightUnavailable("Install the optional browser extra: python -m pip install -e .[browser]") from exc
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
+
+        # A persistent Research Chrome, if one is running, is preferred over a
+        # fresh browser: it is holding the institutional session, and launching
+        # a second browser on the same profile would both fail on the lock and
+        # start out signed in to nothing.
+        from .persistent_browser import probe
+
+        persistent = probe()
+        if persistent.running:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.connect_over_cdp(persistent.endpoint)
+            contexts = self._browser.contexts
+            self.context = contexts[0] if contexts else await self._browser.new_context()
+            self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+            self.attached = True
+            await self._direct_downloads_here()
+            return
+
         lock_files = tuple(self.profile_dir.glob("Singleton*"))
         if lock_files:
             raise ProfileLockedError(f"Dedicated Chrome profile appears locked: {', '.join(p.name for p in lock_files)}")
@@ -283,14 +312,86 @@ class PlaywrightBrowser:
             auth_status=AuthStatus.AUTH_UNKNOWN,
         )
 
+    async def _direct_downloads_here(self) -> None:
+        """Tell the attached browser to write downloads into this run's directory.
+
+        A browser this process launched is configured through Playwright, and a
+        download then arrives as a ``download`` event on the page.  A browser we
+        merely attached to is not: the bytes were measured arriving in full, and
+        staged, while the event never reached the page being awaited, so the
+        acquisition timed out with a complete PDF sitting in a temporary folder.
+
+        Saying where to put the file removes the dependency on that event.  The
+        browser-level session is deliberate: ``Browser.downloadWillBegin`` carries
+        the URL the bytes actually came from -- for ScienceDirect that is
+        ``pdf.sciencedirectassets.com``, not the article host -- and provenance
+        must not be traded away for convenience.
+        """
+
+        self.download_events = []
+        if self._browser is None:
+            return
+        try:
+            session = await self._browser.new_browser_cdp_session()
+        except Exception:
+            # An older browser without this endpoint keeps the previous
+            # behaviour rather than failing the run.
+            return
+        self._cdp = session
+        session.on(
+            "Browser.downloadWillBegin",
+            lambda event: self.download_events.append(
+                {
+                    "guid": event.get("guid", ""),
+                    "url": event.get("url", ""),
+                    "suggested_filename": event.get("suggestedFilename", ""),
+                    "state": "begin",
+                }
+            ),
+        )
+        session.on(
+            "Browser.downloadProgress",
+            lambda event: self.download_events.append(
+                {"guid": event.get("guid", ""), "state": event.get("state", "")}
+            ),
+        )
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            await session.send(
+                "Browser.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": str(self.downloads_dir),
+                    "eventsEnabled": True,
+                },
+            )
+            self.downloads_directed = True
+        except Exception:
+            self.downloads_directed = False
+
     async def close(self) -> None:
-        if self.context:
-            await self.context.close()
-        if self._playwright:
-            await self._playwright.stop()
+        """End this run's use of the browser without ending the browser.
+
+        When this run attached to a persistent Research Chrome, closing means
+        letting go of the connection.  Closing the context instead would take
+        the signed-in session down with it, which is precisely the failure this
+        whole arrangement exists to prevent -- so the attached case only stops
+        the Playwright driver, and Chrome carries on.
+        """
+
+        if self.attached:
+            if self._playwright:
+                await self._playwright.stop()
+        else:
+            if self.context:
+                await self.context.close()
+            if self._playwright:
+                await self._playwright.stop()
         self.context = None
         self.page = None
         self._playwright = None
+        self._browser = None
+        self.attached = False
 
     async def click_text(self, text: str, *, exact: bool = True) -> None:
         if not self.page:
