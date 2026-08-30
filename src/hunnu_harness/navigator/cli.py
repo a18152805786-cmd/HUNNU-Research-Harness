@@ -94,6 +94,16 @@ def add_navigator_subcommands(sub: argparse._SubParsersAction) -> None:
     index.add_argument("action", choices=("status", "build", "validate", "rebuild", "drop"))
     index.add_argument("--page-limit", type=int, default=None)
     index.add_argument("--quiet", action="store_true", help="Suppress per-work build progress")
+    index.add_argument(
+        "--allow-degraded",
+        action="store_true",
+        help=(
+            "Commit a build even when extraction failed systemically."
+            " Without it, a build whose hard failures cover the corpus"
+            " (e.g. pypdf missing from the interpreter) refuses to touch"
+            " the existing index and exits non-zero."
+        ),
+    )
 
     fingerprint = sub.add_parser(
         "paper-fingerprint",
@@ -258,7 +268,7 @@ def run_navigator_command(args: argparse.Namespace) -> int:
 def _run_index(args: argparse.Namespace) -> int:
     from .catalog import CatalogReader
     from .fulltext import FullTextExtractor
-    from .index import NavigatorIndex
+    from .index import IndexBuildRefused, NavigatorIndex
 
     try:
         snapshot = CatalogReader().load()
@@ -299,7 +309,18 @@ def _run_index(args: argparse.Namespace) -> int:
             print(f"[{position}/{total}] {paper_id}", file=sys.stderr)
 
     build = index.rebuild if args.action == "rebuild" else index.build
-    _emit(build(snapshot, progress=progress))
+    try:
+        payload = build(
+            snapshot,
+            progress=progress,
+            allow_degraded=bool(getattr(args, "allow_degraded", False)),
+        )
+    except IndexBuildRefused as refused:
+        # Fail closed: nothing was written or deleted.  Exit non-zero so a
+        # caller cannot mistake a refused rebuild for a fresh index.
+        _emit(refused.payload)
+        return EXIT_INDEX_FAILED
+    _emit(payload)
     return EXIT_OK
 
 

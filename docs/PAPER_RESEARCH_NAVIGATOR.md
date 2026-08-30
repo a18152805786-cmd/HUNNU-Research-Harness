@@ -200,6 +200,16 @@ catalog and the managed full texts; deleting `paper_retrieval/` entirely loses
 nothing but time. **The index is never a source of truth** — `papers.jsonl`,
 `library/papers`, and the topic metadata remain authoritative.
 
+Disposable does not mean replaceable by garbage: a build commits nothing until
+extraction has finished, and it refuses to commit — previous index kept,
+non-zero exit, cause named in the payload — when hard extraction failures
+cover every attempt or more than half of them. The canonical trigger is
+running the rebuild under an interpreter without `pypdf`: every work would
+come back `DEPENDENCY_MISSING`, and before this guard the rebuild silently
+swapped a healthy index for an empty one that still said `BUILT`. Fix the
+environment (use the project `.venv`); `--allow-degraded` is the explicit
+opt-in to commit anyway.
+
 The Navigator works with no index at all: metadata and topic recall are computed
 live from the catalog in about 160 ms. Building the index only adds full-text
 passage search.

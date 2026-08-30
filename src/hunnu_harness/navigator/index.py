@@ -8,6 +8,13 @@ from the catalog plus the managed full texts at any time.  Deleting
 Staleness is detected, never guessed: the manifest records the SHA-256 of both
 catalog files at build time, and each work records the SHA-256 of the version
 whose text was extracted.  A response built on a stale index says so.
+
+Disposable does not mean replaceable by garbage: a build commits nothing until
+extraction has finished, and it refuses to commit at all when the extraction
+machinery failed systemically (every attempt, or more than
+``max_failure_share`` of them).  A rebuild under an interpreter without
+``pypdf`` therefore keeps the previous index instead of swapping in an empty
+one that still says BUILT.
 """
 
 from __future__ import annotations
@@ -33,11 +40,50 @@ from ..paths import (
     require_output_path,
 )
 from .catalog import CatalogSnapshot, PaperWork
-from .fulltext import Chunk, EXTRACTION_OK, FullTextExtractor
+from .fulltext import (
+    Chunk,
+    EXTRACTION_DEPENDENCY_MISSING,
+    EXTRACTION_FAILED,
+    EXTRACTION_MISSING,
+    EXTRACTION_OK,
+    EXTRACTION_UNSUPPORTED,
+    FullTextExtractor,
+)
 from .resolver import PreferredVersionResolver
 
 
 INDEX_SCHEMA_VERSION = "navigator-index-0.1"
+
+#: Statuses that mean the extraction machinery broke, as opposed to statuses
+#: that describe the source document (missing file, scanned-only, non-PDF).
+#: These are the failures that turn a rebuild into data loss when they cover
+#: the corpus.
+HARD_FAILURE_STATUSES = frozenset({EXTRACTION_FAILED, EXTRACTION_DEPENDENCY_MISSING})
+
+#: Statuses that never exercised the extraction machinery at all; they do not
+#: dilute the failure share.
+_NOT_AN_EXTRACTION_ATTEMPT = frozenset({EXTRACTION_MISSING, EXTRACTION_UNSUPPORTED})
+
+#: A build whose hard-failure share among real extraction attempts exceeds
+#: this refuses to commit.  Total failure refuses whatever the value.
+DEFAULT_MAX_FAILURE_SHARE = 0.5
+
+#: Cap on per-work failure rows carried in a build/refusal payload.
+_MAX_REPORTED_FAILURES = 50
+
+
+class IndexBuildRefused(RuntimeError):
+    """A build refused to commit because extraction failed systemically.
+
+    Raised before anything is written or deleted, so the previous index --
+    including the one a ``rebuild`` was about to replace -- is intact on
+    disk.  ``payload`` carries the counts, the dominant cause, and the
+    remedy, ready for the CLI to emit.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("reason", "index build refused")))
+        self.payload = payload
 
 
 class IndexStatus(str, Enum):
@@ -142,6 +188,7 @@ class NavigatorIndex:
         root: Path | None = None,
         extractor: FullTextExtractor | None = None,
         resolver: PreferredVersionResolver | None = None,
+        max_failure_share: float = DEFAULT_MAX_FAILURE_SHARE,
     ) -> None:
         self.root = _logical_path(root or PAPER_RETRIEVAL_ROOT)
         self.index_dir = self.root / "index" if root else _logical_path(PAPER_RETRIEVAL_INDEX_DIR)
@@ -154,6 +201,7 @@ class NavigatorIndex:
         )
         self.extractor = extractor or FullTextExtractor()
         self.resolver = resolver or PreferredVersionResolver()
+        self.max_failure_share = float(max_failure_share)
 
     # -- status ------------------------------------------------------------
 
@@ -243,28 +291,39 @@ class NavigatorIndex:
         *,
         progress: Callable[[str, int, int], None] | None = None,
         only: Iterable[str] | None = None,
+        fresh: bool = False,
+        allow_degraded: bool = False,
     ) -> dict[str, Any]:
-        """Extract text for every readable work and write the index.
+        """Extract text for every readable work, then commit the index.
 
-        A work whose text cannot be extracted is recorded with its failure
-        status and skipped; the build always completes.
+        Extraction runs first and writes nothing; every filesystem effect
+        belongs to the commit phase at the end.  A work whose text cannot be
+        extracted is recorded with its failure status and skipped -- but when
+        hard failures (the extraction machinery breaking, not a document
+        being missing or scanned-only) cover every extraction attempt or
+        exceed ``max_failure_share`` of them, the build raises
+        :class:`IndexBuildRefused` instead of committing, because replacing a
+        working index with an empty one is data loss, not a build.
+        ``allow_degraded=True`` commits anyway.  ``fresh=True`` deletes the
+        previous index directory at commit time; it is what :meth:`rebuild`
+        passes.
         """
 
         require_output_path(self.root, label="Navigator index root")
-        _windows_io_path(self.index_dir).mkdir(parents=True, exist_ok=True)
-        _windows_io_path(self.fulltext_dir).mkdir(parents=True, exist_ok=True)
 
         selected = set(only) if only is not None else None
         entries: dict[str, dict[str, Any]] = {}
-        if selected is not None:
+        if selected is not None and not fresh:
             existing = self._read_fulltext_manifest()
             entries.update(existing)
 
         works = [work for work in snapshot.works if selected is None or work.paper_id in selected]
         total = len(works)
-        chunk_total = 0
-        ok_works = 0
 
+        # -- extraction phase: reads only, so a refusal below loses nothing -
+        chunks_by_work: dict[str, tuple[Chunk, ...]] = {}
+        extraction_attempts = 0
+        hard_failures: list[dict[str, Any]] = []
         for position, work in enumerate(works, start=1):
             if progress is not None:
                 progress(work.paper_id, position, total)
@@ -280,13 +339,35 @@ class NavigatorIndex:
                     "chunk_count": 0,
                     "detail": "work has no managed version",
                 }
-                self._remove_chunk_file(work.paper_id)
                 continue
             result = self.extractor.extract(work.paper_id, preferred.version)
             entries[work.paper_id] = result.as_manifest_entry()
+            if result.status not in _NOT_AN_EXTRACTION_ATTEMPT:
+                extraction_attempts += 1
             if result.status == EXTRACTION_OK and result.chunks:
-                self._write_chunks(work.paper_id, result.chunks)
-                chunk_total += len(result.chunks)
+                chunks_by_work[work.paper_id] = result.chunks
+            elif result.status in HARD_FAILURE_STATUSES:
+                hard_failures.append(
+                    {"paper_id": work.paper_id, "status": result.status, "detail": result.detail}
+                )
+
+        refusal = self._systemic_failure(extraction_attempts, hard_failures)
+        if refusal is not None and not allow_degraded:
+            raise IndexBuildRefused(refusal)
+
+        # -- commit phase ----------------------------------------------------
+        if fresh:
+            self.drop()
+        _windows_io_path(self.index_dir).mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.fulltext_dir).mkdir(parents=True, exist_ok=True)
+
+        chunk_total = 0
+        ok_works = 0
+        for work in works:
+            chunks = chunks_by_work.get(work.paper_id)
+            if chunks:
+                self._write_chunks(work.paper_id, chunks)
+                chunk_total += len(chunks)
                 ok_works += 1
             else:
                 self._remove_chunk_file(work.paper_id)
@@ -333,13 +414,85 @@ class NavigatorIndex:
             "index_dir": str(self.index_dir),
             "manifest": manifest.as_dict(),
             "extraction_status_counts": dict(sorted(statuses.items())),
+            "extraction_attempts": extraction_attempts,
+            "hard_failure_count": len(hard_failures),
+            "hard_failures": sorted(hard_failures, key=lambda item: str(item["paper_id"]))[
+                :_MAX_REPORTED_FAILURES
+            ],
+            "degraded": refusal is not None,
         }
 
-    def rebuild(self, snapshot: CatalogSnapshot, **kwargs: Any) -> dict[str, Any]:
-        """Delete the derived index entirely, then build it again."""
+    def _systemic_failure(
+        self, extraction_attempts: int, hard_failures: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The refusal payload when this run's hard failures look environmental.
 
-        self.drop()
-        return self.build(snapshot, **kwargs)
+        The denominator is the attempts that exercised the extraction
+        machinery: a missing file or an unsupported format says nothing about
+        whether ``pypdf`` works, so those outcomes must not dilute the share.
+        """
+
+        failed = len(hard_failures)
+        if extraction_attempts <= 0 or failed == 0:
+            return None
+        share = failed / extraction_attempts
+        if failed < extraction_attempts and share <= self.max_failure_share:
+            return None
+
+        causes: dict[str, int] = {}
+        for item in hard_failures:
+            cause = str(item["status"])
+            if item.get("detail"):
+                cause = f"{cause}: {item['detail']}"
+            causes[cause] = causes.get(cause, 0) + 1
+        dominant_cause, dominant_count = max(causes.items(), key=lambda kv: (kv[1], kv[0]))
+
+        if failed == extraction_attempts:
+            scale = f"every extraction attempt ({failed} of {failed}) failed hard"
+        else:
+            scale = (
+                f"{failed} of {extraction_attempts} extraction attempts failed hard"
+                f" ({share:.0%} > {self.max_failure_share:.0%} allowed)"
+            )
+        reason = (
+            f"Refusing to commit the index: {scale}."
+            f" Dominant cause ({dominant_count} of {failed} failures): {dominant_cause}."
+            " The previous index, if any, was left untouched."
+        )
+        payload: dict[str, Any] = {
+            "status": "REFUSED",
+            "reason": reason,
+            "extraction_attempts": extraction_attempts,
+            "hard_failure_count": failed,
+            "hard_failure_share": round(share, 4),
+            "max_failure_share": self.max_failure_share,
+            "failure_causes": dict(sorted(causes.items())),
+            "hard_failures": sorted(hard_failures, key=lambda item: str(item["paper_id"]))[
+                :_MAX_REPORTED_FAILURES
+            ],
+            "previous_index_kept": True,
+            "index_dir": str(self.index_dir),
+            "override": "pass allow_degraded=True (CLI: --allow-degraded) to commit anyway",
+        }
+        if any(item["status"] == EXTRACTION_DEPENDENCY_MISSING for item in hard_failures):
+            payload["missing_dependency_hint"] = (
+                "the PDF extraction dependency is not importable in this"
+                " interpreter (see failure_causes, e.g. pypdf); install it or"
+                " rerun under the project virtualenv instead of rebuilding"
+            )
+        return payload
+
+    def rebuild(self, snapshot: CatalogSnapshot, **kwargs: Any) -> dict[str, Any]:
+        """Build a replacement index, then swap it in.
+
+        The previous index directory is deleted only inside the commit phase,
+        after extraction has finished and the fail-closed guard has passed.
+        A rebuild under a broken environment -- an interpreter without
+        ``pypdf``, say -- raises :class:`IndexBuildRefused` and keeps the
+        existing index instead of replacing it with an empty one.
+        """
+
+        return self.build(snapshot, fresh=True, **kwargs)
 
     def drop(self) -> None:
         require_output_path(self.index_dir, label="Navigator index dir")
@@ -468,8 +621,11 @@ class NavigatorIndex:
 
 
 __all__ = [
+    "DEFAULT_MAX_FAILURE_SHARE",
+    "HARD_FAILURE_STATUSES",
     "INDEX_SCHEMA_VERSION",
     "FullTextIndex",
+    "IndexBuildRefused",
     "IndexManifest",
     "IndexStatus",
     "NavigatorIndex",

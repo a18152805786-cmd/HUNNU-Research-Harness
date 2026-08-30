@@ -8,7 +8,11 @@ its ordinal on that page, so a passage returned by a search can be pointed at
 and re-read.
 
 Managed PDFs are opened read-only and never modified.  Extraction failure for
-one work is recorded and skipped; it never aborts a build.
+one work is recorded and skipped; it never aborts a build mid-corpus.  A
+failure of the extraction machinery itself -- ``pypdf`` not importable in the
+running interpreter -- is classified as ``DEPENDENCY_MISSING`` rather than as
+a per-document failure, so the index build guard can tell a broken
+environment from a broken document and refuse to commit.
 """
 
 from __future__ import annotations
@@ -37,6 +41,9 @@ MIN_PAGE_CHARS = 12
 EXTRACTION_OK = "OK"
 EXTRACTION_EMPTY = "NO_EXTRACTABLE_TEXT"
 EXTRACTION_FAILED = "EXTRACTION_FAILED"
+#: The extraction stack is unusable in this interpreter (``pypdf`` not
+#: importable), as opposed to one document failing to extract.
+EXTRACTION_DEPENDENCY_MISSING = "DEPENDENCY_MISSING"
 EXTRACTION_UNSUPPORTED = "UNSUPPORTED_FORMAT"
 EXTRACTION_MISSING = "FILE_MISSING"
 
@@ -221,6 +228,16 @@ class FullTextExtractor:
                             text_sha256=_sha256_text(piece),
                         )
                     )
+        except ImportError as exc:
+            # ``from pypdf import PdfReader`` failed: the interpreter, not the
+            # document, is broken, and every other work will fail the same way.
+            return ExtractionResult(
+                **base,
+                status=EXTRACTION_DEPENDENCY_MISSING,
+                pages_read=pages_read,
+                chunks=(),
+                detail=f"{type(exc).__name__}: {exc}",
+            )
         except Exception as exc:
             return ExtractionResult(
                 **base,
@@ -246,6 +263,7 @@ __all__ = [
     "DEFAULT_CHUNK_CHARS",
     "DEFAULT_CHUNK_OVERLAP",
     "DEFAULT_PAGE_LIMIT",
+    "EXTRACTION_DEPENDENCY_MISSING",
     "EXTRACTION_EMPTY",
     "EXTRACTION_FAILED",
     "EXTRACTION_MISSING",
