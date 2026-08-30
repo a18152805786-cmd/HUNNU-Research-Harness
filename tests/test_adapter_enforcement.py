@@ -161,6 +161,9 @@ def _plan(source: str) -> LiteratureSourcePlan:
 
 
 class AdapterResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
     def test_registry_resolves_and_instantiates_each_registered_adapter(self) -> None:
         factory = LiteratureAdapterFactory(LITERATURE_ADAPTER_REGISTRY)
         expected = {
@@ -288,6 +291,9 @@ class AdapterResolutionTests(unittest.TestCase):
 
 
 class AdapterFirstExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
     def test_browser_transport_satisfies_the_minimal_contract(self) -> None:
         self.assertIsInstance(_FakeTransport(), BrowserTransport)
 
