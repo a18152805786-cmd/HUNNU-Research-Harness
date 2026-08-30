@@ -134,6 +134,30 @@ class LiteratureSourceAdapter(ABC):
     async def open_result(self, record: LiteratureRecord) -> None:
         raise NotImplementedError
 
+    async def current_target_matches(self, record: LiteratureRecord) -> bool:
+        """Is the browser already on *record*'s locked target page?
+
+        The acquisition workflow locks a target during screening and then needs
+        the same page again to resolve the authorized download control.  Blindly
+        re-navigating there is redundant when nothing has moved, and a
+        re-navigation is not free: it discards the page state the identity lock
+        was established against, and an Agent driving the browser is right to
+        treat it as destructive.
+
+        This lets an adapter answer the question cheaply -- by observing the
+        current page rather than by navigating -- so the workflow can skip a
+        pointless navigation while still recovering when the browser really has
+        moved.  It is a read-only probe: implementations must never navigate,
+        click, or otherwise change page state.
+
+        The default is ``False``, which preserves the existing re-navigation for
+        every adapter that has not opted in.  Answering ``True`` is a claim that
+        the current page *is* the locked target; an adapter that cannot verify
+        that must keep returning ``False``.
+        """
+
+        return False
+
     @abstractmethod
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         raise NotImplementedError

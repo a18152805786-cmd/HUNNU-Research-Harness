@@ -401,7 +401,32 @@ class LiteratureAcquisitionWorkflow:
                 if len(downloads) >= max_downloads:
                     break
                 try:
-                    await self.adapter.open_result(record)
+                    # The screening phase has already navigated to this record,
+                    # locked its identity, and confirmed access.  Navigating
+                    # there again is redundant whenever the browser never left,
+                    # and it is the command an Agent sees as "go somewhere"
+                    # immediately after the target was locked.  Ask the adapter
+                    # -- by observation, not navigation -- whether we are still
+                    # on the locked target, and re-navigate only when we are
+                    # not, which keeps genuine recovery working.
+                    #
+                    # This never re-searches: recovery goes back to this
+                    # record's own locked page.  Identity is not weakened
+                    # either -- the probe compares the source identifier, and
+                    # ``download_fulltext`` still fails closed unless the PDF
+                    # control belongs to the locked article.
+                    already_on_target = await self.adapter.current_target_matches(record)
+                    if already_on_target:
+                        self.logger.log(
+                            "target_navigation_reused",
+                            status=RunStatus.SUCCESS.value,
+                            paper_id=record.paper_id,
+                            source=record.source_database,
+                            stable_identifier=record.stable_identifier,
+                            renavigation_skipped=True,
+                        )
+                    else:
+                        await self.adapter.open_result(record)
                     access = await self.adapter.check_fulltext_access()
                     record.full_text_accessible = access.full_text_accessible
                     record.access_type = access.access_type.value

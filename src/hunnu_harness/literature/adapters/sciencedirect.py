@@ -447,6 +447,31 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             raise SourceUnavailable("Browser command port is unavailable")
         await self.browser.execute(NavigateCommand(record.source_page))
 
+    async def current_target_matches(self, record: LiteratureRecord) -> bool:
+        """Observe -- never navigate -- to see whether we are already on the target.
+
+        Identity is the PII, not the URL string: ``/pii/S…`` and ``/abs/pii/S…``
+        are the same article, and query strings and fragments are noise.  A
+        host that is not ScienceDirect, an unparseable path, or any observation
+        failure all answer ``False``, so an uncertain probe costs a redundant
+        navigation rather than a wrong reuse of a page we cannot identify.
+        """
+
+        expected = _ARTICLE_PATH.search(urlsplit(record.source_page).path)
+        if expected is None or self.browser is None:
+            return False
+        try:
+            observation = await self.browser.execute(ObserveCommand())
+            current = urlsplit(observation.url)
+        except Exception:
+            return False
+        if current.hostname not in {"www.sciencedirect.com", "sciencedirect.com"}:
+            return False
+        actual = _ARTICLE_PATH.search(current.path)
+        if actual is None:
+            return False
+        return actual.group(1).casefold() == expected.group(1).casefold()
+
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         html, current_url = await self._content()
         return self.parse_article_html(html, source_url=current_url, search_query=search_query)
