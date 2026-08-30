@@ -48,6 +48,7 @@ TAXONOMY = {
 
 AI_WASHING = "01_人工智能与数字经济\\AI漂洗"
 AUDIT = "04_会计审计与信息披露\\审计与内部控制"
+DISCLOSURE = "04_会计审计与信息披露\\信息披露"
 EARNINGS = "04_会计审计与信息披露\\盈余质量与财务报告"
 STOCK_PRICE = "05_资本市场与证券\\股价与市场波动"
 
@@ -236,6 +237,30 @@ class ClassifierBehaviourTests(unittest.TestCase):
             for evidence in result.assigned_topics + result.proposed_topics:
                 self.assertIn(evidence.topic, known)
 
+    def test_canary_ai_washing_accepts_the_primary_and_holds_disclosure_back(self) -> None:
+        """The canary title, pinned by name rather than by aggregate precision.
+
+        "AI washing: Strategic disclosure and backlash" must auto-accept
+        AI漂洗 and must NOT auto-accept 信息披露 -- "disclosure" is one broad
+        word (lexicon 3.0 + one-word alias 3.0 = 6.0, ratio 0.667 < 0.70), so
+        the secondary margin holds it back as a proposal.  An alias-table edit
+        that widens the disclosure aliases or their weights trips this before
+        it can silently ship.
+        """
+
+        with tempfile.TemporaryDirectory(prefix="alias-canary-", dir=TEMP_DIR) as tmp:
+            classifier = _classifier(Path(tmp))
+            result = classifier.classify(
+                ClassificationInput(
+                    paper_id="PCANARY",
+                    title="AI washing: Strategic disclosure and backlash",
+                )
+            )
+            self.assertTrue(result.is_classified, result.as_dict())
+            self.assertEqual(result.assigned_labels, (AI_WASHING,))
+            self.assertIn(DISCLOSURE, result.proposed_labels)
+            self.assertNotIn(DISCLOSURE, result.assigned_labels)
+
     def test_secondary_corroboration_gate_survives_in_english(self) -> None:
         """A lexicon-only English secondary is still held back for review.
 
@@ -260,6 +285,82 @@ class ClassifierBehaviourTests(unittest.TestCase):
             )
             self.assertEqual(result.assigned_labels, (AI_WASHING,))
             self.assertIn(STOCK_PRICE, result.proposed_labels)
+
+
+class BroadTermCollisionTests(unittest.TestCase):
+    """Broad single words must not auto-produce a topic on their own.
+
+    The words below all appear somewhere in the alias table or the lexicon.
+    The point is not to ban them -- it is to prove that an ordinary title
+    carrying only such a word stops at review: one broad word tops out at
+    lexicon 3.0 + one-word alias 3.0 = 6.0 (confidence 0.667), or a short
+    name-part plus lexicon at 7.5 (0.714), both under the 0.75 gate.  Runs
+    against the real frozen 39-topic taxonomy because that is the collision
+    surface that matters; skips cleanly where it is absent.
+    """
+
+    # One deliberately ordinary, wrong-field title per broad term.
+    NEGATIVE_TITLES = (
+        "Disclosure and the cost of information",       # disclosure
+        "Risk and return in emerging markets",          # risk
+        "Innovation in the public sector",              # innovation
+        "Green buildings and urban planning",           # green
+        "Digital natives and media consumption habits", # digital
+        "Finance for non-financial managers",           # finance
+        "Governance of the global commons",             # governance
+        "Performance evaluation in public schools",     # performance
+        "Investment in early childhood education",      # investment
+        "ESG considerations for retail investors",      # esg
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            cls.taxonomy = TopicTaxonomy.load()
+        except TopicTaxonomyError:
+            raise unittest.SkipTest("real taxonomy is not present on this machine")
+        if len(cls.taxonomy.labels()) < 39:
+            raise unittest.SkipTest("frozen 39-topic taxonomy is not present")
+        cls.classifier = WorkClassifier(taxonomy=cls.taxonomy)
+
+    def test_broad_words_alone_never_auto_assign(self) -> None:
+        for title in self.NEGATIVE_TITLES:
+            result = self.classifier.classify(
+                ClassificationInput(paper_id="PBROAD", title=title)
+            )
+            self.assertFalse(result.is_classified, (title, result.as_dict()))
+            self.assertEqual(result.assigned_labels, (), title)
+
+    def test_broad_words_alone_never_reach_the_gate_even_together_with_a_name_part(self) -> None:
+        # "esg" is both a taxonomy name part (4.5) and a lexicon term (3.0):
+        # the strongest single-broad-word stack there is, and still short.
+        result = self.classifier.classify(
+            ClassificationInput(paper_id="PESG", title="ESG considerations for retail investors")
+        )
+        self.assertEqual(result.status, ClassificationStatus.REVIEW_REQUIRED)
+        self.assertLess(result.overall_confidence, 0.75)
+
+    def test_a_specific_two_word_phrase_assigns_its_topic_and_nothing_else(self) -> None:
+        """The known ambiguous shape, pinned: one specific alias phrase clears
+        the gate for its own topic, and the broad words around it drag no
+        second topic through."""
+
+        result = self.classifier.classify(
+            ClassificationInput(
+                paper_id="PDISC", title="Corporate disclosure quality and firm value"
+            )
+        )
+        self.assertTrue(result.is_classified)
+        self.assertEqual(result.assigned_labels, (DISCLOSURE,))
+
+    def test_canary_holds_on_the_real_taxonomy_too(self) -> None:
+        result = self.classifier.classify(
+            ClassificationInput(
+                paper_id="PCANARY2", title="AI washing: Strategic disclosure and backlash"
+            )
+        )
+        self.assertEqual(result.assigned_labels, (AI_WASHING,))
+        self.assertIn(DISCLOSURE, result.proposed_labels)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -58,14 +58,30 @@ abstract 1.5, full text 1.0 capped at three hits per concept, journal 0.5):
    term for the same construct, never a term fitted to one paper; it matches
    on word boundaries, credits at most one hit per subtopic per field, and one
    English word weighs as a two-character Chinese term in the specificity
-   formula. Measured on the 181-work corpus: English coverage 0.158 → 0.895
-   with per-language precision 1.000, and the Chinese results bit-identical
-   with the table on and off (162 works, coverage 0.654). The taxonomy file
-   itself is untouched — an alias can never create a topic — and the alias
-   table is a calibration artifact: an edit is acceptable only with the
-   per-language backtest
+   formula.
+
+   **Measurement is an in-corpus replay, and its two language halves are not
+   equally self-confirming.** Replaying all 181 works against their existing
+   topics: Chinese coverage 106/162 (0.654, bit-identical per work with the
+   table on and off) at replay precision 1.000, English coverage 3/19 → 17/19
+   (0.895) at replay precision 1.000. The Chinese number largely re-derives
+   assignments this same classifier produced (up to 106 of 162 agree
+   automatically — a highly self-confirming ground truth); the English ground
+   truth predates the alias table almost entirely (only 3 of 19 were ever
+   auto-assignable before it), so its replay agreement is closer to an
+   independent check — but 19 works is a small sample, and neither number is
+   a precision claim about *future* English literature. Broad-word collision
+   behaviour is pinned separately: one broad word (`disclosure`,
+   `innovation`, `esg`, …) tops out below the 0.75 gate by construction, and
+   `tests/test_taxonomy_aliases.py` holds a named canary
+   ("AI washing: Strategic disclosure and backlash" accepts AI漂洗, holds
+   信息披露 back) plus negative titles for ten broad terms.
+
+   The taxonomy file itself is untouched — an alias can never create a topic
+   — and the alias table is a calibration artifact: an edit is acceptable
+   only with the per-language replay
    (`CanonicalLibraryBacktestTests::test_english_aliases_hold_their_own_calibration`)
-   held or improved.
+   and the canary/collision suite held or improved.
 
 Confidence saturates as `score / (score + 3.0)`. One title concept hit alone
 reaches 0.5 and is therefore *not* auto-assigned: a lone uncorroborated signal
