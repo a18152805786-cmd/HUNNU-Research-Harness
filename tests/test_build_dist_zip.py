@@ -24,6 +24,20 @@ SCRIPT = REPO_ROOT / "scripts" / "build_dist_zip.py"
 class DistZipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        toplevel = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if (
+            toplevel.returncode != 0
+            or Path(toplevel.stdout.strip()).resolve() != REPO_ROOT
+        ):
+            raise unittest.SkipTest(
+                "no git metadata of its own here: an extracted distribution "
+                "cannot rebuild its zip; this gate runs in the repository"
+            )
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         cls._holder = tempfile.TemporaryDirectory(prefix="dist-zip-", dir=TEMP_DIR)
         cls.output_dir = Path(cls._holder.name)

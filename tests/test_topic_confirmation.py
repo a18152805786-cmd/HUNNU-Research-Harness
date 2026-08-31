@@ -532,12 +532,33 @@ class DistributionSanitizationTests(unittest.TestCase):
         """Scan every tracked text file for personal path/archive fingerprints."""
 
         root = Path(__file__).resolve().parents[1]
-        result = subprocess.run(
-            ["git", "ls-files", "-z"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        )
+        try:
+            toplevel = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            result = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.skipTest(
+                "no git metadata here: an extracted distribution has no tracked-file "
+                "list to scan; this gate runs in the repository"
+            )
+        if Path(toplevel).resolve() != root:
+            self.skipTest(
+                "this tree is not its own git repository (an extracted copy inside "
+                "some other repo); the scan gate runs in the Harness repository"
+            )
+        if not result.stdout.strip():
+            self.skipTest("git returned no tracked files; scanning is repository-only")
         user_segment = "719" + "66"
         sentinels = (
             user_segment,

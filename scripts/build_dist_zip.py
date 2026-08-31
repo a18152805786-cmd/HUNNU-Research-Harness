@@ -60,13 +60,20 @@ DENY_SUFFIXES = (".pyc", ".pyo")
 
 
 def _git(*args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(REPO_ROOT), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(
+            "REFUSED: building the distribution zip requires the git repository "
+            "(git ls-files is the source of truth). An extracted zip carries no "
+            f"git metadata, so it cannot rebuild itself. ({exc})"
+        ) from exc
 
 
 def _project_version() -> str:
@@ -110,6 +117,15 @@ def main() -> int:
         help="Build even with uncommitted changes (tests only; a release zip must match a commit)",
     )
     args = parser.parse_args()
+
+    toplevel = Path(_git("rev-parse", "--show-toplevel").strip()).resolve()
+    if toplevel != REPO_ROOT:
+        print(
+            "REFUSED: this tree is not its own git repository (toplevel is "
+            f"{toplevel}); refusing to zip a stranger's tracked files.",
+            file=sys.stderr,
+        )
+        return 2
 
     dirty = _git("status", "--porcelain").strip()
     if dirty and not args.allow_dirty:
