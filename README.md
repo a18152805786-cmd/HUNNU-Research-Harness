@@ -38,7 +38,7 @@ Global Library 与受控 external import 的正式契约见 [docs/GLOBAL_PAPER_L
 ## 环境准备
 
 ```powershell
-cd C:\Users\<user>\Desktop\HUNNU-Research-Harness
+cd <Harness 根目录>
 .venv\Scripts\python.exe -m pip install -e .
 # 需要本地 Playwright 后端时：
 .venv\Scripts\python.exe -m pip install -e ".[browser]"
@@ -48,7 +48,7 @@ cd C:\Users\<user>\Desktop\HUNNU-Research-Harness
 
 代码工作区：
 
-`C:\Users\<user>\Desktop\HUNNU-Research-Harness`
+`<Harness 根目录>`
 
 正式论文研究数据与既有非-Harness归档仍保存在：
 
@@ -56,8 +56,8 @@ cd C:\Users\<user>\Desktop\HUNNU-Research-Harness
 
 Harness 运行产物默认保存在项目内部：
 
-- Harness 主体：`C:\Users\<user>\Desktop\HUNNU-Research-Harness\`
-- Harness 统一输出根：`C:\Users\<user>\Desktop\HUNNU-Research-Harness-Output\`
+- Harness 主体：`<Harness 根目录>\`
+- Harness 统一输出根：Output Root（默认为兄弟目录 `<仓库名>-Output`，或 `HUNNU_HARNESS_OUTPUT_ROOT` 指定）
 - 授权下载归档：输出根下的 `downloads\authorized\`
 - Staging / Playwright 输出：输出根下的 `staging\` 与 `staging\playwright-output\`
 - Run / Manifest / 日志：输出根下的 `runs\`、`manifests\` 与 `logs\`
@@ -81,7 +81,7 @@ codex mcp list
 
 默认 profile 位于：
 
-`C:\Users\<user>\ResearchHarness\chrome-profile`
+`%USERPROFILE%\ResearchHarness\chrome-profile`
 
 首次打开后，请由用户本人完成湖南师范大学图书馆/学校统一认证。Harness 只等待并读取可见页面状态。遇到密码、验证码、二维码、MFA 或 WebVPN，必须人工完成后再继续。
 

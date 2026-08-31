@@ -22,7 +22,7 @@
 ## Existing browser and MCP state
 
 - Chrome has multiple existing user profiles. The Harness does not use the daily profile by default.
-- A new dedicated profile directory was created at `C:\Users\<user>\ResearchHarness\chrome-profile`.
+- A new dedicated profile directory was created at `%USERPROFILE%\ResearchHarness\chrome-profile`.
 - FDM is running and may intercept ordinary Chrome downloads. The Harness therefore uses a separate staging directory and recommends native browser downloads for the dedicated profile.
 - Existing Codex configuration already contains `node_repl` and Zotero MCP servers. A Playwright MCP entry was added to the same config using the Hermes `npx.cmd` path, Chrome executable, dedicated profile, and a research output directory. No credentials, cookies, or storage state were exported.
 

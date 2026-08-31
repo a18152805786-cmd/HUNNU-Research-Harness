@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+import sys
 from typing import Any
 
 from ..models import AuthStatus, BrowserState
@@ -51,6 +53,38 @@ DEFAULT_HUMAN_WAIT_POLL_SECONDS = 1.0
 # is not enough: Cloudflare reloads its own challenge page, and the gap between
 # two rotations reads clean.
 DEFAULT_HUMAN_CLEAR_CONFIRMATIONS = 3
+RESEARCH_CHROME_ENV = "HUNNU_RESEARCH_CHROME"
+
+
+def discover_chrome_executable(explicit: Path | str | None = None) -> Path | None:
+    """Find a system Chrome executable without requiring one to be installed.
+
+    An explicit CLI path is intentional configuration, so it is returned as-is
+    and Playwright will report a useful error if that path is invalid.  Paths
+    supplied through the environment or inferred from the conventional Windows
+    locations must exist as files before they are selected.
+    """
+
+    if explicit is not None:
+        return Path(explicit)
+
+    configured = os.environ.get(RESEARCH_CHROME_ENV)
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(os.path.expandvars(configured)).expanduser())
+
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LocalAppData"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(
+                Path(os.path.expandvars(root)).expanduser()
+                / "Google"
+                / "Chrome"
+                / "Application"
+                / "chrome.exe"
+            )
+
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 class PlaywrightUnavailable(RuntimeError):
@@ -161,6 +195,14 @@ class PlaywrightBrowser:
         }
         if self.executable_path:
             launch_args["executable_path"] = str(self.executable_path)
+        else:
+            print(
+                "System Chrome was not found; falling back to Playwright's bundled Chromium. "
+                "If it is not installed, install Google Chrome or run "
+                "python -m playwright install chromium.",
+                file=sys.stderr,
+                flush=True,
+            )
         self.context = await self._playwright.chromium.launch_persistent_context(**launch_args)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 

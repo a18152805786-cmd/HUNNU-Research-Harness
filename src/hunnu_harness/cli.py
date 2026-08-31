@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from . import __version__
-from .browser.playwright_backend import PlaywrightUnavailable
+from .browser.playwright_backend import PlaywrightUnavailable, discover_chrome_executable
 from .browser.pdf_preferences import ResearchChromePdfPreference, ResearchChromePreferenceError
 from .browser.session import ResearchBrowser
 from .paths import LIBRARY_ROOT, OUTPUT_ROOT, CORE_ROOT, STAGING_DIR, _windows_io_path
@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("browser-start", help="Start a dedicated Playwright Chrome profile")
     start.add_argument("--profile", type=Path, default=Path(os.environ.get("HUNNU_RESEARCH_PROFILE", Path.home() / "ResearchHarness" / "chrome-profile")))
     start.add_argument("--downloads", type=Path, default=STAGING_DIR)
-    start.add_argument("--chrome", type=Path, default=Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"))
+    start.add_argument("--chrome", type=Path, default=discover_chrome_executable())
     start.add_argument("--headless", action="store_true")
     pdf_download = sub.add_parser(
         "browser-configure-pdf-download",

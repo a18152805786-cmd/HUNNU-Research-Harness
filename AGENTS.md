@@ -41,8 +41,8 @@
 
 ## Core / output separation
 
-33. Harness source/core root: `C:\Users\<user>\Desktop\HUNNU-Research-Harness`.
-34. Harness runtime/output root: `C:\Users\<user>\Desktop\HUNNU-Research-Harness-Output`.
+33. Harness source/core root: the directory containing this repository.
+34. Harness runtime/output root: the sibling directory `<repository-directory-name>-Output`, unless overridden by `HUNNU_HARNESS_OUTPUT_ROOT`.
 35. All Harness runtime/generated artifacts default to the Output Root, including runs, audits, logs, screenshots, manifests, review packages, staging, authorized downloads, browser output, quarantine, and temporary runtime artifacts. The Core Root is not a runtime destination.
 36. The Output Root is not a second Harness repository: never copy source, adapters, tests, fixtures, configuration, reusable scripts, or dependency metadata there as a parallel implementation.
 

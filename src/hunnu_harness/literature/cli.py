@@ -3,9 +3,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
-from ..browser.playwright_backend import PlaywrightBrowser, PlaywrightUnavailable, ProfileLockedError
+from ..browser.playwright_backend import (
+    PlaywrightBrowser,
+    PlaywrightUnavailable,
+    ProfileLockedError,
+    discover_chrome_executable,
+)
 from .adapters.cnki import CNKIAdapter
 from .adapters.oxfordacademic import OxfordAcademicAdapter
 from .adapters.sciencedirect import ScienceDirectAdapter
@@ -23,8 +29,11 @@ from .workflow import (
 )
 
 
-DEFAULT_PROFILE = Path(r"C:\Users\<user>\ResearchHarness\chrome-profile")
-DEFAULT_CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+DEFAULT_PROFILE = Path.home() / "ResearchHarness" / "chrome-profile"
+
+
+def _default_profile() -> Path:
+    return Path(os.environ.get("HUNNU_RESEARCH_PROFILE", DEFAULT_PROFILE))
 
 
 def _request_from_args(args: argparse.Namespace) -> LiteratureSearchRequest:
@@ -65,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     selector.add_argument("--doi")
     selector.add_argument("--request-json", type=Path)
     live.add_argument("--run-root", type=Path, default=UPGRADE_RUN_ROOT)
-    live.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
-    live.add_argument("--chrome", type=Path, default=DEFAULT_CHROME)
+    live.add_argument("--profile", type=Path, default=_default_profile())
+    live.add_argument("--chrome", type=Path, default=discover_chrome_executable())
     live.add_argument("--max-results", type=int, default=5)
     live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     live.add_argument("--headless", action="store_true")
@@ -92,8 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
     springer_selector.add_argument("--doi")
     springer_selector.add_argument("--request-json", type=Path)
     springer_live.add_argument("--run-root", type=Path, default=UPGRADE_RUN_ROOT)
-    springer_live.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
-    springer_live.add_argument("--chrome", type=Path, default=DEFAULT_CHROME)
+    springer_live.add_argument("--profile", type=Path, default=_default_profile())
+    springer_live.add_argument("--chrome", type=Path, default=discover_chrome_executable())
     springer_live.add_argument("--max-results", type=int, default=5)
     springer_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     springer_live.add_argument("--headless", action="store_true")
@@ -112,8 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     cnki_selector.add_argument("--doi")
     cnki_selector.add_argument("--request-json", type=Path)
     cnki_live.add_argument("--run-root", type=Path, default=CNKI_UPGRADE_RUN_ROOT)
-    cnki_live.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
-    cnki_live.add_argument("--chrome", type=Path, default=DEFAULT_CHROME)
+    cnki_live.add_argument("--profile", type=Path, default=_default_profile())
+    cnki_live.add_argument("--chrome", type=Path, default=discover_chrome_executable())
     cnki_live.add_argument("--max-results", type=int, default=3)
     cnki_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     cnki_live.add_argument("--headless", action="store_true")
@@ -135,8 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     oxford_selector.add_argument("--doi")
     oxford_selector.add_argument("--request-json", type=Path)
     oxford_live.add_argument("--run-root", type=Path, default=OXFORD_UPGRADE_RUN_ROOT)
-    oxford_live.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
-    oxford_live.add_argument("--chrome", type=Path, default=DEFAULT_CHROME)
+    oxford_live.add_argument("--profile", type=Path, default=_default_profile())
+    oxford_live.add_argument("--chrome", type=Path, default=discover_chrome_executable())
     oxford_live.add_argument("--max-results", type=int, default=1)
     oxford_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     oxford_live.add_argument("--headless", action="store_true")
