@@ -12,6 +12,7 @@ from ..browser.playwright_backend import (
     ProfileLockedError,
     discover_chrome_executable,
 )
+from ..cli_output import CliReport, attach_json_flag
 from .adapters.cnki import CNKIAdapter
 from .adapters.oxfordacademic import OxfordAcademicAdapter
 from .adapters.sciencedirect import ScienceDirectAdapter
@@ -210,10 +211,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Confirm the file came from the target's normal single-paper control in the authenticated browser",
     )
     cnki_capture.add_argument("--run-root", type=Path, default=CNKI_UPGRADE_RUN_ROOT)
+
+    # Machine-output mode is uniform across every subcommand: one JSON document
+    # on stdout, human-directed sentences on stderr.  Commands that already
+    # emit a single JSON document (plan) accept the flag as a no-op.
+    attach_json_flag(subparsers)
     return parser
 
 
 async def _run_live(args: argparse.Namespace) -> int:
+    report = CliReport(bool(getattr(args, "json", False)))
     request = _request_from_args(args)
     staging = Path(args.run_root) / "downloads" / "staging"
     browser = PlaywrightBrowser(
@@ -255,13 +262,15 @@ async def _run_live(args: argparse.Namespace) -> int:
         )
         result = await workflow.run(request)
     except ProfileLockedError as exc:
-        print("Status=SOURCE_UNAVAILABLE")
-        print(f"Reason={exc}")
-        print("ProfileModified=false")
+        report.put("Status", "SOURCE_UNAVAILABLE")
+        report.put("Reason", str(exc))
+        report.put("ProfileModified", False, plain="false")
+        report.flush()
         return 3
     except PlaywrightUnavailable as exc:
-        print("Status=SOURCE_UNAVAILABLE")
-        print(f"Reason={exc}")
+        report.put("Status", "SOURCE_UNAVAILABLE")
+        report.put("Reason", str(exc))
+        report.flush()
         return 2
     finally:
         # Read the browser's own account of what it did before tearing it down.
@@ -276,22 +285,27 @@ async def _run_live(args: argparse.Namespace) -> int:
 
     for key in ("BrowserLaunched", "BrowserHeadless", "FinalURL", "FinalPageTitle"):
         if key in lifecycle:
-            print(f"{key}={lifecycle[key]}")
+            report.put(key, lifecycle[key])
 
-    print(f"Status={result.status.value}")
-    print(f"Results={len(result.records)}")
-    print(f"Downloads={len(result.downloads)}")
+    report.put("Status", result.status.value)
+    report.put("Results", len(result.records))
+    report.put("Downloads", len(result.downloads))
     if result.status == RunStatus.ACTION_REQUIRED_USER_LOGIN:
-        print("ACTION_REQUIRED_USER_LOGIN=true")
-        print(f"Reason={result.action_required_reason}")
-        print("BrowserReadyForManualAction=false")
-        print("Use the registered Playwright MCP session to keep Research Chrome open for manual login.")
+        report.put("ACTION_REQUIRED_USER_LOGIN", True, plain="true")
+        report.put("Reason", result.action_required_reason)
+        report.put("BrowserReadyForManualAction", False, plain="false")
+        report.note(
+            "Use the registered Playwright MCP session to keep Research Chrome open for manual login."
+        )
     if result.status == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD:
-        print("ACTION_REQUIRED_USER_LOGIN=false")
-        print("ACTION_REQUIRED_USER_DOWNLOAD=true")
-        print("BrowserReadyForManualDownload=true")
-        print(f"Reason={result.action_required_reason}")
-        print("Click the Chrome PDF Viewer native Download button once; Harness will ingest the new file.")
+        report.put("ACTION_REQUIRED_USER_LOGIN", False, plain="false")
+        report.put("ACTION_REQUIRED_USER_DOWNLOAD", True, plain="true")
+        report.put("BrowserReadyForManualDownload", True, plain="true")
+        report.put("Reason", result.action_required_reason)
+        report.note(
+            "Click the Chrome PDF Viewer native Download button once; Harness will ingest the new file."
+        )
+    report.flush()
     return 0 if result.status in {RunStatus.SUCCESS, RunStatus.PARTIAL_SUCCESS} else 4
 
 
@@ -321,10 +335,15 @@ def main(argv: list[str] | None = None) -> int:
             downloaded_pdf=args.pdf,
             run_root=args.run_root,
         )
-        print(f"Status={result.status.value}")
-        print(f"LiveAcceptanceSearchPassed={len(result.records) == 1}")
-        print(f"LiveAcceptancePDFDownloaded={len(result.downloads) == 1}")
-        print(f"LiveAcceptancePDFValidated={bool(result.downloads and result.downloads[0].pdf_validation_passed)}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("Status", result.status.value)
+        report.put("LiveAcceptanceSearchPassed", len(result.records) == 1)
+        report.put("LiveAcceptancePDFDownloaded", len(result.downloads) == 1)
+        report.put(
+            "LiveAcceptancePDFValidated",
+            bool(result.downloads and result.downloads[0].pdf_validation_passed),
+        )
+        report.flush()
         return 0 if result.status == RunStatus.SUCCESS else 5
     if args.command == "finalize-springerlink-capture":
         request = _request_from_args(args)
@@ -337,10 +356,15 @@ def main(argv: list[str] | None = None) -> int:
             downloaded_pdf=args.pdf,
             run_root=args.run_root,
         )
-        print(f"Status={result.status.value}")
-        print(f"LiveAcceptanceSearchPassed={len(result.records) == 1}")
-        print(f"LiveAcceptancePDFDownloaded={len(result.downloads) == 1}")
-        print(f"LiveAcceptancePDFValidated={bool(result.downloads and result.downloads[0].pdf_validation_passed)}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("Status", result.status.value)
+        report.put("LiveAcceptanceSearchPassed", len(result.records) == 1)
+        report.put("LiveAcceptancePDFDownloaded", len(result.downloads) == 1)
+        report.put(
+            "LiveAcceptancePDFValidated",
+            bool(result.downloads and result.downloads[0].pdf_validation_passed),
+        )
+        report.flush()
         return 0 if result.status == RunStatus.SUCCESS else 5
     if args.command == "finalize-cnki-capture":
         request = _request_from_args(args)
@@ -356,12 +380,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         entry = result.downloads[0] if result.downloads else None
         record = result.records[0] if result.records else None
-        print(f"Status={result.status.value}")
-        print(f"LiveAcceptanceSearchPassed={len(result.records) == 1}")
-        print(f"LiveAcceptanceDownloaded={entry is not None}")
-        print(f"LiveAcceptanceFileValidated={bool(entry and entry.file_validation_passed)}")
-        print(f"LiveAcceptanceFormat={entry.full_text_format if entry else 'Unknown'}")
-        print(f"LiveAcceptanceTargetIdentityConfirmed={bool(record and record.target_identity_confirmed)}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("Status", result.status.value)
+        report.put("LiveAcceptanceSearchPassed", len(result.records) == 1)
+        report.put("LiveAcceptanceDownloaded", entry is not None)
+        report.put("LiveAcceptanceFileValidated", bool(entry and entry.file_validation_passed))
+        report.put("LiveAcceptanceFormat", entry.full_text_format if entry else "Unknown")
+        report.put(
+            "LiveAcceptanceTargetIdentityConfirmed",
+            bool(record and record.target_identity_confirmed),
+        )
+        report.flush()
         return 0 if result.status == RunStatus.SUCCESS else 5
     raise SystemExit(f"Unknown command: {args.command}")
 

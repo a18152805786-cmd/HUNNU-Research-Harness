@@ -10,7 +10,19 @@ from . import __version__
 from .browser.playwright_backend import PlaywrightUnavailable, discover_chrome_executable
 from .browser.pdf_preferences import ResearchChromePdfPreference, ResearchChromePreferenceError
 from .browser.session import ResearchBrowser
+from .cli_output import CliReport, attach_json_flag
 from .paths import LIBRARY_ROOT, OUTPUT_ROOT, CORE_ROOT, STAGING_DIR, _windows_io_path
+
+
+def _bool_plain(value: object) -> object:
+    return str(value).lower() if isinstance(value, bool) else value
+
+
+def _audit_report(args: argparse.Namespace, audit_items: dict) -> CliReport:
+    report = CliReport(bool(getattr(args, "json", False)))
+    for key, value in audit_items.items():
+        report.put(key, value, plain=_bool_plain(value))
+    return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -183,6 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
+    # One contract across the whole CLI: with --json, stdout is exactly one
+    # json.loads-able document.  Commands already emitting one accept the
+    # flag as a no-op.
+    attach_json_flag(sub)
     return parser
 
 
@@ -213,6 +229,8 @@ def _acquire_to_literature_argv(args: argparse.Namespace) -> list[str]:
         argv.append("--headless")
     if args.allow_refetch:
         argv.append("--allow-refetch")
+    if getattr(args, "json", False):
+        argv.append("--json")
     return argv
 
 
@@ -233,23 +251,27 @@ async def _start(args: argparse.Namespace) -> int:
             chrome_executable=args.chrome,
         )
     except PersistentBrowserError as exc:
-        print("DedicatedProfileStarted=false")
-        print(f"Reason={exc}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("DedicatedProfileStarted", False, plain="false")
+        report.put("Reason", str(exc))
+        report.flush()
         return 2
-    for key, value in status.as_dict().items():
-        print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-    print("DedicatedProfileStarted=true")
-    print("BrowserLeftRunning=true")
+    report = _audit_report(args, status.as_dict())
+    report.put("DedicatedProfileStarted", True, plain="true")
+    report.put("BrowserLeftRunning", True, plain="true")
+    report.flush()
     return 0
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.command == "env":
-        print(f"CoreRoot={CORE_ROOT}")
-        print(f"OutputRoot={OUTPUT_ROOT}")
-        print(f"LibraryRoot={LIBRARY_ROOT}")
-        print(f"Python={os.sys.executable}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("CoreRoot", str(CORE_ROOT))
+        report.put("OutputRoot", str(OUTPUT_ROOT))
+        report.put("LibraryRoot", str(LIBRARY_ROOT))
+        report.put("Python", os.sys.executable)
+        report.flush()
         return 0
     if args.command == "browser-start":
         return asyncio.run(_start(args))
@@ -257,29 +279,31 @@ def main() -> int:
         try:
             audit = ResearchChromePdfPreference(args.profile).configure_direct_download()
         except ResearchChromePreferenceError as exc:
-            print(f"PdfDirectDownloadConfigured=false")
-            print(f"Reason={exc}")
+            report = CliReport(bool(getattr(args, "json", False)))
+            report.put("PdfDirectDownloadConfigured", False, plain="false")
+            report.put("Reason", str(exc))
+            report.flush()
             return 2
-        for key, value in audit.as_dict().items():
-            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-        print("PdfDirectDownloadConfigured=true")
+        report = _audit_report(args, audit.as_dict())
+        report.put("PdfDirectDownloadConfigured", True, plain="true")
+        report.flush()
         return 0
     if args.command == "browser-status":
         from .browser.persistent_browser import probe
 
-        status = probe()
-        for key, value in status.as_dict().items():
-            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+        _audit_report(args, probe().as_dict()).flush()
         return 0
     if args.command == "browser-stop":
         import asyncio as _asyncio
 
         from .browser.persistent_browser import probe
 
+        report = CliReport(bool(getattr(args, "json", False)))
         status = probe()
         if not status.running:
-            print("PersistentBrowserRunning=false")
-            print("Reason=No persistent Research Chrome is listening")
+            report.put("PersistentBrowserRunning", False, plain="false")
+            report.put("Reason", "No persistent Research Chrome is listening")
+            report.flush()
             return 0
 
         async def _shutdown() -> None:
@@ -290,19 +314,22 @@ def main() -> int:
                 await browser.close()
 
         _asyncio.run(_shutdown())
-        print("PersistentBrowserStopped=true")
-        print("SessionEnded=true")
+        report.put("PersistentBrowserStopped", True, plain="true")
+        report.put("SessionEnded", True, plain="true")
+        report.flush()
         return 0
     if args.command == "browser-configure-session-restore":
         try:
             audit = ResearchChromePdfPreference(args.profile).configure_session_restore()
         except ResearchChromePreferenceError as exc:
-            print("SessionRestoreConfigured=false")
-            print(f"Reason={exc}")
+            report = CliReport(bool(getattr(args, "json", False)))
+            report.put("SessionRestoreConfigured", False, plain="false")
+            report.put("Reason", str(exc))
+            report.flush()
             return 2
-        for key, value in audit.as_dict().items():
-            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-        print("SessionRestoreConfigured=true")
+        report = _audit_report(args, audit.as_dict())
+        report.put("SessionRestoreConfigured", True, plain="true")
+        report.flush()
         return 0
     if args.command == "acquire":
         # The literature module owns the live path end to end (it constructs
@@ -339,9 +366,11 @@ def main() -> int:
         except FetchLedgerError as exc:
             # A ledger that cannot be read refuses fetches (fail closed), so
             # say that plainly instead of printing a half-true budget.
-            print("LedgerReadable=false")
-            print(f"Reason={exc}")
-            print("FetchesWillBeRefused=true")
+            report = CliReport(bool(getattr(args, "json", False)))
+            report.put("LedgerReadable", False, plain="false")
+            report.put("Reason", str(exc))
+            report.put("FetchesWillBeRefused", True, plain="true")
+            report.flush()
             return 2
         print(json.dumps(usage, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
