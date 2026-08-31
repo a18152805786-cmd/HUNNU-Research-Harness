@@ -7,8 +7,10 @@ from unittest.mock import patch
 
 from hunnu_harness.cli import build_parser
 from hunnu_harness.literature.library import (
+    CATALOG_SCHEMA_VERSION,
     ExternalPaperImporter,
     GlobalPaperLibrary,
+    LibraryCatalogError,
     LibraryDisposition,
     UnsafeImportSource,
 )
@@ -328,6 +330,69 @@ class ExternalImporterSafetyTests(unittest.TestCase):
                     source,
                     {"Title": "x", "Authors": ["A"], "Year": "2026"},
                 )
+
+
+class CatalogSchemaVersionGateTests(unittest.TestCase):
+    """This gate failing to fire means the catalog is being reinterpreted silently.
+
+    ``CATALOG_SCHEMA_VERSION`` used to be write-only: every record carried it,
+    nothing ever compared it, so a catalog written by a different Harness build
+    was read under the current build's assumptions without a word.  These tests
+    pin the load-time gate; removing it reintroduces that silent reread.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.library = GlobalPaperLibrary(
+            self.root / "library",
+            allow_outside_output_for_tests=True,
+            make_managed_read_only=False,
+        )
+        record = paper_record()
+        source = write_paper_pdf(self.root / "seed.pdf", record)
+        result = self.library.ingest_external_pdf(source, record)
+        self.assertEqual(result.status, "MANAGED")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _rewrite_first_record(self, mutate) -> None:
+        lines = self.library.catalog_jsonl_path.read_text(encoding="utf-8-sig").splitlines()
+        payload = json.loads(lines[0])
+        mutate(payload)
+        lines[0] = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        self.library.catalog_jsonl_path.write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+
+    def _next_ingest(self):
+        record = paper_record(doi="10.1000/second-paper", title="Second library paper")
+        source = write_paper_pdf(self.root / "second.pdf", record)
+        return self.library.ingest_external_pdf(source, record)
+
+    def test_a_foreign_schema_version_stops_the_load_with_guidance(self) -> None:
+        self._rewrite_first_record(lambda item: item.update(schema_version="9.9.9"))
+        with self.assertRaises(LibraryCatalogError) as caught:
+            self._next_ingest()
+        message = str(caught.exception)
+        self.assertIn("'9.9.9'", message)
+        self.assertIn(CATALOG_SCHEMA_VERSION, message)
+        self.assertIn("PaperID", message)
+        self.assertIn("migrate the catalog", message)
+
+    def test_a_record_without_schema_version_stops_the_load_with_guidance(self) -> None:
+        self._rewrite_first_record(lambda item: item.pop("schema_version", None))
+        with self.assertRaises(LibraryCatalogError) as caught:
+            self._next_ingest()
+        message = str(caught.exception)
+        self.assertIn("absent", message)
+        self.assertIn(CATALOG_SCHEMA_VERSION, message)
+
+    def test_the_matching_schema_version_still_loads_and_ingests(self) -> None:
+        result = self._next_ingest()
+        self.assertEqual(result.status, "MANAGED")
+        self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
 
 
 if __name__ == "__main__":
