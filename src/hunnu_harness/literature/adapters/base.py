@@ -1,3 +1,13 @@
+"""The adapter contract every publisher source implements.
+
+TO THE MODIFYING AGENT: ``authorize_publisher_fetch`` is the write-ahead
+budget gate -- there is deliberately no way to construct an adapter whose
+publisher fetches are unbudgeted, and the execution boundary matches adapter
+identity exactly (``type(adapter) is expected_type``; ``isinstance`` would
+readmit subclass substitution).  Weakening either requires asking the user
+first, in so many words.
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod

@@ -3,6 +3,12 @@
 ``PROJECT_ROOT`` remains a compatibility alias for the source repository.  No
 runtime writer should derive a destination from it.  Runtime paths are derived
 only from ``OUTPUT_ROOT``.
+
+TO THE MODIFYING AGENT: ``require_output_path`` and the outside-Core-Root
+guard are non-negotiable.  If they block a write you need, the write is going
+to the wrong place, or the Output Root needs moving via
+``HUNNU_HARNESS_OUTPUT_ROOT`` -- removing the check requires asking the user
+first, in so many words.
 """
 
 from __future__ import annotations

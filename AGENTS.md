@@ -1,5 +1,45 @@
 # HUNNU Research Harness — Agent Rules
 
+## If you are an agent MODIFYING this harness (read this first)
+
+The 71 numbered rules below are written for agents *using* the harness. You,
+fixing a bug in it, face a different temptation: for an agent whose goal is
+"make the error go away", a fail-closed check looks like the thing in the way.
+Every one of these edits makes the immediate error disappear, and every one of
+them removes the protection someone's institutional account depends on:
+
+- a rate/budget refusal → raising the constant or deleting the check;
+- `type(adapter) is expected_type` → `isinstance`, "more Pythonic" (it is the
+  gate that rejects subclass substitution, and it is exact on purpose);
+- a manual-authentication stop → adding an automatic retry;
+- `require_output_path` in the way of a write → removing the call.
+
+Before you touch a guard, know these three things:
+
+1. **The tunable knobs already exist.** The daily fetch total
+   (`--daily-limit` / `HUNNU_HARNESS_DAILY_FETCH_LIMIT`), pacing
+   (`HUNNU_HARNESS_FETCH_MIN_INTERVAL_SECONDS`, burst window/limit), the
+   Output Root (`HUNNU_HARNESS_OUTPUT_ROOT`), Chrome and profile paths — all
+   adjustable without editing a line. If a limit is genuinely wrong for your
+   user, the knob is the fix, and the knob belongs to the user.
+2. **Some things are deliberately not knobs.** The 2-per-identifier daily
+   repeat guard is loop detection (it once caught the same PDF being fetched
+   13 times in a day); the manual-authentication stops, the cookie/credential
+   boundary, and the Core/Output separation are non-negotiable. Files that
+   carry such guards say so in their header: weakening them requires asking
+   the user first, in so many words — it is their account and their data.
+3. **Failing tests name what you broke.** This suite's test names are written
+   as sentences ("this failing means --allow-refetch became a general budget
+   bypass"). If your change turns one red, the test is talking to you; do not
+   delete it, and do not "fix" it to agree with the regression.
+
+`docs/AGENTS_ENFORCEMENT_AUDIT.md` maps all 71 rules to their enforcement
+(code-enforced vs prose) — use it to find what you are actually touching.
+When a needed change weakens any code-enforced rule, stop and put the
+decision to the user in plain language.
+
+---
+
 1. Never enter university passwords, personal passwords, OTPs, or MFA codes.
 2. Stop at CAPTCHA, MFA, WebVPN, CAS, or any manual authentication page.
 3. Verify URL, database, module, and table before every download.

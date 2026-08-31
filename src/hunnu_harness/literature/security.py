@@ -1,3 +1,11 @@
+"""Sanitization and leak scanning for everything the Harness writes down.
+
+TO THE MODIFYING AGENT: this is the single sanitization policy for audit
+logs and agent-facing output.  Narrowing a pattern here, or exempting a key
+because redaction "hides useful detail", widens what reaches disk -- ask the
+user first, in so many words.  Over-redaction is the intended failure mode.
+"""
+
 from __future__ import annotations
 
 import json

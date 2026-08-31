@@ -39,6 +39,12 @@ unreadable or corrupt ledger, a record that cannot be appended, and a missing
 identifier all refuse the fetch.  Only the after-the-fact ``outcome`` append
 is best-effort, because failing it would misreport a download that already
 happened.
+
+TO THE MODIFYING AGENT: the daily total and the pacing in this file are
+knobs -- adjust them through their env vars / CLI flags, never by editing
+constants.  The per-identifier repeat guard and the write-ahead ordering are
+NOT knobs; weakening either requires asking the user first, in so many
+words.  This budget spends their institutional account.
 """
 
 from __future__ import annotations
