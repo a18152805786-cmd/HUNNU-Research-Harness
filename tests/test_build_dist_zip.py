@@ -15,7 +15,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from hunnu_harness.paths import TEMP_DIR
+from hunnu_harness.paths import TEMP_DIR, _windows_io_path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "build_dist_zip.py"
@@ -51,7 +51,9 @@ class DistZipTests(unittest.TestCase):
         cls.stdout = result.stdout
         zips = sorted(cls.output_dir.glob("*.zip"))
         assert len(zips) == 1, f"expected exactly one zip, found {zips}"
-        with zipfile.ZipFile(zips[0]) as archive:
+        # zipfile opens via io.open, below the pathlib long-path shims, so a
+        # deep Output Root needs the extended-length form here.
+        with zipfile.ZipFile(_windows_io_path(zips[0])) as archive:
             cls.names = archive.namelist()
 
     @classmethod

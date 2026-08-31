@@ -28,6 +28,21 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
+def _io_path(path: Path) -> Path:
+    """Windows extended-length form for deep paths; stdlib-only by design.
+
+    The harness's own long-path shims live in the package this script must be
+    able to run without, so the two lines are duplicated here on purpose.
+    """
+
+    raw = os.fspath(path)
+    if os.name != "nt" or raw.startswith("\\\\?\\") or len(raw) < 248:
+        return path
+    if raw.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{raw[2:]}")
+    return Path(f"\\\\?\\{os.path.abspath(raw)}")
+
 # Stable top-level folder inside the zip, independent of the local checkout
 # directory name.
 ARCHIVE_PREFIX = "HUNNU-Research-Harness"
@@ -150,12 +165,12 @@ def main() -> int:
 
     output_dir = args.output if args.output is not None else _default_output_dir()
     output_dir = output_dir.expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _io_path(output_dir).mkdir(parents=True, exist_ok=True)
     zip_path = output_dir / f"hunnu-research-harness-{_project_version()}-dist.zip"
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(_io_path(zip_path), "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for relative in shipped:
-            archive.write(REPO_ROOT / relative, f"{ARCHIVE_PREFIX}/{relative}")
+            archive.write(_io_path(REPO_ROOT / relative), f"{ARCHIVE_PREFIX}/{relative}")
 
     for relative in excluded:
         print(f"excluded: {relative}")
@@ -163,7 +178,7 @@ def main() -> int:
     print(f"commit: {commit}{' (dirty build)' if dirty else ''}")
     print(f"entries: {len(shipped)}")
     print(f"zip: {zip_path}")
-    print(f"bytes: {zip_path.stat().st_size}")
+    print(f"bytes: {_io_path(zip_path).stat().st_size}")
     return 0
 
 
