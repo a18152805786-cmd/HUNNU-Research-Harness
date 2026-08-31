@@ -13,6 +13,15 @@ from ..browser.playwright_backend import (
     discover_chrome_executable,
 )
 from ..cli_output import CliReport, attach_json_flag
+from ..exit_codes import (
+    EXIT_BUDGET_EXHAUSTED,
+    EXIT_CAPABILITY_MISSING,
+    EXIT_ENV_NOT_READY,
+    EXIT_HUMAN_ACTION_REQUIRED,
+    EXIT_OK,
+    EXIT_RUN_FAILED,
+)
+from .fetch_ledger import STATUS_ATTEMPT_LIMIT_REACHED, STATUS_BUDGET_EXHAUSTED
 from .adapters.cnki import CNKIAdapter
 from .adapters.oxfordacademic import OxfordAcademicAdapter
 from .adapters.sciencedirect import ScienceDirectAdapter
@@ -266,12 +275,12 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.put("Reason", str(exc))
         report.put("ProfileModified", False, plain="false")
         report.flush()
-        return 3
+        return EXIT_ENV_NOT_READY
     except PlaywrightUnavailable as exc:
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", str(exc))
         report.flush()
-        return 2
+        return EXIT_CAPABILITY_MISSING
     finally:
         # Read the browser's own account of what it did before tearing it down.
         # An Agent that has to infer this from missing output gets it wrong:
@@ -290,6 +299,14 @@ async def _run_live(args: argparse.Namespace) -> int:
     report.put("Status", result.status.value)
     report.put("Results", len(result.records))
     report.put("Downloads", len(result.downloads))
+    budget_refusals = sum(
+        1
+        for record in result.records
+        if getattr(record, "error_status", None)
+        in {STATUS_BUDGET_EXHAUSTED, STATUS_ATTEMPT_LIMIT_REACHED}
+    )
+    if budget_refusals:
+        report.put("FetchBudgetRefusals", budget_refusals)
     if result.status == RunStatus.ACTION_REQUIRED_USER_LOGIN:
         report.put("ACTION_REQUIRED_USER_LOGIN", True, plain="true")
         report.put("Reason", result.action_required_reason)
@@ -306,7 +323,28 @@ async def _run_live(args: argparse.Namespace) -> int:
             "Click the Chrome PDF Viewer native Download button once; Harness will ingest the new file."
         )
     report.flush()
-    return 0 if result.status in {RunStatus.SUCCESS, RunStatus.PARTIAL_SUCCESS} else 4
+    return _live_exit_code(result, budget_refusals)
+
+
+def _live_exit_code(result: Any, budget_refusals: int) -> int:
+    """Map one finished run onto the graded exit ladder (see exit_codes).
+
+    The one judgment call: a partial run that still downloaded something
+    exits 0 even when later fetches hit the budget -- files landed, and the
+    report says both facts.  Only a run whose every attempted download was
+    refused on budget exits 3, because "stop asking today" is then the whole
+    story.
+    """
+
+    if result.status in {RunStatus.ACTION_REQUIRED_USER_LOGIN, RunStatus.ACTION_REQUIRED_USER_DOWNLOAD}:
+        return EXIT_HUMAN_ACTION_REQUIRED
+    if budget_refusals and not result.downloads:
+        return EXIT_BUDGET_EXHAUSTED
+    if result.status in {RunStatus.SUCCESS, RunStatus.PARTIAL_SUCCESS, RunStatus.NO_RESULTS}:
+        return EXIT_OK
+    if result.status in {RunStatus.SOURCE_UNAVAILABLE, RunStatus.SOURCE_LAYOUT_CHANGED}:
+        return EXIT_ENV_NOT_READY
+    return EXIT_RUN_FAILED
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -344,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
             bool(result.downloads and result.downloads[0].pdf_validation_passed),
         )
         report.flush()
-        return 0 if result.status == RunStatus.SUCCESS else 5
+        return EXIT_OK if result.status == RunStatus.SUCCESS else EXIT_RUN_FAILED
     if args.command == "finalize-springerlink-capture":
         request = _request_from_args(args)
         result = finalize_captured_springerlink_acceptance(
@@ -365,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
             bool(result.downloads and result.downloads[0].pdf_validation_passed),
         )
         report.flush()
-        return 0 if result.status == RunStatus.SUCCESS else 5
+        return EXIT_OK if result.status == RunStatus.SUCCESS else EXIT_RUN_FAILED
     if args.command == "finalize-cnki-capture":
         request = _request_from_args(args)
         result = finalize_captured_cnki_acceptance(
@@ -391,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             bool(record and record.target_identity_confirmed),
         )
         report.flush()
-        return 0 if result.status == RunStatus.SUCCESS else 5
+        return EXIT_OK if result.status == RunStatus.SUCCESS else EXIT_RUN_FAILED
     raise SystemExit(f"Unknown command: {args.command}")
 
 

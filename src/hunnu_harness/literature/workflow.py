@@ -28,7 +28,7 @@ from .downloads import (
     LiteratureDownloadManager,
     UnauthorizedFullTextError,
 )
-from .fetch_ledger import FetchLedgerError
+from .fetch_ledger import FetchBudgetExceeded, FetchLedgerError
 from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
 from .auto_classification import PostAcquisitionClassifier
 from .library import GlobalPaperLibrary
@@ -494,6 +494,20 @@ class LiteratureAcquisitionWorkflow:
                     record.error_status = RunStatus.FULLTEXT_NOT_AUTHORIZED.value
                     record.error_reason = str(exc)
                     status = RunStatus.PARTIAL_SUCCESS
+                except FetchBudgetExceeded as exc:
+                    # A budget refusal is not a download failure: the run goes
+                    # on, but the record carries the ledger's own status so the
+                    # CLI can report -- and exit on -- "budget", not "failed".
+                    record.error_status = exc.status
+                    record.error_reason = str(exc)
+                    errors.append(str(exc))
+                    status = RunStatus.PARTIAL_SUCCESS
+                    self.logger.log(
+                        "fulltext_fetch_refused_by_budget",
+                        status=exc.status,
+                        paper_id=record.paper_id,
+                        reason=str(exc),
+                    )
                 except (
                     InvalidFullTextDownload,
                     LiteratureSourceError,

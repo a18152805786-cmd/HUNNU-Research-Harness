@@ -97,7 +97,7 @@ class LiveJsonModeTests(unittest.TestCase):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = literature_cli.main(["live-cnki", "--title", "x", "--json"])
         payload = json.loads(out.getvalue())
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 4)
         self.assertEqual(payload["Status"], "SOURCE_UNAVAILABLE")
         self.assertIn("HumanNotes", payload)
 
@@ -119,7 +119,7 @@ class LiveJsonModeTests(unittest.TestCase):
         with patch.object(literature_cli, "PlaywrightBrowser", _Unavailable):
             with contextlib.redirect_stdout(out):
                 code = literature_cli.main(["live-cnki", "--title", "x"])
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 4)
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[0], "Status=SOURCE_UNAVAILABLE")
         self.assertTrue(lines[1].startswith("Reason="))
