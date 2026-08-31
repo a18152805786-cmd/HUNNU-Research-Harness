@@ -108,7 +108,8 @@ class LiteratureSourceAdapter(ABC):
     # means the real ledger in the Output Root's audit directory -- there is
     # deliberately no way to construct an adapter whose publisher fetches are
     # unbudgeted.  Tests inject an isolated ledger here; ``allow_refetch`` is
-    # the explicit CLI override for a refused fetch.
+    # the explicit CLI override for the per-identifier repeat check only --
+    # the daily total binds regardless.
     fetch_ledger: FulltextFetchLedger | None = None
     allow_refetch: bool = False
     # Applies only to the bare ledger construction path; an injected

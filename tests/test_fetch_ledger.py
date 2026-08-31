@@ -232,7 +232,39 @@ class BudgetRuleTests(unittest.TestCase):
         with self.assertRaises(FetchBudgetExceeded) as caught:
             ledger.authorize_fetch(source="S", identifier="id-fresh", paper_id="P")
         self.assertEqual(caught.exception.status, STATUS_BUDGET_EXHAUSTED)
-        self.assertIn("AGENTS.md 62", str(caught.exception))
+        self.assertIn("daily ceiling", str(caught.exception))
+
+    def test_allow_refetch_never_bypasses_the_daily_total(self) -> None:
+        """This test failing means --allow-refetch became a general budget bypass.
+
+        The flag exists for exactly one situation: fetching the *same paper*
+        again after the per-identifier repeat check refused it.  The daily
+        total is the account-level budget; the explicit way to raise it is the
+        --daily-limit / HUNNU_HARNESS_DAILY_FETCH_LIMIT knob, never a flag
+        meant for one paper.
+        """
+
+        ledger = _ledger(_tmp(self), global_limit=3)
+        for index in range(3):
+            ledger.authorize_fetch(source="S", identifier=f"id-{index}", paper_id="P")
+        with self.assertRaises(FetchBudgetExceeded) as caught:
+            ledger.authorize_fetch(
+                source="S", identifier="id-fresh", paper_id="P", allow_refetch=True
+            )
+        self.assertEqual(caught.exception.status, STATUS_BUDGET_EXHAUSTED)
+        self.assertNotIn("--allow-refetch", str(caught.exception))
+
+    def test_allow_refetch_cannot_ride_a_repeat_past_the_daily_total(self) -> None:
+        ledger = _ledger(_tmp(self), global_limit=2)
+        for _ in range(PER_IDENTIFIER_DAILY_LIMIT):
+            ledger.authorize_fetch(source="S", identifier="pii:x", paper_id="P1")
+        # Per-identifier and global limits are both exhausted now; the repeat
+        # switch may only answer the former.
+        with self.assertRaises(FetchBudgetExceeded) as caught:
+            ledger.authorize_fetch(
+                source="S", identifier="pii:x", paper_id="P1", allow_refetch=True
+            )
+        self.assertEqual(caught.exception.status, STATUS_BUDGET_EXHAUSTED)
 
     def test_allow_refetch_passes_and_is_recorded_on_the_attempt(self) -> None:
         ledger = _ledger(_tmp(self))

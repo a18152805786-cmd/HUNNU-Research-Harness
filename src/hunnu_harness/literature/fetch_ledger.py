@@ -328,12 +328,15 @@ class FulltextFetchLedger:
                 "Diagnose offline from the first fetched file; pass "
                 "--allow-refetch to explicitly fetch it again.",
             )
-        if len(attempts) >= self.global_limit and not allow_refetch:
+        # ``allow_refetch`` deliberately has no effect here: it exempts only
+        # the per-identifier repeat check above.  Exempting the daily total as
+        # well would turn the one explicit "fetch this paper again" switch
+        # into a general budget bypass.
+        if len(attempts) >= self.global_limit:
             raise FetchBudgetExceeded(
                 STATUS_BUDGET_EXHAUSTED,
                 f"{len(attempts)} publisher fetch attempts already recorded today "
-                f"(daily ceiling {self.global_limit}, AGENTS.md 62). Pass "
-                "--allow-refetch to explicitly continue.",
+                f"(daily ceiling {self.global_limit}).",
             )
         self.append_record(
             record_type="attempt",

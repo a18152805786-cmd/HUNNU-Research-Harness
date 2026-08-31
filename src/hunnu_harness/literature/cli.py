@@ -88,8 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-refetch",
         action="store_true",
         help=(
-            "Explicitly permit a fetch the daily full-text budget would refuse "
-            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+            "Explicitly permit fetching the same paper again after the per-identifier "
+            "repeat check refused it; never lifts the daily total (that is --daily-limit); "
+            "the attempt is still recorded"
         ),
     )
     live.add_argument(
@@ -116,8 +117,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-refetch",
         action="store_true",
         help=(
-            "Explicitly permit a fetch the daily full-text budget would refuse "
-            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+            "Explicitly permit fetching the same paper again after the per-identifier "
+            "repeat check refused it; never lifts the daily total (that is --daily-limit); "
+            "the attempt is still recorded"
         ),
     )
 
@@ -137,8 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-refetch",
         action="store_true",
         help=(
-            "Explicitly permit a fetch the daily full-text budget would refuse "
-            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+            "Explicitly permit fetching the same paper again after the per-identifier "
+            "repeat check refused it; never lifts the daily total (that is --daily-limit); "
+            "the attempt is still recorded"
         ),
     )
 
@@ -161,8 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-refetch",
         action="store_true",
         help=(
-            "Explicitly permit a fetch the daily full-text budget would refuse "
-            "(same paper twice today, or the daily ceiling); the attempt is still recorded"
+            "Explicitly permit fetching the same paper again after the per-identifier "
+            "repeat check refused it; never lifts the daily total (that is --daily-limit); "
+            "the attempt is still recorded"
         ),
     )
 
