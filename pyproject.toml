@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hunnu-research-harness"
-version = "0.2.22"
+version = "0.3.0"
 description = "Human-in-the-loop research automation harness for Hunan Normal University digital resources"
 requires-python = ">=3.11"
 # Exact pins, deliberately: the zip has no lock file, so a range would hand
