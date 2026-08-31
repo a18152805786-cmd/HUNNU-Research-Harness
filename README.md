@@ -1,5 +1,69 @@
 # HUNNU Research Harness v0.2.20
 
+## 给安装 Agent 的指引（拿到 zip 后先读这一节）
+
+这一节写给替用户完成安装的 agent：按顺序执行，每一步都先跑命令、再跑验证、失败走对应分支。全程不需要用户账号密码；遇到密码、验证码、MFA 一律停下来交给用户本人。装完之后，操作契约在 [AGENTS.md](AGENTS.md)——先读完再动手干活。
+
+**第 0 步 · 前提。** 解压 zip 得到 `HUNNU-Research-Harness\` 文件夹，下面所有命令都在这个文件夹里执行（PowerShell）。zip 里没有也不可能有 `.venv`（虚拟环境的路径写死在内部文件里，打包了也是坏的），必须现场重建。
+
+**第 1 步 · Python。**
+
+```powershell
+python --version
+```
+
+验证：版本 ≥ 3.11（开发与测试用 3.12.13）。失败分支：让用户从 python.org 安装 3.11+ 后重来；不要用系统里来路不明的旧 Python 硬装。
+
+**第 2 步 · 建虚拟环境。**
+
+```powershell
+python -m venv .venv
+```
+
+验证：`.venv\Scripts\python.exe` 存在。失败分支：把报错原样报告给用户，停止。
+
+**第 3 步 · 安装（依赖已钉死精确版本）。**
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[browser,dev]"
+```
+
+验证：`.venv\Scripts\python.exe -m pip show pypdf playwright pytest` 显示 pypdf 6.16.1、playwright 1.62.0、pytest 8.4.2。失败分支：网络超时或下载慢时改用镜像重试：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[browser,dev]" -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+**第 4 步 · 输出根（Output Root）。** 所有运行产物写在仓库外的独立目录，默认是同级的 `<文件夹名>-Output\`，首次使用自动创建；也可用环境变量 `HUNNU_HARNESS_OUTPUT_ROOT` 指到别处。验证：
+
+```powershell
+.venv\Scripts\python.exe -c "from hunnu_harness.paths import OUTPUT_ROOT; print(OUTPUT_ROOT)"
+```
+
+失败分支：如果报 `must be outside Core Root`，说明有人把输出根指进了代码文件夹——换个位置；如果报路径过长，把输出根设到更浅的目录（例如 `C:\HUNNU-Output`）。
+
+**第 5 步 · 浏览器。** Harness 自动发现系统 Chrome（也认环境变量 `HUNNU_RESEARCH_CHROME`），找到就不需要下载任何浏览器。验证跳过。只有这台机器确实没装 Chrome 时才走回落分支：安装 Google Chrome，或执行 `.venv\Scripts\python.exe -m playwright install chromium`（约 150MB 下载）。
+
+**第 6 步 · 自检（测试套件）。**
+
+```powershell
+.venv\Scripts\python.exe -m pytest -q
+```
+
+验证：没有 FAILED；出现一批 skipped 是正常的——语料相关测试在空文献库上主动降级，不是坏。失败分支：停下来，把失败测试名和输出原样报告给用户；**不要试图删测试或改护栏让它变绿**（那些测试的名字会告诉你它在守什么）。
+
+**第 7 步 · 冒烟（无网络 dry-run）。**
+
+```powershell
+.venv\Scripts\hunnu-harness.exe agent-route --text "找 数字化转型 的文献" --dry-run
+```
+
+验证：输出 JSON 且 `"DryRun": true`，退出码 0，全程无网络访问。退出码 2 表示请求被判为不可路由（看输出里的原因说明），不是安装问题。
+
+**装完须知。** 真实采集（`live-*`）会用用户自己的学校账号配额：登录由用户本人在专用 Chrome profile 里完成（正常约每天一次），每日取件总量默认 15（`--daily-limit` 或 `HUNNU_HARNESS_DAILY_FETCH_LIMIT` 可调），同一篇一天最多 2 次的循环保护不可调。这些设计的理由都写在 AGENTS.md 里。
+
+---
+
 湖南师范大学数字资源研究自动化 Harness。它把“人工完成学校认证”和“登录后的研究操作”明确分开：Harness 可以识别页面、进入 CNRDS CNFS、选择研究条件、触发合法下载并归档原始文件；它不会输入密码、验证码或 MFA，也不会导出 cookie。
 
 ## 当前能力
