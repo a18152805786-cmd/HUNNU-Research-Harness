@@ -7,11 +7,15 @@ name = "hunnu-research-harness"
 version = "0.2.22"
 description = "Human-in-the-loop research automation harness for Hunan Normal University digital resources"
 requires-python = ">=3.11"
-dependencies = ["pypdf>=5,<7"]
+# Exact pins, deliberately: the zip has no lock file, so a range would hand
+# every installer a different dependency set -- and Playwright's version
+# directly changes selector behavior, download events, and CDP connects.
+# These are the versions the shipped test suite was validated against.
+dependencies = ["pypdf==6.16.1"]
 
 [project.optional-dependencies]
-browser = ["playwright>=1.49"]
-dev = ["pytest>=8"]
+browser = ["playwright==1.62.0"]
+dev = ["pytest==8.4.2"]
 
 [project.scripts]
 hunnu-harness = "hunnu_harness.cli:main"
