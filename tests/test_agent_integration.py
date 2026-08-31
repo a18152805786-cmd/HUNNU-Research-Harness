@@ -173,9 +173,11 @@ class AgentEntrypointAndOutputTests(unittest.TestCase):
         self.assertTrue(is_within(V0216_RUN_ROOT, OUTPUT_ROOT))
         self.assertFalse(is_within(V0216_RUN_ROOT, CORE_ROOT))
 
-    def test_pytest_cache_is_configured_outside_the_core_root(self) -> None:
+    def test_pytest_cacheprovider_is_disabled_to_keep_core_root_cache_free(self) -> None:
         config = (CORE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('cache_dir = "../HUNNU-Research-Harness-Output/temp/pytest-cache"', config)
+        self.assertIn('addopts = ["-p", "no:cacheprovider"]', config)
+        self.assertNotIn("cache_dir", config)
+        self.assertNotIn("HUNNU-Research-Harness-Output", config)
 
     def test_dry_run_writes_sanitized_artifact_only_under_output_root(self) -> None:
         decision = self.router.route(
