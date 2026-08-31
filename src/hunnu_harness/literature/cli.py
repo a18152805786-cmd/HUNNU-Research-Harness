@@ -295,8 +295,8 @@ async def _run_live(args: argparse.Namespace) -> int:
     return 0 if result.status in {RunStatus.SUCCESS, RunStatus.PARTIAL_SUCCESS} else 4
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.command == "plan":
         request = _request_from_args(args)
         payload = {

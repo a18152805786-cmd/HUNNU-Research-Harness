@@ -133,10 +133,87 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    acquire = sub.add_parser(
+        "acquire",
+        help=(
+            "Run one bounded live acquisition against a supported source, in the "
+            "user's own authenticated Research Chrome (spends their quota)"
+        ),
+    )
+    acquire.add_argument(
+        "--source",
+        required=True,
+        choices=("sciencedirect", "springerlink", "cnki", "oxfordacademic"),
+        help="Which publisher adapter to drive",
+    )
+    acquire_selector = acquire.add_mutually_exclusive_group(required=True)
+    acquire_selector.add_argument("--title")
+    acquire_selector.add_argument("--doi")
+    acquire_selector.add_argument("--request-json", type=Path)
+    acquire.add_argument("--run-root", type=Path, default=None)
+    acquire.add_argument("--profile", type=Path, default=None)
+    acquire.add_argument("--chrome", type=Path, default=None)
+    acquire.add_argument("--max-results", type=int, default=None)
+    acquire.add_argument("--max-downloads", type=int, choices=range(0, 2), default=None)
+    acquire.add_argument("--headless", action="store_true")
+    acquire.add_argument(
+        "--daily-limit",
+        type=int,
+        default=None,
+        help=(
+            "Override the daily publisher fetch total (default 15; also "
+            "HUNNU_HARNESS_DAILY_FETCH_LIMIT); this is your account's quota knob"
+        ),
+    )
+    acquire.add_argument(
+        "--allow-refetch",
+        action="store_true",
+        help=(
+            "Explicitly permit fetching the same paper again after the "
+            "per-identifier repeat check refused it; never lifts the daily total"
+        ),
+    )
+    acquire.add_argument(
+        "--human-wait",
+        type=float,
+        default=None,
+        help="Seconds to hold the page for a person to clear a challenge (springerlink only)",
+    )
+
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
     return parser
+
+
+def _acquire_to_literature_argv(args: argparse.Namespace) -> list[str]:
+    """Translate ``acquire --source X`` onto the literature ``live-X`` surface.
+
+    The literature parser stays the single owner of per-source defaults
+    (run roots, result caps); this translation forwards only what the caller
+    actually set, so those defaults keep applying.
+    """
+
+    argv: list[str] = [f"live-{args.source}"]
+    for flag, value in (
+        ("--title", args.title),
+        ("--doi", args.doi),
+        ("--request-json", args.request_json),
+        ("--run-root", args.run_root),
+        ("--profile", args.profile),
+        ("--chrome", args.chrome),
+        ("--max-results", args.max_results),
+        ("--max-downloads", args.max_downloads),
+        ("--daily-limit", args.daily_limit),
+        ("--human-wait", args.human_wait),
+    ):
+        if value is not None:
+            argv.extend([flag, str(value)])
+    if args.headless:
+        argv.append("--headless")
+    if args.allow_refetch:
+        argv.append("--allow-refetch")
+    return argv
 
 
 async def _start(args: argparse.Namespace) -> int:
@@ -227,6 +304,12 @@ def main() -> int:
             print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
         print("SessionRestoreConfigured=true")
         return 0
+    if args.command == "acquire":
+        # The literature module owns the live path end to end (it constructs
+        # its own PlaywrightBrowser; no host MCP client is involved).
+        from .literature.cli import main as literature_main
+
+        return literature_main(_acquire_to_literature_argv(args))
     if args.command == "agent-route":
         from .agent_entrypoint import route_from_cli_args
 
