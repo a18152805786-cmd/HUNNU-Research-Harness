@@ -245,6 +245,8 @@ LIBRARY_TOPICS_JSONL = LIBRARY_CATALOG_DIR / "paper_topics.jsonl"
 LIBRARY_TOPICS_CSV = LIBRARY_CATALOG_DIR / "paper_topics.csv"
 PAPERS_BY_TOPIC_DIR = OUTPUT_ROOT / "papers_by_topic"
 TOPIC_TAXONOMY_JSON = OUTPUT_ROOT / "topic_taxonomy.json"
+NAVIGATOR_LEXICON_JSON = OUTPUT_ROOT / "navigator_lexicon.json"
+TAXONOMY_ALIASES_JSON = OUTPUT_ROOT / "taxonomy_aliases.json"
 
 # Paper Research Navigator derived data.  Everything below this root is
 # rebuildable from the catalog and the managed full texts; deleting it must

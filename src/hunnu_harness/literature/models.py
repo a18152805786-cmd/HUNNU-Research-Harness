@@ -217,17 +217,21 @@ class LiteratureSearchRequest:
         now_year = current_year or datetime.now().year
         lowered = text.casefold()
 
-        known_en = (
-            "ai washing",
-            "artificial intelligence washing",
-            "audit monitoring",
-            "auditor monitoring",
-            "earnings management",
-            "discretionary accruals",
+        # Dependency direction: models -> navigator.lexicon -> navigator.tokenize;
+        # the lexicon does not import literature modules.
+        from ..navigator.lexicon import _is_latin_term, match_concepts
+
+        matches = match_concepts(text)
+        keywords_en = tuple(
+            dict.fromkeys(
+                match.matched_term for match in matches if _is_latin_term(match.matched_term)
+            )
         )
-        known_cn = ("人工智能漂洗", "ai漂洗", "审计监督", "审计", "盈余管理", "应计")
-        keywords_en = tuple(term for term in known_en if term in lowered)
-        keywords_cn = tuple(term for term in known_cn if term.casefold() in lowered)
+        keywords_cn = tuple(
+            dict.fromkeys(
+                match.matched_term for match in matches if not _is_latin_term(match.matched_term)
+            )
+        )
 
         dois = tuple(
             match.rstrip(".,;，。；)]}")

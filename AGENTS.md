@@ -16,7 +16,7 @@
 14. Default authorized downloads go to the separate Harness Output Root.
 15. Default manifests go to the separate Harness Output Root.
 16. Runtime logs, screenshots, staging files, review packages, runs, audit files, and temporary artifacts remain inside the Harness Output Root.
-17. Formal thesis datasets may be exported to D:\BaiduNetdiskDownload\论文数据 only when explicitly requested.
+17. Formal thesis datasets may be exported to the formal thesis data directory explicitly specified by the user only when explicitly requested.
 18. Never place test, smoke-test, or runtime files in the thesis data directory.
 
 ## Browser control surface
@@ -104,7 +104,7 @@ This section defines **how** an Agent calls Harness after global routing has sel
 
 ## Paper Research Navigator (retrieval layer v0.1)
 
-64. To find literature the Harness may already hold, query the Navigator before anything else: `paper-search`, `paper-lookup`, `paper-fulltext`, `paper-related`, `paper-pack`, `paper-gaps`, `paper-verify-citation` on the `hunnu-harness` CLI, or `hunnu_harness.navigator.PaperNavigator` in process. Do not glob the disk, search `Desktop`/`Downloads`/`D:\BaiduNetdiskDownload`/Obsidian history, or guess a paper path. The full contract is `docs/PAPER_RESEARCH_NAVIGATOR.md`.
+64. To find literature the Harness may already hold, query the Navigator before anything else: `paper-search`, `paper-lookup`, `paper-fulltext`, `paper-related`, `paper-pack`, `paper-gaps`, `paper-verify-citation` on the `hunnu-harness` CLI, or `hunnu_harness.navigator.PaperNavigator` in process. Do not glob the disk, search `Desktop`/`Downloads`/a personal cloud or thesis archive directory/Obsidian history, or guess a paper path. The full contract is `docs/PAPER_RESEARCH_NAVIGATOR.md`.
 
 65. Retrieval is WORK-first. A `paper_id` is the logical identity; the 192 physical files are versions of the 179 works and must never be treated as separate papers. Open only the path the Navigator returns in `preferred_version.absolute_path`; never construct a path from a `paper_id`, because three managed files carry a historical name that differs from the `paper_id` of the work that owns them.
 

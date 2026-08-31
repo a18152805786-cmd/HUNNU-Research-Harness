@@ -52,7 +52,7 @@ cd <Harness 根目录>
 
 正式论文研究数据与既有非-Harness归档仍保存在：
 
-`D:\BaiduNetdiskDownload\论文数据\`
+`你自己指定的正式研究资料目录`
 
 Harness 运行产物默认保存在项目内部：
 
@@ -64,7 +64,7 @@ Harness 运行产物默认保存在项目内部：
 - 截图、审计、审查包和临时文件：输出根下的 `screenshots\`、`audit\`、`review\` 与 `temp\`
 - 长期个人论文库：输出根下的 `library\papers\`、`library\notes\`、`library\catalog\` 与 `library\import_staging\`
 
-只有明确批准的正式论文研究数据才导出到 `D:\BaiduNetdiskDownload\论文数据\`；测试、smoke test 和 Harness 运行产物不得写入论文数据目录。
+只有明确批准的正式研究数据才导出到你自己指定的正式研究资料目录；测试、smoke test 和 Harness 运行产物不得写入正式研究资料目录。
 
 Codex MCP（安装/配置一次即可）：
 

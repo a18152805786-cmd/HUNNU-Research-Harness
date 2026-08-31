@@ -20,6 +20,10 @@ hunnu-harness-agent = "hunnu_harness.agent_entrypoint:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"hunnu_harness.navigator" = ["lexicon.default.json"]
+"hunnu_harness.literature" = ["taxonomy_aliases.default.json"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

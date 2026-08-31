@@ -1,0 +1,192 @@
+{
+  "aliases": {
+    "数字化转型": ["digital transformation", "digitalization", "digitalisation"],
+    "AI漂洗": ["ai washing", "aiwashing", "artificial intelligence washing"],
+    "人工智能与机器人": [
+      "artificial intelligence",
+      "machine learning",
+      "robot",
+      "robots",
+      "robotics",
+      "generative ai",
+      "large language model",
+      "large language models"
+    ],
+    "数字经济": ["digital economy", "platform economy"],
+    "生产率与资源配置": [
+      "productivity",
+      "total factor productivity",
+      "resource allocation",
+      "resource misallocation"
+    ],
+    "技术进步与产业升级": [
+      "technological progress",
+      "technological change",
+      "industrial upgrading"
+    ],
+    "企业创新": ["innovation", "corporate innovation", "firm innovation", "enterprise innovation"],
+    "企业投资与现金持有": [
+      "corporate investment",
+      "firm investment",
+      "cash holdings",
+      "cash holding",
+      "investment efficiency",
+      "overinvestment",
+      "over investment",
+      "underinvestment",
+      "under investment"
+    ],
+    "融资约束与资本配置": [
+      "financing constraints",
+      "financing constraint",
+      "financial constraints",
+      "financial constraint",
+      "capital allocation"
+    ],
+    "债务与资本成本": ["cost of debt", "cost of capital", "debt financing", "corporate debt", "leverage"],
+    "信息披露": ["disclosure", "information disclosure", "voluntary disclosure", "corporate disclosure"],
+    "盈余质量与财务报告": [
+      "earnings quality",
+      "earnings management",
+      "financial reporting",
+      "accrual quality",
+      "accruals"
+    ],
+    "审计与内部控制": [
+      "audit",
+      "auditing",
+      "auditor",
+      "auditors",
+      "audit quality",
+      "audit fees",
+      "internal control",
+      "internal controls"
+    ],
+    "股价与市场波动": [
+      "stock price",
+      "stock prices",
+      "stock return",
+      "stock returns",
+      "market volatility",
+      "stock price crash",
+      "crash risk"
+    ],
+    "分析师与资本市场": [
+      "analyst",
+      "analysts",
+      "analyst coverage",
+      "analyst forecasts",
+      "capital market",
+      "capital markets"
+    ],
+    "卖空与市场机制": ["short selling", "short sale", "short sales", "short sellers", "margin trading"],
+    "公司治理与代理成本": [
+      "corporate governance",
+      "agency cost",
+      "agency costs",
+      "agency problem",
+      "agency problems"
+    ],
+    "高管激励与管理者行为": [
+      "executive compensation",
+      "executive incentives",
+      "managerial incentives",
+      "managerial behavior",
+      "managerial behaviour",
+      "ceo",
+      "ceos"
+    ],
+    "股权与所有制": [
+      "ownership structure",
+      "state ownership",
+      "ownership concentration",
+      "state owned enterprise",
+      "state owned enterprises"
+    ],
+    "风险承担与不确定性": [
+      "risk taking",
+      "uncertainty",
+      "economic policy uncertainty",
+      "corporate risk taking"
+    ],
+    "企业与组织韧性": [
+      "organizational resilience",
+      "organisational resilience",
+      "corporate resilience",
+      "firm resilience",
+      "resilience"
+    ],
+    "供应链韧性": ["supply chain resilience"],
+    "全球价值链与国际化": [
+      "global value chain",
+      "global value chains",
+      "internationalization",
+      "internationalisation",
+      "export",
+      "exports"
+    ],
+    "供应链与产业链": ["supply chain", "supply chains", "industrial chain", "supplier network"],
+    "环境规制与污染治理": [
+      "environmental regulation",
+      "environmental regulations",
+      "pollution",
+      "pollution control",
+      "environmental governance"
+    ],
+    "绿色金融与绿色创新": ["green finance", "green innovation", "green credit", "green bonds"],
+    "ESG与社会责任": ["corporate social responsibility", "csr", "social responsibility"],
+    "劳动市场与就业": [
+      "labor market",
+      "labor markets",
+      "labour market",
+      "labour markets",
+      "employment",
+      "unemployment",
+      "jobs"
+    ],
+    "工资与收入分配": [
+      "wage",
+      "wages",
+      "income distribution",
+      "income inequality",
+      "wage inequality",
+      "pay gap"
+    ],
+    "人力资本": ["human capital"],
+    "产业政策与结构": ["industrial policy", "industrial policies", "industrial structure"],
+    "区域经济与城市发展": [
+      "regional economy",
+      "regional development",
+      "urban development",
+      "urban economics"
+    ],
+    "高质量发展": ["high quality development"],
+    "金融风险与信用": ["financial risk", "financial risks", "credit risk", "systemic risk", "default risk"],
+    "银行信贷与金融发展": [
+      "bank credit",
+      "bank loan",
+      "bank loans",
+      "bank lending",
+      "bank financing",
+      "financial development"
+    ],
+    "金融错配与资源配置": [
+      "financial misallocation",
+      "financial mismatch",
+      "capital misallocation",
+      "credit misallocation"
+    ],
+    "宏观经济与人口": [
+      "macroeconomic",
+      "macroeconomics",
+      "macroeconomy",
+      "business cycle",
+      "business cycles",
+      "population aging",
+      "population ageing",
+      "demographic change"
+    ],
+    "计量方法与研究设计": ["econometric", "econometrics", "research design"],
+    "综合经济与管理": []
+  }
+}
