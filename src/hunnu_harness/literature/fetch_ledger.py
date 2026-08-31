@@ -44,7 +44,9 @@ happened.
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +66,12 @@ FETCH_LEDGER_PATH = AUDIT_DIR / "fulltext_fetch_ledger.jsonl"
 PER_IDENTIFIER_DAILY_LIMIT = 2
 GLOBAL_DAILY_LIMIT = 15
 DAILY_FETCH_LIMIT_ENV = "HUNNU_HARNESS_DAILY_FETCH_LIMIT"
+MIN_FETCH_INTERVAL_SECONDS = 15.0
+MIN_FETCH_INTERVAL_ENV = "HUNNU_HARNESS_FETCH_MIN_INTERVAL_SECONDS"
+BURST_WINDOW_SECONDS = 600.0
+BURST_WINDOW_ENV = "HUNNU_HARNESS_FETCH_BURST_WINDOW_SECONDS"
+BURST_WINDOW_LIMIT = 12
+BURST_LIMIT_ENV = "HUNNU_HARNESS_FETCH_BURST_LIMIT"
 
 
 def _resolve_global_limit(explicit: int | None) -> int:
@@ -85,6 +93,68 @@ def _resolve_global_limit(explicit: int | None) -> int:
         raise ValueError(
             f"{DAILY_FETCH_LIMIT_ENV} must be an integer >= 1; got {raw!r}. "
             "Unset it or set it to a positive integer."
+        )
+    return resolved
+
+
+def _resolve_float_setting(
+    explicit: float | None,
+    *,
+    env_name: str,
+    default: float,
+    minimum: float,
+    inclusive: bool,
+) -> float:
+    """Resolve one finite float from an explicit value, env, or default."""
+
+    raw: Any
+    if explicit is not None:
+        raw = explicit
+    else:
+        raw = os.environ.get(env_name)
+        if raw is None:
+            return default
+    try:
+        resolved = float(raw)
+    except (TypeError, ValueError) as exc:
+        comparator = ">=" if inclusive else ">"
+        raise ValueError(
+            f"{env_name} must be a finite float {comparator} {minimum}; got {raw!r}."
+        ) from exc
+    valid = math.isfinite(resolved) and (
+        resolved >= minimum if inclusive else resolved > minimum
+    )
+    if not valid:
+        comparator = ">=" if inclusive else ">"
+        raise ValueError(
+            f"{env_name} must be a finite float {comparator} {minimum}; got {raw!r}."
+        )
+    return resolved
+
+
+def _resolve_burst_limit(explicit: int | None) -> int:
+    """Resolve the burst ceiling from an explicit value, env, or default."""
+
+    raw: Any
+    if explicit is not None:
+        raw = explicit
+    else:
+        raw = os.environ.get(BURST_LIMIT_ENV)
+        if raw is None:
+            return BURST_WINDOW_LIMIT
+    try:
+        # Unlike the environment, an explicit setting is type-annotated as an
+        # int; reject lossy float coercions instead of silently truncating.
+        if isinstance(raw, float) and not raw.is_integer():
+            raise ValueError
+        resolved = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{BURST_LIMIT_ENV} must be an integer >= 1; got {raw!r}."
+        ) from exc
+    if resolved < 1:
+        raise ValueError(
+            f"{BURST_LIMIT_ENV} must be an integer >= 1; got {raw!r}."
         )
     return resolved
 
@@ -183,6 +253,10 @@ class FulltextFetchLedger:
         now: Callable[[], datetime] | None = None,
         per_identifier_limit: int = PER_IDENTIFIER_DAILY_LIMIT,
         global_limit: int | None = None,
+        min_interval_seconds: float | None = None,
+        burst_window_seconds: float | None = None,
+        burst_limit: int | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.path = require_output_path(
             Path(path or FETCH_LEDGER_PATH), label="Full-text fetch ledger"
@@ -190,6 +264,22 @@ class FulltextFetchLedger:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.per_identifier_limit = per_identifier_limit
         self.global_limit = _resolve_global_limit(global_limit)
+        self.min_interval_seconds = _resolve_float_setting(
+            min_interval_seconds,
+            env_name=MIN_FETCH_INTERVAL_ENV,
+            default=MIN_FETCH_INTERVAL_SECONDS,
+            minimum=0.0,
+            inclusive=True,
+        )
+        self.burst_window_seconds = _resolve_float_setting(
+            burst_window_seconds,
+            env_name=BURST_WINDOW_ENV,
+            default=BURST_WINDOW_SECONDS,
+            minimum=0.0,
+            inclusive=False,
+        )
+        self.burst_limit = _resolve_burst_limit(burst_limit)
+        self._sleeper = sleeper if sleeper is not None else time.sleep
 
     # -- reading -----------------------------------------------------------
 
@@ -255,6 +345,47 @@ class FulltextFetchLedger:
             ):
                 last = item
         return last
+
+    def _pace(self, attempts: list[dict[str, Any]]) -> None:
+        """Wait for the minimum interval and sliding burst window, if needed."""
+
+        now = self._now().astimezone(timezone.utc)
+        timestamps: list[datetime] = []
+        for item in attempts:
+            raw_timestamp = str(item.get("timestamp", "")).strip()
+            try:
+                timestamp = datetime.fromisoformat(raw_timestamp)
+            except (TypeError, ValueError) as exc:
+                raise FetchLedgerError(
+                    f"fetch ledger attempt has an invalid ISO timestamp: {raw_timestamp!r}"
+                ) from exc
+            if timestamp.tzinfo is None:
+                raise FetchLedgerError(
+                    f"fetch ledger attempt timestamp has no timezone: {raw_timestamp!r}"
+                )
+            timestamps.append(timestamp.astimezone(timezone.utc))
+        timestamps.sort()
+
+        wait1 = 0.0
+        if self.min_interval_seconds > 0 and timestamps:
+            wait1 = self.min_interval_seconds - (now - timestamps[-1]).total_seconds()
+
+        wait2 = 0.0
+        window_timestamps = [
+            timestamp
+            for timestamp in timestamps
+            if (now - timestamp).total_seconds() < self.burst_window_seconds
+        ]
+        if len(window_timestamps) >= self.burst_limit:
+            # ``[-burst_limit]`` is the oldest timestamp among the most recent
+            # burst_limit attempts; once it leaves the window, only
+            # burst_limit - 1 of those recent attempts remain.
+            threshold = window_timestamps[-self.burst_limit]
+            wait2 = self.burst_window_seconds - (now - threshold).total_seconds()
+
+        wait = max(0.0, wait1, wait2)
+        if wait > 0:
+            self._sleeper(wait)
 
     # -- writing -----------------------------------------------------------
 
@@ -338,6 +469,14 @@ class FulltextFetchLedger:
                 f"{len(attempts)} publisher fetch attempts already recorded today "
                 f"(daily ceiling {self.global_limit}).",
             )
+        # Reject first, so a request that is already over quota is not made to
+        # wait.  Pace next, then put the attempt on the ledger before the
+        # caller is permitted to issue the fetch action.
+        # Pacing intentionally considers only today's UTC attempts; crossing
+        # midnight clears both controls.  The injected sleeper is synchronous,
+        # so the default time.sleep blocks an async CLI event loop; this Harness
+        # has one serial workflow, making that trade-off acceptable.
+        self._pace(attempts)
         self.append_record(
             record_type="attempt",
             source=source,
@@ -382,6 +521,9 @@ class FulltextFetchLedger:
             "LedgerDateUTC": self._today(),
             "PerIdentifierDailyLimit": self.per_identifier_limit,
             "GlobalDailyLimit": self.global_limit,
+            "MinIntervalSeconds": self.min_interval_seconds,
+            "BurstWindowSeconds": self.burst_window_seconds,
+            "BurstLimit": self.burst_limit,
             "AttemptsToday": len(attempts),
             "RemainingGlobalBudget": max(self.global_limit - len(attempts), 0),
             "Identifiers": sorted(
@@ -392,9 +534,15 @@ class FulltextFetchLedger:
 
 
 __all__ = [
+    "BURST_LIMIT_ENV",
+    "BURST_WINDOW_ENV",
+    "BURST_WINDOW_LIMIT",
+    "BURST_WINDOW_SECONDS",
     "DAILY_FETCH_LIMIT_ENV",
     "FETCH_LEDGER_PATH",
     "GLOBAL_DAILY_LIMIT",
+    "MIN_FETCH_INTERVAL_ENV",
+    "MIN_FETCH_INTERVAL_SECONDS",
     "PER_IDENTIFIER_DAILY_LIMIT",
     "STATUS_ATTEMPT_LIMIT_REACHED",
     "STATUS_BUDGET_EXHAUSTED",

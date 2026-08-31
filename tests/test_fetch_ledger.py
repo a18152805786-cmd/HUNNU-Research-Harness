@@ -28,9 +28,15 @@ from hunnu_harness.literature import fetch_ledger as fetch_ledger_module
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.cli import build_parser as build_literature_parser
 from hunnu_harness.literature.fetch_ledger import (
+    BURST_LIMIT_ENV,
+    BURST_WINDOW_ENV,
+    BURST_WINDOW_LIMIT,
+    BURST_WINDOW_SECONDS,
     DAILY_FETCH_LIMIT_ENV,
     FETCH_LEDGER_PATH,
     GLOBAL_DAILY_LIMIT,
+    MIN_FETCH_INTERVAL_ENV,
+    MIN_FETCH_INTERVAL_SECONDS,
     PER_IDENTIFIER_DAILY_LIMIT,
     STATUS_ATTEMPT_LIMIT_REACHED,
     STATUS_BUDGET_EXHAUSTED,
@@ -61,6 +67,9 @@ ARTICLE_URL = f"https://www.sciencedirect.com/science/article/pii/{PII}"
 
 
 def _ledger(root: Path, **kwargs) -> FulltextFetchLedger:
+    # The production default is time.sleep; tests must never spend real time
+    # exercising a publisher pacing policy.
+    kwargs.setdefault("sleeper", lambda _seconds: None)
     return FulltextFetchLedger(path=Path(root) / "fetch_ledger.jsonl", **kwargs)
 
 
@@ -305,6 +314,159 @@ class BudgetRuleTests(unittest.TestCase):
             ledger.authorize_fetch(source="S", identifier="pii:x", paper_id="P1")
         moments.append(moments[-1] + timedelta(hours=1))  # next UTC day
         ledger.authorize_fetch(source="S", identifier="pii:x", paper_id="P1")
+
+
+class PacingTests(unittest.TestCase):
+    def test_two_consecutive_authorizes_wait_for_the_remaining_interval(self) -> None:
+        start = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [start]
+        sleeps: list[float] = []
+
+        def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += timedelta(seconds=seconds)
+
+        ledger = _ledger(
+            _tmp(self),
+            now=lambda: clock[0],
+            min_interval_seconds=15.0,
+            burst_window_seconds=600.0,
+            burst_limit=12,
+            sleeper=sleeper,
+        )
+        ledger.authorize_fetch(source="S", identifier="id-1", paper_id="P")
+        clock[0] += timedelta(seconds=4)
+        ledger.authorize_fetch(source="S", identifier="id-1", paper_id="P")
+
+        self.assertEqual(sleeps, [11.0])
+        attempts = [
+            item for item in ledger.read_records() if item["record_type"] == "attempt"
+        ]
+        first = datetime.fromisoformat(attempts[0]["timestamp"])
+        second = datetime.fromisoformat(attempts[1]["timestamp"])
+        self.assertEqual((second - first).total_seconds(), 15.0)
+
+    def test_interval_that_is_already_satisfied_does_not_sleep(self) -> None:
+        start = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [start]
+        sleeps: list[float] = []
+        ledger = _ledger(
+            _tmp(self),
+            now=lambda: clock[0],
+            min_interval_seconds=15.0,
+            sleeper=sleeps.append,
+        )
+        ledger.authorize_fetch(source="S", identifier="id-1", paper_id="P")
+        clock[0] += timedelta(seconds=15)
+        ledger.authorize_fetch(source="S", identifier="id-1", paper_id="P")
+
+        self.assertEqual(sleeps, [])
+
+    def test_zero_minimum_interval_never_sleeps_for_interval_control(self) -> None:
+        clock = [datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)]
+        sleeps: list[float] = []
+        ledger = _ledger(
+            _tmp(self),
+            now=lambda: clock[0],
+            min_interval_seconds=0.0,
+            sleeper=sleeps.append,
+        )
+        ledger.authorize_fetch(source="S", identifier="id-1", paper_id="P")
+        ledger.authorize_fetch(source="S", identifier="id-1", paper_id="P")
+
+        self.assertEqual(sleeps, [])
+
+    def test_burst_limit_waits_until_the_oldest_recent_attempt_exits(self) -> None:
+        start = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [start]
+        sleeps: list[float] = []
+
+        def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += timedelta(seconds=seconds)
+
+        ledger = _ledger(
+            _tmp(self),
+            now=lambda: clock[0],
+            min_interval_seconds=0.0,
+            burst_window_seconds=10.0,
+            burst_limit=3,
+            sleeper=sleeper,
+        )
+        for index in range(3):
+            ledger.authorize_fetch(source="S", identifier=f"id-{index}", paper_id="P")
+            if index < 2:
+                clock[0] += timedelta(seconds=2)
+        clock[0] += timedelta(seconds=1)
+
+        ledger.authorize_fetch(source="S", identifier="id-3", paper_id="P")
+
+        self.assertEqual(sleeps, [5.0])
+        self.assertEqual(clock[0], start + timedelta(seconds=10))
+
+    def test_environment_pacing_settings_are_used_individually(self) -> None:
+        settings = (
+            (MIN_FETCH_INTERVAL_ENV, "2.5", "min_interval_seconds", 2.5),
+            (BURST_WINDOW_ENV, "30.0", "burst_window_seconds", 30.0),
+            (BURST_LIMIT_ENV, "4", "burst_limit", 4),
+        )
+        all_names = (MIN_FETCH_INTERVAL_ENV, BURST_WINDOW_ENV, BURST_LIMIT_ENV)
+        for env_name, value, attribute, expected in settings:
+            with self.subTest(env_name=env_name), patch.dict(os.environ, {}, clear=False):
+                for name in all_names:
+                    os.environ.pop(name, None)
+                os.environ[env_name] = value
+                ledger = _ledger(_tmp(self))
+            self.assertEqual(getattr(ledger, attribute), expected)
+
+    def test_explicit_pacing_settings_override_the_environment(self) -> None:
+        values = {
+            MIN_FETCH_INTERVAL_ENV: "bad",
+            BURST_WINDOW_ENV: "0",
+            BURST_LIMIT_ENV: "not-an-integer",
+        }
+        with patch.dict(os.environ, values):
+            ledger = _ledger(
+                _tmp(self),
+                min_interval_seconds=1.5,
+                burst_window_seconds=20.0,
+                burst_limit=4,
+            )
+        self.assertEqual(ledger.min_interval_seconds, 1.5)
+        self.assertEqual(ledger.burst_window_seconds, 20.0)
+        self.assertEqual(ledger.burst_limit, 4)
+
+    def test_invalid_environment_pacing_settings_fail_closed(self) -> None:
+        invalid = (
+            (MIN_FETCH_INTERVAL_ENV, ("not-a-float", "-1", "nan", "inf")),
+            (BURST_WINDOW_ENV, ("not-a-float", "0", "-1", "nan", "inf")),
+            (BURST_LIMIT_ENV, ("not-an-integer", "0", "-3", "1.5")),
+        )
+        all_names = (MIN_FETCH_INTERVAL_ENV, BURST_WINDOW_ENV, BURST_LIMIT_ENV)
+        for env_name, values in invalid:
+            for value in values:
+                with self.subTest(env_name=env_name, value=value), patch.dict(
+                    os.environ, {}, clear=False
+                ):
+                    for name in all_names:
+                        os.environ.pop(name, None)
+                    os.environ[env_name] = value
+                    with self.assertRaisesRegex(ValueError, env_name):
+                        _ledger(_tmp(self))
+
+    def test_usage_report_includes_pacing_settings(self) -> None:
+        ledger = _ledger(
+            _tmp(self),
+            min_interval_seconds=2.5,
+            burst_window_seconds=30.0,
+            burst_limit=4,
+        )
+
+        usage = ledger.usage_today()
+
+        self.assertEqual(usage["MinIntervalSeconds"], 2.5)
+        self.assertEqual(usage["BurstWindowSeconds"], 30.0)
+        self.assertEqual(usage["BurstLimit"], 4)
 
 
 class LedgerIntegrityTests(unittest.TestCase):
