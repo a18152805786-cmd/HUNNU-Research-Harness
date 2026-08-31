@@ -145,6 +145,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    sub.add_parser(
+        "capabilities",
+        help="What this build supports: sources, knobs, exit-code ladder (JSON, no probing)",
+    )
+    sub.add_parser(
+        "doctor",
+        help="Is this machine ready: Python, Playwright, Chrome, Output Root, budget (JSON, no network)",
+    )
+
     acquire = sub.add_parser(
         "acquire",
         help=(
@@ -331,6 +340,17 @@ def main(argv: list[str] | None = None) -> int:
         report.put("SessionRestoreConfigured", True, plain="true")
         report.flush()
         return 0
+    if args.command == "capabilities":
+        from .diagnostics import build_capabilities
+
+        print(json.dumps(build_capabilities(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "doctor":
+        from .diagnostics import build_doctor
+
+        payload, exit_code = build_doctor()
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return exit_code
     if args.command == "acquire":
         # The literature module owns the live path end to end (it constructs
         # its own PlaywrightBrowser; no host MCP client is involved).
