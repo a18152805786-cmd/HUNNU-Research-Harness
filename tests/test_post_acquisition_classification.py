@@ -637,7 +637,7 @@ class SecondaryHardeningTests(unittest.TestCase):
             fixture.add_work("SA", "AI漂洗与企业绩效", keywords="AI漂洗")
             result = fixture.classifier().classify_work("SA")
             self.assertTrue(result.is_classified)
-            self.assertEqual(result.primary_topic, "01_人工智能与数字经济\AI漂洗")
+            self.assertEqual(result.primary_topic, "01_人工智能与数字经济\\AI漂洗")
             self.assertIn(SIGNAL_TAXONOMY_NAME, result.assigned_topics[0].signals)
 
     def test_strongly_corroborated_secondary_is_auto_assigned(self) -> None:
@@ -799,7 +799,7 @@ class NavigatorReadinessTests(unittest.TestCase):
             self.assertIsInstance(readiness, NavigatorReadiness)
             self.assertIn(
                 readiness.fulltext_index_status,
-                {"FRESH", "STALE", "A\ENT", "UNREADABLE", "unknown"},
+                {"FRESH", "STALE", "ABSENT", "UNREADABLE", "unknown"},
             )
 
 

@@ -149,6 +149,29 @@ def _emit(payload: Any) -> None:
     emit_utf8(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _library_unavailable_payload(exc: Exception) -> dict[str, Any]:
+    """Explain the empty state instead of leaving an agent to guess.
+
+    On a fresh install there is no Global Paper Library at all, and the first
+    thing anyone runs into is this handler.  "Unavailable" alone reads as
+    breakage; the note says what is actually true -- nothing has been acquired
+    yet -- and what fills the library.
+    """
+
+    return {
+        "status": "LIBRARY_UNAVAILABLE",
+        "reason": str(exc),
+        "empty_library_note": (
+            "A fresh install starts with no Global Paper Library -- this state "
+            "is expected, not broken. The library fills as the acquisition "
+            "pipeline archives validated full texts (hunnu-harness acquire / "
+            "the live-* commands), or as individual PDFs pass library-stage + "
+            "library-import. Once at least one work is archived, every "
+            "paper-* command answers normally."
+        ),
+    }
+
+
 def _navigator():
     from .search import PaperNavigator
 
@@ -226,7 +249,7 @@ def run_navigator_command(args: argparse.Namespace) -> int:
             return EXIT_NOT_FOUND
 
     except LibraryUnavailable as exc:
-        _emit({"status": "LIBRARY_UNAVAILABLE", "reason": str(exc)})
+        _emit(_library_unavailable_payload(exc))
         return EXIT_LIBRARY_UNAVAILABLE
 
     raise SystemExit(f"Unknown Navigator command: {command}")
@@ -240,7 +263,7 @@ def _run_index(args: argparse.Namespace) -> int:
     try:
         snapshot = CatalogReader().load()
     except LibraryUnavailable as exc:
-        _emit({"status": "LIBRARY_UNAVAILABLE", "reason": str(exc)})
+        _emit(_library_unavailable_payload(exc))
         return EXIT_LIBRARY_UNAVAILABLE
 
     extractor = (
@@ -286,7 +309,7 @@ def _run_fingerprint(args: argparse.Namespace) -> int:
     try:
         current = LibraryFingerprinter().capture()
     except LibraryUnavailable as exc:
-        _emit({"status": "LIBRARY_UNAVAILABLE", "reason": str(exc)})
+        _emit(_library_unavailable_payload(exc))
         return EXIT_LIBRARY_UNAVAILABLE
 
     if args.output:
