@@ -111,6 +111,9 @@ class LiteratureSourceAdapter(ABC):
     # the explicit CLI override for a refused fetch.
     fetch_ledger: FulltextFetchLedger | None = None
     allow_refetch: bool = False
+    # Applies only to the bare ledger construction path; an injected
+    # ``fetch_ledger`` always takes precedence.
+    daily_fetch_limit: int | None = None
 
     def __init__(self, browser: BrowserCommandPort | Any | None):
         # ``None`` remains valid for parser-only/finalizer construction.  Any
@@ -200,7 +203,7 @@ class LiteratureSourceAdapter(ABC):
         cannot be budgeted at all; both fail the download, never bypass it.
         """
 
-        ledger = self.fetch_ledger or FulltextFetchLedger()
+        ledger = self.fetch_ledger or FulltextFetchLedger(global_limit=self.daily_fetch_limit)
         return ledger.authorize_fetch(
             source=self.name,
             identifier=ledger_identifier(record, prefer=identifier),

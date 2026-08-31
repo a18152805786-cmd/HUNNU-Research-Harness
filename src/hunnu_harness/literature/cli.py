@@ -63,6 +63,10 @@ def _request_from_args(args: argparse.Namespace) -> LiteratureSearchRequest:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m hunnu_harness.literature")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    daily_limit_help = (
+        "Override the daily publisher fetch total (default 15; also configurable "
+        "with HUNNU_HARNESS_DAILY_FETCH_LIMIT); this is your account's quota knob"
+    )
 
     plan = subparsers.add_parser("plan", help="Parse a natural-language request and print bounded queries")
     plan.add_argument("--text", required=True)
@@ -79,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--max-results", type=int, default=5)
     live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     live.add_argument("--headless", action="store_true")
+    live.add_argument("--daily-limit", type=int, default=None, help=daily_limit_help)
     live.add_argument(
         "--allow-refetch",
         action="store_true",
@@ -106,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     springer_live.add_argument("--max-results", type=int, default=5)
     springer_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     springer_live.add_argument("--headless", action="store_true")
+    springer_live.add_argument("--daily-limit", type=int, default=None, help=daily_limit_help)
     springer_live.add_argument(
         "--allow-refetch",
         action="store_true",
@@ -126,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     cnki_live.add_argument("--max-results", type=int, default=3)
     cnki_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     cnki_live.add_argument("--headless", action="store_true")
+    cnki_live.add_argument("--daily-limit", type=int, default=None, help=daily_limit_help)
     cnki_live.add_argument(
         "--allow-refetch",
         action="store_true",
@@ -149,6 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     oxford_live.add_argument("--max-results", type=int, default=1)
     oxford_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     oxford_live.add_argument("--headless", action="store_true")
+    oxford_live.add_argument("--daily-limit", type=int, default=None, help=daily_limit_help)
     oxford_live.add_argument(
         "--allow-refetch",
         action="store_true",
@@ -223,6 +231,7 @@ async def _run_live(args: argparse.Namespace) -> int:
         # The write-ahead fetch budget refuses a repeat by default; the flag is
         # the explicit, per-run override and is recorded on the attempt row.
         adapter.allow_refetch = bool(getattr(args, "allow_refetch", False))
+        adapter.daily_fetch_limit = getattr(args, "daily_limit", None)
         resolver = None
         trigger = None
         if args.command == "live-springerlink":

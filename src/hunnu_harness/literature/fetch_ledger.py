@@ -44,6 +44,7 @@ happened.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,10 +58,35 @@ FETCH_LEDGER_PATH = AUDIT_DIR / "fulltext_fetch_ledger.jsonl"
 
 # Two attempts per identifier per day: the second is a genuine transient
 # retry, a third is debugging against a live publisher.  The global ceiling
-# reuses AGENTS.md 62's single-batch limit of 25 rather than inventing a
-# second number.
+# is a soft gate sized for a normal day (15 by default) and can be adjusted
+# with the environment knob; AGENTS.md 62's single-batch limit of 25 in
+# batching.py is a separate constraint.
 PER_IDENTIFIER_DAILY_LIMIT = 2
-GLOBAL_DAILY_LIMIT = 25
+GLOBAL_DAILY_LIMIT = 15
+DAILY_FETCH_LIMIT_ENV = "HUNNU_HARNESS_DAILY_FETCH_LIMIT"
+
+
+def _resolve_global_limit(explicit: int | None) -> int:
+    """Resolve the daily total from an explicit value, env, or the default."""
+
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(DAILY_FETCH_LIMIT_ENV)
+    if raw is None:
+        return GLOBAL_DAILY_LIMIT
+    try:
+        resolved = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{DAILY_FETCH_LIMIT_ENV} must be an integer >= 1; got {raw!r}. "
+            "Unset it or set it to a positive integer."
+        ) from exc
+    if resolved < 1:
+        raise ValueError(
+            f"{DAILY_FETCH_LIMIT_ENV} must be an integer >= 1; got {raw!r}. "
+            "Unset it or set it to a positive integer."
+        )
+    return resolved
 
 # "attempted", never "fetched": the refused third try usually follows two
 # FAILED attempts, and a name claiming success would misdescribe exactly the
@@ -156,14 +182,14 @@ class FulltextFetchLedger:
         *,
         now: Callable[[], datetime] | None = None,
         per_identifier_limit: int = PER_IDENTIFIER_DAILY_LIMIT,
-        global_limit: int = GLOBAL_DAILY_LIMIT,
+        global_limit: int | None = None,
     ) -> None:
         self.path = require_output_path(
             Path(path or FETCH_LEDGER_PATH), label="Full-text fetch ledger"
         )
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.per_identifier_limit = per_identifier_limit
-        self.global_limit = global_limit
+        self.global_limit = _resolve_global_limit(global_limit)
 
     # -- reading -----------------------------------------------------------
 
@@ -363,6 +389,7 @@ class FulltextFetchLedger:
 
 
 __all__ = [
+    "DAILY_FETCH_LIMIT_ENV",
     "FETCH_LEDGER_PATH",
     "GLOBAL_DAILY_LIMIT",
     "PER_IDENTIFIER_DAILY_LIMIT",

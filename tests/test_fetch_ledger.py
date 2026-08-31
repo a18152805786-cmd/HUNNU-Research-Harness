@@ -16,15 +16,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from hunnu_harness.cli import build_parser as build_harness_parser
+from hunnu_harness.literature import fetch_ledger as fetch_ledger_module
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.cli import build_parser as build_literature_parser
 from hunnu_harness.literature.fetch_ledger import (
+    DAILY_FETCH_LIMIT_ENV,
     FETCH_LEDGER_PATH,
     GLOBAL_DAILY_LIMIT,
     PER_IDENTIFIER_DAILY_LIMIT,
@@ -147,6 +151,30 @@ class WriteAheadOrderingTests(unittest.TestCase):
 
 
 class BudgetRuleTests(unittest.TestCase):
+    def test_default_global_limit_is_fifteen(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(DAILY_FETCH_LIMIT_ENV, None)
+            ledger = _ledger(_tmp(self))
+        self.assertEqual(ledger.global_limit, 15)
+
+    def test_environment_global_limit_is_used(self) -> None:
+        with patch.dict(os.environ, {DAILY_FETCH_LIMIT_ENV: "9"}):
+            ledger = _ledger(_tmp(self))
+        self.assertEqual(ledger.global_limit, 9)
+
+    def test_explicit_global_limit_overrides_environment(self) -> None:
+        with patch.dict(os.environ, {DAILY_FETCH_LIMIT_ENV: "9"}):
+            ledger = _ledger(_tmp(self), global_limit=5)
+        self.assertEqual(ledger.global_limit, 5)
+
+    def test_invalid_environment_global_limit_fails_closed(self) -> None:
+        for value in ("not-an-integer", "0", "-3"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {DAILY_FETCH_LIMIT_ENV: value}
+            ):
+                with self.assertRaisesRegex(ValueError, DAILY_FETCH_LIMIT_ENV):
+                    _ledger(_tmp(self))
+
     def test_second_attempt_passes_and_the_third_is_refused(self) -> None:
         ledger = _ledger(_tmp(self))
         for _ in range(PER_IDENTIFIER_DAILY_LIMIT):
@@ -347,6 +375,32 @@ class CLISurfaceTests(unittest.TestCase):
             self.assertTrue(args.allow_refetch, command)
             args = parser.parse_args([command, "--title", "t"])
             self.assertFalse(args.allow_refetch, command)
+
+    def test_live_cnki_accepts_daily_limit(self) -> None:
+        args = build_literature_parser().parse_args(
+            ["live-cnki", "--title", "x", "--daily-limit", "7"]
+        )
+        self.assertEqual(args.daily_limit, 7)
+
+
+class AdapterDailyLimitTests(unittest.TestCase):
+    def test_daily_limit_controls_only_the_bare_ledger_construction(self) -> None:
+        for configured, expected in ((None, 15), (7, 7)):
+            with self.subTest(configured=configured):
+                root = _tmp(self)
+                ledger_path = root / "adapter-fetch-ledger.jsonl"
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(DAILY_FETCH_LIMIT_ENV, None)
+                    with patch.object(
+                        fetch_ledger_module, "FETCH_LEDGER_PATH", ledger_path
+                    ):
+                        adapter = ScienceDirectAdapter(None)
+                        adapter.daily_fetch_limit = configured
+                        ticket = adapter.authorize_publisher_fetch(
+                            _sciencedirect_record(), identifier=PII
+                        )
+                self.assertEqual(ticket.ledger.path, ledger_path)
+                self.assertEqual(ticket.ledger.global_limit, expected)
 
 
 if __name__ == "__main__":  # pragma: no cover
