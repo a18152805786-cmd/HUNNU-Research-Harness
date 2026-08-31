@@ -31,8 +31,8 @@
 | 12 | 不动用户既有数据/手稿 | 仅散文 | （脱敏后已泛化表述；Harness 只写 Output Root 是规则 35 的机制，但"不动某些特定资产"本身无代码知晓） |
 | 13 | 源码/测试/文档留在 Core Root | 部分代码 | `relocation.classify_core_path` 分类保护；反向（Output 不当第二仓库）见 36 |
 | 14–16 | 下载/manifest/运行产物默认进 Output Root | 代码强制 | `paths.require_output_path` fail-closed；`test_output_root_separation` 全家 |
-| 17 | 论文数据只在明确要求时导出 | 仅散文 | 代码不含任何导出路径（辅助性设计缺失） |
-| 18 | 测试文件不进论文数据目录 | 设计缺失 | 一切运行时路径派生自 OUTPUT_ROOT，不存在指向用户论文目录的写入 |
+| 17 | 正式研究资料只在明确要求时导出 | 仅散文 | 代码不含任何导出路径（辅助性设计缺失） |
+| 18 | 测试文件不进正式研究资料目录 | 设计缺失 | 一切运行时路径派生自 OUTPUT_ROOT，不存在指向用户论文目录的写入 |
 | 19 | 采集必须走 Router/Broker，不得裸 MCP 起步 | 代码强制 | `AgentRequestRouter`/`AdapterExecutionBroker`；`test_adapter_enforcement.py` |
 | 20–21 | 手动/诊断浏览器面纪律 | 仅散文 | agent 选择哪个浏览器面，代码无从拦截 |
 | 22 | MCP 会话不碰凭据 | 部分代码 | `MCPExecutor` 类型化 allowlist 边界（非白名单工具不可调）；"不看 cookie"由 6 的结构性测试兜底 |
