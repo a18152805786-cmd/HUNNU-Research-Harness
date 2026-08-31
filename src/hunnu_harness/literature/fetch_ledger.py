@@ -464,10 +464,17 @@ class FulltextFetchLedger:
         # well would turn the one explicit "fetch this paper again" switch
         # into a general budget bypass.
         if len(attempts) >= self.global_limit:
+            # Informative, not accusatory: hitting this ceiling is the system
+            # working, and the budget being spent is the user's own.  The
+            # honest lever is the knob, so the message names it -- and never
+            # suggests --allow-refetch, which answers a different question.
             raise FetchBudgetExceeded(
                 STATUS_BUDGET_EXHAUSTED,
-                f"{len(attempts)} publisher fetch attempts already recorded today "
-                f"(daily ceiling {self.global_limit}).",
+                f"You have fetched {len(attempts)} full texts from publishers today, "
+                f"which is today's daily ceiling ({self.global_limit}). This budget "
+                "spends your own institutional account's quota, so the ceiling is "
+                "yours to adjust: pass --daily-limit or set "
+                f"{DAILY_FETCH_LIMIT_ENV} if today genuinely needs more.",
             )
         # Reject first, so a request that is already over quota is not made to
         # wait.  Pace next, then put the attempt on the ledger before the

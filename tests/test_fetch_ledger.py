@@ -241,7 +241,16 @@ class BudgetRuleTests(unittest.TestCase):
         with self.assertRaises(FetchBudgetExceeded) as caught:
             ledger.authorize_fetch(source="S", identifier="id-fresh", paper_id="P")
         self.assertEqual(caught.exception.status, STATUS_BUDGET_EXHAUSTED)
-        self.assertIn("daily ceiling", str(caught.exception))
+        # The daily refusal informs rather than accuses: it reports the count,
+        # says whose quota this is, and names the honest lever (the knob) --
+        # never --allow-refetch, which answers a different question.
+        message = str(caught.exception)
+        self.assertIn("daily ceiling", message)
+        self.assertIn(f"fetched {GLOBAL_DAILY_LIMIT} full texts", message)
+        self.assertIn("your own institutional account", message)
+        self.assertIn("--daily-limit", message)
+        self.assertIn(DAILY_FETCH_LIMIT_ENV, message)
+        self.assertNotIn("--allow-refetch", message)
 
     def test_allow_refetch_never_bypasses_the_daily_total(self) -> None:
         """This test failing means --allow-refetch became a general budget bypass.
