@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..paths import _windows_io_path
+
 # Where a publisher is allowed to serve the bytes from.  Kept explicit and
 # small: widening it is a decision someone should have to make on purpose.
 ELSEVIER_PDF_HOSTS = frozenset(
@@ -188,7 +190,7 @@ class BrowserDirectedDownload:
 
         if self.lease is not None:
             await self.lease.acquire(str(self.download_dir))
-        self.download_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.download_dir).mkdir(parents=True, exist_ok=True)
         self._target = asyncio.get_running_loop().create_future()
         self._armed = True
         self.session.on("Browser.downloadWillBegin", self._on_will_begin)
@@ -197,7 +199,7 @@ class BrowserDirectedDownload:
             "Browser.setDownloadBehavior",
             {
                 "behavior": "allow",
-                "downloadPath": str(self.download_dir),
+                "downloadPath": str(_windows_io_path(self.download_dir)),
                 "eventsEnabled": True,
             },
         )
@@ -307,7 +309,7 @@ class BrowserDirectedDownload:
             )
 
         path = self.download_dir / Path(pending.suggested_filename).name
-        if not path.is_file():
+        if not _windows_io_path(path).is_file():
             raise DirectedDownloadFailure(
                 f"{DirectedDownloadOutcome.DOWNLOAD_FILE_MISSING.value}: "
                 f"the browser reported completion but {path.name} is not in the run directory"

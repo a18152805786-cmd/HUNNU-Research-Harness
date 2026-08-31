@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..paths import _logical_path, _windows_io_path
+
 
 PDF_DIRECT_DOWNLOAD_PREFERENCE = "plugins.always_open_pdf_externally"
 SESSION_RESTORE_PREFERENCE = "session.restore_on_startup"
@@ -61,7 +63,7 @@ def _default_profile_process_check(profile_dir: Path) -> bool | None:
     """Return whether Chrome is using *profile_dir* without persisting process data."""
 
     if os.name != "nt":
-        return bool(tuple(profile_dir.glob("Singleton*")))
+        return bool(tuple(_windows_io_path(profile_dir).glob("Singleton*")))
     command = (
         "$p='" + str(profile_dir).replace("'", "''") + "';"
         "$found=Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
@@ -105,11 +107,12 @@ class ResearchChromePdfPreference:
         allow_arbitrary_profile_for_tests: bool = False,
         profile_process_check: Callable[[Path], bool | None] | None = None,
     ) -> None:
-        self.profile_dir = Path(profile_dir).expanduser().resolve()
+        self.profile_dir = _logical_path(Path(profile_dir).expanduser())
         expected = Path(
             expected_profile_dir
             or os.environ.get("HUNNU_RESEARCH_PROFILE", DEFAULT_RESEARCH_CHROME_PROFILE)
-        ).expanduser().resolve()
+        ).expanduser()
+        expected = _logical_path(expected)
         if not allow_arbitrary_profile_for_tests and self.profile_dir != expected:
             raise ResearchChromePreferenceError(
                 "PDF preference changes are restricted to the configured Research Chrome profile"
@@ -120,7 +123,7 @@ class ResearchChromePdfPreference:
             local_app_data / "Microsoft" / "Edge" / "User Data",
         )
         if any(
-            self.profile_dir == root.resolve() or self.profile_dir.is_relative_to(root.resolve())
+            self.profile_dir == _logical_path(root) or self.profile_dir.is_relative_to(_logical_path(root))
             for root in forbidden_roots
         ):
             raise ResearchChromePreferenceError("Normal user Chrome/Edge profiles are out of scope")
@@ -128,12 +131,12 @@ class ResearchChromePdfPreference:
         self._profile_process_check = profile_process_check or _default_profile_process_check
 
     def _payload(self) -> dict:
-        if not self.preferences_path.is_file():
+        if not _windows_io_path(self.preferences_path).is_file():
             raise ResearchChromePreferenceError(
                 f"Research Chrome Preferences file is unavailable: {self.preferences_path}"
             )
         try:
-            payload = json.loads(self.preferences_path.read_text(encoding="utf-8"))
+            payload = json.loads(_windows_io_path(self.preferences_path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ResearchChromePreferenceError("Research Chrome Preferences is not valid JSON") from exc
         return payload
@@ -158,7 +161,7 @@ class ResearchChromePdfPreference:
     def _require_stopped(self) -> None:
         """Chrome rewrites Preferences as it exits, so edit it only when stopped."""
 
-        if tuple(self.profile_dir.glob("Singleton*")):
+        if tuple(_windows_io_path(self.profile_dir).glob("Singleton*")):
             raise ResearchChromeProfileInUse("Research Chrome profile lock is present")
         in_use = self._profile_process_check(self.profile_dir)
         if in_use is not False:
@@ -229,7 +232,8 @@ class ResearchChromePdfPreference:
     def _apply(self, *, container: str, key: str, value: bool | int, literal: str) -> None:
         """Set one preference and prove nothing else in the file moved."""
 
-        original = self.preferences_path.read_text(encoding="utf-8")
+        preferences_io = _windows_io_path(self.preferences_path)
+        original = preferences_io.read_text(encoding="utf-8")
         current_payload = json.loads(original)
         expected_payload = dict(current_payload)
         expected_section = dict(current_payload.get(container) or {})
@@ -248,28 +252,28 @@ class ResearchChromePdfPreference:
                 f"Targeted edit changed content beyond {container}.{key}"
             )
 
-        mode = stat.S_IMODE(self.preferences_path.stat().st_mode)
+        mode = stat.S_IMODE(preferences_io.stat().st_mode)
         temp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
                 newline="",
-                dir=self.preferences_path.parent,
+                dir=_windows_io_path(self.preferences_path.parent, force=True),
                 prefix=".hunnu-pdf-pref-",
                 suffix=".tmp",
                 delete=False,
             ) as handle:
-                temp_path = Path(handle.name)
+                temp_path = _logical_path(handle.name)
                 handle.write(updated)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(temp_path, mode)
-            os.replace(temp_path, self.preferences_path)
+            _windows_io_path(temp_path).chmod(mode)
+            os.replace(_windows_io_path(temp_path), preferences_io)
             temp_path = None
         finally:
             if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
+                _windows_io_path(temp_path).unlink(missing_ok=True)
 
     @classmethod
     def _surgical_set(cls, source: str, container: str, key: str, replacement: str) -> str:

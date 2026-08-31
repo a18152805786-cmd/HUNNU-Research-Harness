@@ -45,7 +45,7 @@ from ..models import (
 from ..fulltext import AuthorizedFullTextValidator
 from ..normalization import normalize_doi, normalize_person, normalize_title, stable_paper_id
 from ..security import sanitize_url
-from ...paths import QUARANTINE_DIR
+from ...paths import QUARANTINE_DIR, _logical_path, _windows_io_path
 
 if TYPE_CHECKING:
     from ..institutional import InstitutionalRouteResult
@@ -420,8 +420,9 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         try:
             from pypdf import PdfReader  # type: ignore[import-not-found]
 
-            reader = PdfReader(str(path), strict=False)
-            text = "\n".join((page.extract_text() or "") for page in reader.pages[:2])
+            with _windows_io_path(path).open("rb") as handle:
+                reader = PdfReader(handle, strict=False)
+                text = "\n".join((page.extract_text() or "") for page in reader.pages[:2])
         except Exception:
             return OxfordPDFIdentityResult(False, False, False, False)
         title_match = AuthorizedFullTextValidator._title_matches_extracted_text(record.title, text) is True
@@ -441,16 +442,17 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
 
     @staticmethod
     def _quarantine(path: Path) -> Path:
-        QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
-        source = Path(path)
-        target = QUARANTINE_DIR / source.name
+        base = _logical_path(QUARANTINE_DIR)
+        _windows_io_path(base).mkdir(parents=True, exist_ok=True)
+        source = _logical_path(path)
+        target = base / source.name
         counter = 1
-        while target.exists():
+        while _windows_io_path(target).exists():
             target = target.with_name(
                 f"{source.stem}_identity-mismatch_{counter}{source.suffix}"
             )
             counter += 1
-        shutil.move(str(path), str(target))
+        shutil.move(str(_windows_io_path(source)), str(_windows_io_path(target)))
         return target
 
     @classmethod

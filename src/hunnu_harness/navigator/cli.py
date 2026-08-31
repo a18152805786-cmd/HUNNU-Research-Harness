@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import LibraryUnavailable
+from ..paths import _windows_io_path
 
 
 EXIT_OK = 0
@@ -289,7 +290,7 @@ def _run_fingerprint(args: argparse.Namespace) -> int:
         return EXIT_LIBRARY_UNAVAILABLE
 
     if args.output:
-        Path(args.output).write_text(current.to_json(), encoding="utf-8", newline="\n")
+        _windows_io_path(Path(args.output)).write_text(current.to_json(), encoding="utf-8", newline="\n")
 
     if args.compare:
         comparison = current.compare(load_fingerprint(Path(args.compare)))

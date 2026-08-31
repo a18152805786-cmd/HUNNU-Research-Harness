@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..paths import require_output_path
+from ..paths import _logical_path, _windows_io_path, _windows_path_units, require_output_path
 from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
 from .auto_classification import PostAcquisitionClassifier
 from .classification import ClassificationStatus
@@ -46,7 +46,7 @@ class LiteratureDownloadManager:
         global_library: GlobalPaperLibrary | None = None,
         topic_classifier: PostAcquisitionClassifier | None = None,
     ):
-        self.downloads_root = Path(downloads_root).resolve()
+        self.downloads_root = _logical_path(downloads_root)
         if not allow_outside_project_for_tests:
             self.downloads_root = require_output_path(
                 self.downloads_root,
@@ -56,7 +56,7 @@ class LiteratureDownloadManager:
         self.archive_dir = self.downloads_root / "archive"
         self.staging_dir = self.downloads_root / "staging"
         for directory in (self.raw_dir, self.archive_dir, self.staging_dir):
-            directory.mkdir(parents=True, exist_ok=True)
+            _windows_io_path(directory).mkdir(parents=True, exist_ok=True)
         self.make_archive_read_only = make_archive_read_only
         self.global_library = global_library
         self.topic_classifier = topic_classifier
@@ -87,7 +87,7 @@ class LiteratureDownloadManager:
     ) -> DownloadManifestEntry:
         if not access.full_text_accessible or not access.authorized_access:
             raise UnauthorizedFullTextError("Full text was not confirmed as authorized by the source page")
-        source = Path(source).resolve()
+        source = _logical_path(source)
         declared_format = full_text_format or access.full_text_format
         resolved_format = infer_full_text_format(source, declared_format)
         validation = AuthorizedFullTextValidator.validate(source, resolved_format, record=record)
@@ -109,7 +109,8 @@ class LiteratureDownloadManager:
 
         if self.make_archive_read_only:
             for path in (raw_path, normalized_path):
-                path.chmod(path.stat().st_mode & ~stat.S_IWRITE)
+                path_io = _windows_io_path(path)
+                path_io.chmod(path_io.stat().st_mode & ~stat.S_IWRITE)
 
         timestamp = datetime.now().astimezone().isoformat()
         record.access_type = access.access_type.value
@@ -330,7 +331,9 @@ class LiteratureDownloadManager:
 
     @staticmethod
     def _windows_path_units(value: Path | str) -> int:
-        return len(str(value).encode("utf-16-le")) // 2
+        """Compatibility facade for the shared Windows path-length helper."""
+
+        return _windows_path_units(value)
 
     @classmethod
     def _truncate_to_windows_units(cls, value: str, maximum: int) -> str:
@@ -339,7 +342,7 @@ class LiteratureDownloadManager:
         result: list[str] = []
         used = 0
         for character in value:
-            width = cls._windows_path_units(character)
+            width = _windows_path_units(character)
             if used + width > maximum:
                 break
             result.append(character)
@@ -356,44 +359,50 @@ class LiteratureDownloadManager:
         force_digest_suffix: bool = False,
         digest_length: int = 12,
     ) -> Path:
-        parent = Path(parent).resolve()
+        parent = _logical_path(parent)
         safe_name = Path(filename).name
         suffix = Path(safe_name).suffix
         stem = Path(safe_name).stem.rstrip(" ._") or "artifact"
         direct = parent / safe_name
         if (
             not force_digest_suffix
-            and cls._windows_path_units(direct) <= cls.CANONICAL_PATH_SAFE_BUDGET
+            and _windows_path_units(direct) <= cls.CANONICAL_PATH_SAFE_BUDGET
         ):
             return direct
 
         token = f"__{digest[:digest_length]}"
         fixed_units = (
-            cls._windows_path_units(parent)
+            _windows_path_units(parent)
             + 1
-            + cls._windows_path_units(token)
-            + cls._windows_path_units(suffix)
+            + _windows_path_units(token)
+            + _windows_path_units(suffix)
         )
         readable_budget = cls.CANONICAL_PATH_SAFE_BUDGET - fixed_units
         if readable_budget < 1:
-            raise InvalidFullTextDownload(
-                "Managed archive parent leaves no safe deterministic filename budget"
-            )
+            # The legacy-safe budget is useful for ordinary roots, but it is
+            # not a reason to reject an otherwise valid Output Root after the
+            # I/O layer has switched to the Windows extended path namespace.
+            # Keep the logical filename deterministic and let the long-path
+            # boundary, rather than MAX_PATH, decide whether it is usable.
+            candidate = parent / (safe_name if not force_digest_suffix else f"{stem}{token}{suffix}")
+            if _windows_path_units(candidate) >= 32767:
+                raise InvalidFullTextDownload("Canonical archive destination exceeds the Windows path limit")
+            return candidate
         readable = cls._truncate_to_windows_units(stem, readable_budget).rstrip(" ._")
         if not readable:
             readable = "a"
         candidate = parent / f"{readable}{token}{suffix}"
-        if candidate.parent.resolve() != parent:
+        if _logical_path(candidate.parent) != parent:
             raise InvalidFullTextDownload("Canonical archive destination escaped its managed parent")
-        if cls._windows_path_units(candidate) > cls.CANONICAL_PATH_SAFE_BUDGET:
+        if _windows_path_units(candidate) > cls.CANONICAL_PATH_SAFE_BUDGET:
             raise InvalidFullTextDownload("Canonical archive destination exceeds the safe path budget")
         return candidate
 
     @classmethod
     def _copy_unique(cls, source: Path, destination: Path, digest: str) -> Path:
-        source = Path(source).resolve()
-        parent = destination.parent.resolve()
-        parent.mkdir(parents=True, exist_ok=True)
+        source = _logical_path(source)
+        parent = _logical_path(destination.parent)
+        _windows_io_path(parent).mkdir(parents=True, exist_ok=True)
         candidates = [cls._bounded_destination(parent, destination.name, digest)]
         for length in cls._DIGEST_SUFFIX_LENGTHS:
             try:
@@ -409,22 +418,25 @@ class LiteratureDownloadManager:
             if candidate not in candidates:
                 candidates.append(candidate)
         for candidate in candidates:
-            if candidate.exists():
+            candidate_io = _windows_io_path(candidate)
+            if candidate_io.exists():
                 if sha256_file(candidate) == digest:
                     return candidate
                 continue
             try:
-                with source.open("rb") as source_handle, candidate.open("xb") as destination_handle:
+                with _windows_io_path(source).open("rb") as source_handle, candidate_io.open(
+                    "xb"
+                ) as destination_handle:
                     shutil.copyfileobj(source_handle, destination_handle)
-                shutil.copystat(source, candidate)
+                shutil.copystat(_windows_io_path(source), candidate_io)
                 return candidate
             except FileExistsError:
-                if candidate.exists() and sha256_file(candidate) == digest:
+                if candidate_io.exists() and sha256_file(candidate) == digest:
                     return candidate
                 continue
             except Exception:
                 try:
-                    candidate.unlink(missing_ok=True)
+                    candidate_io.unlink(missing_ok=True)
                 except OSError:
                     pass
                 raise

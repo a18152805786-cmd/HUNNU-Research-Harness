@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..paths import PAPER_RETRIEVAL_PACKS_DIR, require_output_path
+from ..paths import PAPER_RETRIEVAL_PACKS_DIR, _logical_path, _windows_io_path, require_output_path
 from .lexicon import RelevanceRole
 from .search import PaperNavigator, SearchResult
 
@@ -56,7 +56,7 @@ def _pack_id(query: str, *, now: datetime | None = None) -> str:
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     try:
-        with path.open("rb") as handle:
+        with _windows_io_path(path).open("rb") as handle:
             while block := handle.read(1024 * 1024):
                 digest.update(block)
     except OSError:
@@ -98,7 +98,7 @@ class ReadingPackBuilder:
 
     def __init__(self, navigator: PaperNavigator, *, packs_dir: Path | None = None) -> None:
         self.navigator = navigator
-        self.packs_dir = Path(packs_dir or PAPER_RETRIEVAL_PACKS_DIR)
+        self.packs_dir = _logical_path(packs_dir or PAPER_RETRIEVAL_PACKS_DIR)
 
     def build(
         self,
@@ -173,11 +173,11 @@ class ReadingPackBuilder:
         if write:
             pack_dir = self.packs_dir / pack_id
             require_output_path(pack_dir, label="Navigator reading pack")
-            pack_dir.mkdir(parents=True, exist_ok=True)
+            _windows_io_path(pack_dir).mkdir(parents=True, exist_ok=True)
             self._write_json(pack_dir / "manifest.json", manifest)
             self._write_json(pack_dir / "ranking.json", ranking)
             self._write_json(pack_dir / "evidence_plan.json", evidence_plan)
-            (pack_dir / "README.md").write_text(readme, encoding="utf-8", newline="\n")
+            self._write_text(pack_dir / "README.md", readme)
             payload["pack_dir"] = str(pack_dir)
         return payload
 
@@ -210,11 +210,15 @@ class ReadingPackBuilder:
 
     @staticmethod
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
-        path.write_text(
+        ReadingPackBuilder._write_text(
+            path,
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
         )
+
+    @staticmethod
+    def _write_text(path: Path, content: str) -> None:
+        logical = require_output_path(path, label="Navigator reading pack file")
+        _windows_io_path(logical).write_text(content, encoding="utf-8", newline="\n")
 
     def _evidence_plan(self, pack_id: str, query: str, entries: list[PackEntry]) -> dict[str, Any]:
         by_role: dict[str, list[dict[str, Any]]] = {}

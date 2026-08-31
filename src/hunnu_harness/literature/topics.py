@@ -17,7 +17,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -28,6 +27,9 @@ from ..paths import (
     LIBRARY_TOPICS_JSONL,
     PAPERS_BY_TOPIC_DIR,
     TOPIC_TAXONOMY_JSON,
+    _logical_path,
+    _transaction_token,
+    _windows_io_path,
     is_within,
 )
 from .models import UNKNOWN
@@ -152,10 +154,11 @@ class TopicTaxonomy:
     @classmethod
     def load(cls, path: Path | None = None) -> "TopicTaxonomy":
         source = Path(path or TOPIC_TAXONOMY_JSON)
-        if not source.exists():
+        source_io = _windows_io_path(source)
+        if not source_io.exists():
             raise TopicTaxonomyError(f"Topic taxonomy is not present: {source}")
         try:
-            payload = json.loads(source.read_text(encoding="utf-8"))
+            payload = json.loads(source_io.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise TopicTaxonomyError(f"Topic taxonomy is unreadable: {exc}") from exc
         raw_domains = payload.get("domains")
@@ -296,27 +299,29 @@ class WorkTopicRow:
 
 
 def _atomic_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+    temporary_io = _windows_io_path(temporary)
     try:
-        temporary.write_text(content, encoding="utf-8", newline="\n")
-        temporary.replace(path)
+        temporary_io.write_text(content, encoding="utf-8", newline="\n")
+        temporary_io.replace(_windows_io_path(path))
     finally:
-        temporary.unlink(missing_ok=True)
+        temporary_io.unlink(missing_ok=True)
 
 
 def _atomic_csv(path: Path, fields: tuple[str, ...], rows: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+    temporary_io = _windows_io_path(temporary)
     try:
-        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+        with temporary_io.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(fields))
             writer.writeheader()
             for row in rows:
                 writer.writerow({name: row.get(name, "") for name in fields})
-        temporary.replace(path)
+        temporary_io.replace(_windows_io_path(path))
     finally:
-        temporary.unlink(missing_ok=True)
+        temporary_io.unlink(missing_ok=True)
 
 
 class TopicStore:
@@ -329,8 +334,8 @@ class TopicStore:
         csv_path: Path | None = None,
         taxonomy: TopicTaxonomy | None = None,
     ) -> None:
-        self.jsonl_path = Path(jsonl_path or LIBRARY_TOPICS_JSONL)
-        self.csv_path = Path(csv_path or LIBRARY_TOPICS_CSV)
+        self.jsonl_path = _logical_path(jsonl_path or LIBRARY_TOPICS_JSONL)
+        self.csv_path = _logical_path(csv_path or LIBRARY_TOPICS_CSV)
         self._taxonomy = taxonomy
 
     @property
@@ -340,11 +345,12 @@ class TopicStore:
         return self._taxonomy
 
     def load(self) -> dict[str, WorkTopicRow]:
-        if not self.jsonl_path.exists():
+        jsonl_io = _windows_io_path(self.jsonl_path)
+        if not jsonl_io.exists():
             return {}
         rows: dict[str, WorkTopicRow] = {}
         try:
-            text = self.jsonl_path.read_text(encoding="utf-8")
+            text = jsonl_io.read_text(encoding="utf-8")
         except OSError as exc:
             raise TopicStoreError(f"Topic metadata is unreadable: {exc}") from exc
         for number, line in enumerate(text.splitlines(), start=1):
@@ -405,8 +411,8 @@ class TopicViewBuilder:
         view_root: Path | None = None,
         papers_dir: Path | None = None,
     ) -> None:
-        self.view_root = Path(view_root or PAPERS_BY_TOPIC_DIR)
-        self.papers_dir = Path(papers_dir or LIBRARY_PAPERS_DIR)
+        self.view_root = _logical_path(view_root or PAPERS_BY_TOPIC_DIR)
+        self.papers_dir = _logical_path(papers_dir or LIBRARY_PAPERS_DIR)
 
     @property
     def links_path(self) -> Path:
@@ -436,8 +442,8 @@ class TopicViewBuilder:
         return links
 
     def _safe_view_path(self, candidate: Path) -> Path:
-        resolved_root = self.view_root.resolve()
-        resolved = Path(os.path.normpath(str(candidate)))
+        resolved_root = _logical_path(self.view_root)
+        resolved = _logical_path(Path(os.path.normpath(str(candidate))))
         if not is_within(resolved, resolved_root):
             raise TopicStoreError(f"Topic view entry escaped the view root: {candidate}")
         return resolved
@@ -450,7 +456,7 @@ class TopicViewBuilder:
         twice creates nothing the first call did not.
         """
 
-        canonical = Path(row.canonical_path) if row.canonical_path else None
+        canonical = _logical_path(row.canonical_path) if row.canonical_path else None
         created: list[str] = []
         removed: list[str] = []
         referenced: list[str] = []
@@ -463,20 +469,20 @@ class TopicViewBuilder:
         for existing in self._existing_links_for(row.paper_id, name):
             if existing not in wanted:
                 try:
-                    existing.unlink()
+                    _windows_io_path(existing).unlink()
                     removed.append(str(existing))
                 except OSError:
                     pass
 
         for target, _label in sorted(wanted.items(), key=lambda item: str(item[0])):
-            if target.exists():
+            if _windows_io_path(target).exists():
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if canonical is None or not canonical.exists():
+            _windows_io_path(target.parent).mkdir(parents=True, exist_ok=True)
+            if canonical is None or not _windows_io_path(canonical).exists():
                 referenced.append(str(target))
                 continue
             try:
-                os.link(canonical, target)
+                os.link(_windows_io_path(canonical), _windows_io_path(target))
                 created.append(str(target))
             except OSError:
                 # A view entry is a convenience, never the paper itself.  When
@@ -492,17 +498,20 @@ class TopicViewBuilder:
         }
 
     def _existing_links_for(self, paper_id: str, name: str) -> tuple[Path, ...]:
-        if not self.view_root.exists():
+        view_root_io = _windows_io_path(self.view_root)
+        if not view_root_io.exists():
             return ()
         found: list[Path] = []
-        for domain_dir in self.view_root.iterdir():
-            if not domain_dir.is_dir() or domain_dir.name == VARIANT_VIEW_DOMAIN:
+        for raw_domain_dir in view_root_io.iterdir():
+            domain_dir = _logical_path(raw_domain_dir)
+            if not _windows_io_path(domain_dir).is_dir() or domain_dir.name == VARIANT_VIEW_DOMAIN:
                 continue
-            for subtopic_dir in domain_dir.iterdir():
-                if not subtopic_dir.is_dir():
+            for raw_subtopic_dir in _windows_io_path(domain_dir).iterdir():
+                subtopic_dir = _logical_path(raw_subtopic_dir)
+                if not _windows_io_path(subtopic_dir).is_dir():
                     continue
                 candidate = subtopic_dir / name
-                if candidate.exists():
+                if _windows_io_path(candidate).exists():
                     found.append(candidate)
         return tuple(found)
 
@@ -514,8 +523,9 @@ class TopicViewBuilder:
         """
 
         preserved: list[dict[str, Any]] = []
-        if self.links_path.exists():
-            with self.links_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        links_path_io = _windows_io_path(self.links_path)
+        if links_path_io.exists():
+            with links_path_io.open("r", encoding="utf-8-sig", newline="") as handle:
                 for item in csv.DictReader(handle):
                     if item.get("domain") == VARIANT_VIEW_DOMAIN:
                         preserved.append({name: item.get(name, "") for name in TOPIC_LINK_FIELDS})

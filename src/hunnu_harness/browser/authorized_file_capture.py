@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..paths import require_output_path
+from ..paths import _logical_path, _windows_io_path, require_output_path
 
 
 class AcquisitionMethod(str, Enum):
@@ -53,10 +53,10 @@ class BrowserAuthorizedFileCapture:
         *,
         allow_outside_output_for_tests: bool = False,
     ) -> None:
-        resolved = Path(staging_dir).resolve()
+        resolved = _logical_path(staging_dir)
         if not allow_outside_output_for_tests:
             resolved = require_output_path(resolved, label="Authorized browser capture staging")
-        resolved.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(resolved).mkdir(parents=True, exist_ok=True)
         self.staging_dir = resolved
 
     @classmethod
@@ -69,7 +69,7 @@ class BrowserAuthorizedFileCapture:
         base = self.staging_dir / self._safe_filename(filename)
         target = base
         counter = 1
-        while target.exists():
+        while _windows_io_path(target).exists():
             target = base.with_name(f"{base.stem}_{counter}{base.suffix}")
             counter += 1
         return target
@@ -97,9 +97,10 @@ class BrowserAuthorizedFileCapture:
     @staticmethod
     def _is_valid_pdf_file(path: Path) -> bool:
         try:
-            if path.stat().st_size < 5:
+            path_io = _windows_io_path(path)
+            if path_io.stat().st_size < 5:
                 return False
-            with path.open("rb") as stream:
+            with path_io.open("rb") as stream:
                 return stream.read(5) == b"%PDF-"
         except OSError:
             return False
@@ -149,12 +150,12 @@ class BrowserAuthorizedFileCapture:
             if not armed or download_future.done():
                 return
             try:
-                await download.save_as(str(target))
+                await download.save_as(str(_windows_io_path(target)))
                 if not armed or download_future.done():
                     return
                 if not self._is_valid_pdf_file(target):
                     try:
-                        target.unlink()
+                        _windows_io_path(target).unlink()
                     except OSError:
                         pass
                     raise AuthorizedFileCaptureUnavailable(
@@ -285,7 +286,7 @@ class BrowserAuthorizedFileCapture:
                     except TimeoutError:
                         pass
                 payload, host = response_future.result()
-                target.write_bytes(payload)
+                _windows_io_path(target).write_bytes(payload)
                 return AuthorizedFileCaptureResult(
                     path=target,
                     acquisition_method=AcquisitionMethod.AUTHORIZED_PDF_RESPONSE,

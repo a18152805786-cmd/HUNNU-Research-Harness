@@ -7,7 +7,6 @@ download behavior remains in registered handlers backed by existing adapters.
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -15,7 +14,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 
-from ..paths import V028_RUN_ROOT, require_output_path
+from ..paths import (
+    V028_RUN_ROOT,
+    _transaction_token,
+    _windows_io_path,
+    require_output_path,
+)
 from .adapters.base import LiteratureSourceAdapter, SourceActionRequired, SourceUserDownloadRequired
 from .models import LiteratureRunResult, LiteratureSearchRequest, RunStatus, UNKNOWN
 from .security import sanitize_value
@@ -442,9 +446,10 @@ def _result_from_literature_run(
         return _not_ready_result(source, f"WORKFLOW_STATUS_{result.status.value}")
     entry = result.downloads[0]
     local = Path(entry.local_path)
+    local_io = _windows_io_path(local)
     current_session = False
     try:
-        current_session = local.exists() and local.stat().st_mtime_ns >= started_at_ns
+        current_session = local_io.exists() and local_io.stat().st_mtime_ns >= started_at_ns
     except OSError:
         current_session = False
     unattended_action = not any(
@@ -895,7 +900,7 @@ class PreflightArtifactWriter:
             }
             self._atomic_json(action_path, payload)
             return manifest, action_path
-        if action_path.exists():
+        if _windows_io_path(action_path).exists():
             payload = {
                 "SchemaVersion": "0.2.8",
                 "ResearchRequestID": aggregate.research_request_id,
@@ -913,10 +918,11 @@ class PreflightArtifactWriter:
 
     @staticmethod
     def _action_history(path: Path) -> list[dict[str, Any]]:
-        if not path.exists():
+        path_io = _windows_io_path(path)
+        if not path_io.exists():
             return []
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
+            existing = json.loads(path_io.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return []
         history = list(existing.get("UserActionHistory", []))
@@ -927,11 +933,15 @@ class PreflightArtifactWriter:
 
     @staticmethod
     def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(
-            json.dumps(sanitize_value(dict(payload)), ensure_ascii=False, indent=2, sort_keys=True)
-            + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+        temporary_io = _windows_io_path(temporary)
+        try:
+            temporary_io.write_text(
+                json.dumps(sanitize_value(dict(payload)), ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary_io.replace(_windows_io_path(path))
+        finally:
+            temporary_io.unlink(missing_ok=True)

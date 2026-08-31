@@ -10,7 +10,7 @@ from . import __version__
 from .browser.playwright_backend import PlaywrightUnavailable
 from .browser.pdf_preferences import ResearchChromePdfPreference, ResearchChromePreferenceError
 from .browser.session import ResearchBrowser
-from .paths import LIBRARY_ROOT, OUTPUT_ROOT, CORE_ROOT, STAGING_DIR
+from .paths import LIBRARY_ROOT, OUTPUT_ROOT, CORE_ROOT, STAGING_DIR, _windows_io_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -279,7 +279,7 @@ def main() -> int:
     if args.command == "library-import":
         from .literature.library import ExternalPaperImporter, LibraryDisposition
 
-        metadata = json.loads(args.metadata_json.read_text(encoding="utf-8-sig"))
+        metadata = json.loads(_windows_io_path(args.metadata_json).read_text(encoding="utf-8-sig"))
         if not isinstance(metadata, dict):
             raise ValueError("Library import metadata JSON must contain one object")
         result = ExternalPaperImporter().import_staged_pdf(args.source, metadata)

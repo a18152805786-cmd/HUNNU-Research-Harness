@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from ..paths import _logical_path, _windows_io_path
+
 
 class BrowserCommandError(RuntimeError):
     """Base class for fail-closed command execution errors."""
@@ -390,12 +392,12 @@ class DownloadArtifact:
         mime_type: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> "DownloadArtifact":
-        resolved = Path(path).resolve()
-        if not resolved.is_file():
+        resolved = _logical_path(path)
+        if not _windows_io_path(resolved).is_file():
             raise DownloadFailure(f"Download artifact does not exist: {resolved}")
         digest = hashlib.sha256()
         size = 0
-        with resolved.open("rb") as stream:
+        with _windows_io_path(resolved).open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
                 size += len(chunk)

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from ..paths import _windows_io_path
 from .models import FullTextFormat, LiteratureRecord, UNKNOWN
 from .normalization import normalize_doi, normalize_title
 from .pdf import PDFValidator
@@ -194,13 +195,14 @@ class AuthorizedFullTextValidator:
         record: LiteratureRecord | None = None,
     ) -> FullTextValidationResult:
         path = Path(path)
+        path_io = _windows_io_path(path)
         full_text_format = infer_full_text_format(path, declared_format)
-        if not path.exists() or not path.is_file():
+        if not path_io.exists() or not path_io.is_file():
             return FullTextValidationResult(path, full_text_format, False, False, False, False, 0, error="File does not exist")
         try:
-            size = path.stat().st_size
+            size = path_io.stat().st_size
             if size > 0:
-                with path.open("rb") as handle:
+                with path_io.open("rb") as handle:
                     header = handle.read(1024)
             else:
                 header = b""
@@ -300,10 +302,11 @@ class AuthorizedFullTextValidator:
         try:
             from pypdf import PdfReader  # type: ignore[import-not-found]
 
-            reader = PdfReader(str(path), strict=False)
-            if not reader.pages:
-                return None
-            return reader.pages[0].extract_text() or ""
+            with _windows_io_path(path).open("rb") as handle:
+                reader = PdfReader(handle, strict=False)
+                if not reader.pages:
+                    return None
+                return reader.pages[0].extract_text() or ""
         except Exception:
             return None
 
@@ -317,9 +320,10 @@ class AuthorizedFullTextValidator:
         try:
             from pypdf import PdfReader  # type: ignore[import-not-found]
 
-            reader = PdfReader(str(path), strict=False)
-            limit = max(0, min(int(page_limit), len(reader.pages)))
-            return tuple(reader.pages[index].extract_text() or "" for index in range(limit))
+            with _windows_io_path(path).open("rb") as handle:
+                reader = PdfReader(handle, strict=False)
+                limit = max(0, min(int(page_limit), len(reader.pages)))
+                return tuple(reader.pages[index].extract_text() or "" for index in range(limit))
         except Exception:
             return ()
 

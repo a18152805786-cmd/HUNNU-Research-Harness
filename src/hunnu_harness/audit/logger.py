@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..paths import _windows_io_path
+
 
 _SENSITIVE_KEYS = {"password", "passwd", "secret", "token", "cookie", "otp", "mfa", "authorization"}
 
@@ -22,7 +24,7 @@ def _safe(value: Any, key: str | None = None) -> Any:
 class AuditLogger:
     def __init__(self, path: Path):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
 
     def log(self, action: str, *, status: str, **details: Any) -> None:
         event = {
@@ -31,5 +33,5 @@ class AuditLogger:
             "status": status,
             **_safe(details),
         }
-        with self.path.open("a", encoding="utf-8") as handle:
+        with _windows_io_path(self.path).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")

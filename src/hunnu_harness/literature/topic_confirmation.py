@@ -22,14 +22,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..paths import LIBRARY_ROOT
+from ..paths import LIBRARY_ROOT, _transaction_token, _windows_io_path
 from .classification import (
     ClassificationEvidence,
     ClassificationResult,
@@ -158,10 +157,11 @@ class TopicProvenanceStore:
     path: Path = field(default_factory=lambda: Path(TOPIC_PROVENANCE_PATH))
 
     def load(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        path_io = _windows_io_path(self.path)
+        if not path_io.exists():
             return []
         entries: list[dict[str, Any]] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for line in path_io.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
@@ -181,10 +181,7 @@ class TopicProvenanceStore:
         return latest
 
     def _temporary(self) -> Path:
-        # Short on purpose.  A pid plus a full uuid hex added around forty
-        # characters and pushed the whole path past the legacy Windows limit,
-        # so the write failed even though the directory was there.
-        return self.path.with_name(f".{self.path.stem}.{uuid.uuid4().hex[:8]}.tmp")
+        return self.path.with_name(f".{self.path.stem}.{_transaction_token()}.tmp")
 
     def ensure_writable(self) -> None:
         """Prove provenance can be written before anything canonical is.
@@ -195,23 +192,26 @@ class TopicProvenanceStore:
         it came from -- the very state this workflow exists to prevent.
         """
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
         probe = self._temporary()
+        probe_io = _windows_io_path(probe)
         try:
-            probe.write_text("", encoding="utf-8", newline="\n")
+            probe_io.write_text("", encoding="utf-8", newline="\n")
         finally:
-            probe.unlink(missing_ok=True)
+            probe_io.unlink(missing_ok=True)
 
     def append(self, entry: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        path_io = _windows_io_path(self.path)
+        _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
         line = json.dumps(dict(entry), ensure_ascii=False, sort_keys=True) + "\n"
         temporary = self._temporary()
-        existing = self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+        temporary_io = _windows_io_path(temporary)
+        existing = path_io.read_text(encoding="utf-8") if path_io.exists() else ""
         try:
-            temporary.write_text(existing + line, encoding="utf-8", newline="\n")
-            temporary.replace(self.path)
+            temporary_io.write_text(existing + line, encoding="utf-8", newline="\n")
+            temporary_io.replace(path_io)
         finally:
-            temporary.unlink(missing_ok=True)
+            temporary_io.unlink(missing_ok=True)
 
     def scan(self) -> tuple[list[dict[str, Any]], int]:
         """Every readable record, plus how many lines were not readable.
@@ -222,11 +222,12 @@ class TopicProvenanceStore:
         changing what ``load`` does.
         """
 
-        if not self.path.exists():
+        path_io = _windows_io_path(self.path)
+        if not path_io.exists():
             return [], 0
         entries: list[dict[str, Any]] = []
         malformed = 0
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for line in path_io.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
@@ -272,7 +273,7 @@ class TopicProvenanceStore:
             key = str(record.get("assignment_source", AssignmentSource.UNKNOWN_LEGACY.value))
             counts[key] = counts.get(key, 0) + 1
         return TopicProvenanceFingerprint(
-            present=self.path.exists(),
+            present=_windows_io_path(self.path).exists(),
             record_count=len(records),
             paper_count=len({str(record.get("paper_id", "")) for record in records if record.get("paper_id")}),
             malformed_lines=malformed,

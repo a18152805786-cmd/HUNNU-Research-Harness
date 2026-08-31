@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..paths import AUDIT_DIR, require_output_path
+from ..paths import AUDIT_DIR, _windows_io_path, require_output_path
 from .models import UNKNOWN
 from .normalization import normalize_doi
 
@@ -178,10 +178,11 @@ class FulltextFetchLedger:
         be talked past.  Detection is loud on purpose.
         """
 
-        if not self.path.exists():
+        path_io = _windows_io_path(self.path)
+        if not path_io.exists():
             return []
         try:
-            text = self.path.read_text(encoding="utf-8")
+            text = path_io.read_text(encoding="utf-8")
         except OSError as exc:
             raise FetchLedgerError(f"fetch ledger is unreadable: {exc}") from exc
         records: list[dict[str, Any]] = []
@@ -252,8 +253,8 @@ class FulltextFetchLedger:
             "paper_id": paper_id,
             **extra,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
+        _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
+        with _windows_io_path(self.path).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             handle.flush()
 

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
-from ..paths import TEMP_DIR, is_within
+from ..paths import TEMP_DIR, _windows_io_path, is_within
 from .adapters.base import (
     LiteratureSourceAdapter,
     LiteratureSourceError,
@@ -532,9 +532,10 @@ class LiteratureAcquisitionWorkflow:
             await asyncio.sleep(self.delay)
 
     def _query_log_count(self) -> int:
-        if not self.writer.query_log_path.exists():
+        query_log_io = _windows_io_path(self.writer.query_log_path)
+        if not query_log_io.exists():
             return 0
-        with self.writer.query_log_path.open("r", encoding="utf-8-sig") as handle:
+        with query_log_io.open("r", encoding="utf-8-sig") as handle:
             return max(0, sum(1 for _ in handle) - 1)
 
     def _finalize(

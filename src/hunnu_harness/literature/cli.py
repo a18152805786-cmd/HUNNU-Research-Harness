@@ -13,6 +13,7 @@ from .adapters.springerlink import SpringerLinkAdapter
 from .artifacts import CNKI_UPGRADE_RUN_ROOT, OXFORD_UPGRADE_RUN_ROOT, UPGRADE_RUN_ROOT
 from .institutional import HUNNUInstitutionalAccessResolver, InstitutionalResolutionTrigger
 from .models import LiteratureSearchRequest, RunStatus
+from ..paths import _windows_io_path
 from .planning import LiteratureSearchPlanner
 from .workflow import (
     LiteratureAcquisitionWorkflow,
@@ -28,7 +29,7 @@ DEFAULT_CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 
 def _request_from_args(args: argparse.Namespace) -> LiteratureSearchRequest:
     if getattr(args, "request_json", None):
-        payload = json.loads(Path(args.request_json).read_text(encoding="utf-8-sig"))
+        payload = json.loads(_windows_io_path(Path(args.request_json)).read_text(encoding="utf-8-sig"))
         return LiteratureSearchRequest.from_mapping(payload)
     if getattr(args, "text", None):
         return LiteratureSearchRequest.from_natural_language(args.text)
@@ -292,8 +293,8 @@ def main() -> int:
         result = finalize_captured_sciencedirect_acceptance(
             request=request,
             query=args.query,
-            search_html=args.search_html.read_text(encoding="utf-8"),
-            article_html=args.article_html.read_text(encoding="utf-8"),
+            search_html=_windows_io_path(args.search_html).read_text(encoding="utf-8"),
+            article_html=_windows_io_path(args.article_html).read_text(encoding="utf-8"),
             article_url=args.article_url,
             downloaded_pdf=args.pdf,
             run_root=args.run_root,
@@ -308,8 +309,8 @@ def main() -> int:
         result = finalize_captured_springerlink_acceptance(
             request=request,
             query=args.query,
-            search_html=args.search_html.read_text(encoding="utf-8"),
-            article_html=args.article_html.read_text(encoding="utf-8"),
+            search_html=_windows_io_path(args.search_html).read_text(encoding="utf-8"),
+            article_html=_windows_io_path(args.article_html).read_text(encoding="utf-8"),
             article_url=args.article_url,
             downloaded_pdf=args.pdf,
             run_root=args.run_root,
@@ -324,8 +325,8 @@ def main() -> int:
         result = finalize_captured_cnki_acceptance(
             request=request,
             query=args.query,
-            search_html=args.search_html.read_text(encoding="utf-8"),
-            article_html=args.article_html.read_text(encoding="utf-8"),
+            search_html=_windows_io_path(args.search_html).read_text(encoding="utf-8"),
+            article_html=_windows_io_path(args.article_html).read_text(encoding="utf-8"),
             article_url=args.article_url,
             downloaded_fulltext=args.fulltext,
             run_root=args.run_root,

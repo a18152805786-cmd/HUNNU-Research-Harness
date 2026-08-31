@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import AuthStatus, BrowserState
+from ..paths import _logical_path, _windows_io_path
 
 
 # Titles and opening text a bot-check interstitial shows while it is still
@@ -76,9 +77,9 @@ class PlaywrightBrowser:
         human_wait_poll_seconds: float = DEFAULT_HUMAN_WAIT_POLL_SECONDS,
         human_clear_confirmations: int = DEFAULT_HUMAN_CLEAR_CONFIRMATIONS,
     ):
-        self.profile_dir = Path(profile_dir)
-        self.downloads_dir = Path(downloads_dir)
-        self.executable_path = Path(executable_path) if executable_path else None
+        self.profile_dir = _logical_path(profile_dir)
+        self.downloads_dir = _logical_path(downloads_dir)
+        self.executable_path = _logical_path(executable_path) if executable_path else None
         self.headless = headless
         self.interstitial_wait_seconds = interstitial_wait_seconds
         self.interstitial_poll_seconds = interstitial_poll_seconds
@@ -128,8 +129,8 @@ class PlaywrightBrowser:
             from playwright.async_api import async_playwright
         except ImportError as exc:
             raise PlaywrightUnavailable("Install the optional browser extra: python -m pip install -e .[browser]") from exc
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.profile_dir).mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.downloads_dir).mkdir(parents=True, exist_ok=True)
 
         # A persistent Research Chrome, if one is running, is preferred over a
         # fresh browser: it is holding the institutional session, and launching
@@ -148,7 +149,7 @@ class PlaywrightBrowser:
             await self._direct_downloads_here()
             return
 
-        lock_files = tuple(self.profile_dir.glob("Singleton*"))
+        lock_files = tuple(_windows_io_path(self.profile_dir).glob("Singleton*"))
         if lock_files:
             raise ProfileLockedError(f"Dedicated Chrome profile appears locked: {', '.join(p.name for p in lock_files)}")
         self._playwright = await async_playwright().start()
@@ -355,7 +356,7 @@ class PlaywrightBrowser:
                 {"guid": event.get("guid", ""), "state": event.get("state", "")}
             ),
         )
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.downloads_dir).mkdir(parents=True, exist_ok=True)
         try:
             await session.send(
                 "Browser.setDownloadBehavior",
@@ -416,7 +417,7 @@ class PlaywrightBrowser:
             await self.click_text(text)
         download = await download_info.value
         target = self.downloads_dir / (download.suggested_filename or "download.bin")
-        await download.save_as(str(target))
+        await download.save_as(str(_windows_io_path(target)))
         return target
 
 

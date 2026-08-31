@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from ..paths import _windows_io_path
 from .models import PDFValidationResult, UNKNOWN
 
 
@@ -12,17 +13,18 @@ class PDFValidator:
     @staticmethod
     def validate(path: Path) -> PDFValidationResult:
         path = Path(path)
-        if not path.exists() or not path.is_file():
+        path_io = _windows_io_path(path)
+        if not path_io.exists() or not path_io.is_file():
             return PDFValidationResult(path, False, False, False, False, None, 0, "File does not exist")
         try:
-            size = path.stat().st_size
+            size = path_io.stat().st_size
         except OSError as exc:
             return PDFValidationResult(path, False, False, False, False, None, 0, str(exc))
         if size <= 0:
             return PDFValidationResult(path, True, False, False, False, None, size, "File is empty")
 
         try:
-            with path.open("rb") as handle:
+            with path_io.open("rb") as handle:
                 header = handle.read(1024)
         except OSError as exc:
             return PDFValidationResult(path, True, True, False, False, None, size, str(exc))
@@ -37,14 +39,15 @@ class PDFValidator:
         try:
             from pypdf import PdfReader  # type: ignore[import-not-found]
 
-            reader = PdfReader(str(path), strict=False)
-            page_count = len(reader.pages)
+            with path_io.open("rb") as handle:
+                reader = PdfReader(handle, strict=False)
+                page_count = len(reader.pages)
             readable = page_count > 0
             if not readable:
                 error = "PDF contains no readable pages"
         except ImportError:
             try:
-                data = path.read_bytes()
+                data = path_io.read_bytes()
                 matches = re.findall(rb"/Type\s*/Page(?!s)\b", data)
                 if matches:
                     page_count = len(matches)

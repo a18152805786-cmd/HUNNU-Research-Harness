@@ -21,6 +21,8 @@ from ..paths import (
     LIBRARY_CATALOG_DIR,
     LIBRARY_PAPERS_DIR,
     PAPERS_BY_TOPIC_DIR,
+    _logical_path,
+    _windows_io_path,
 )
 from .catalog import CatalogReader, CatalogSnapshot
 
@@ -30,7 +32,7 @@ FINGERPRINT_SCHEMA_VERSION = "navigator-fingerprint-0.1"
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with _windows_io_path(path).open("rb") as handle:
         while block := handle.read(chunk_size):
             digest.update(block)
     return digest.hexdigest()
@@ -97,25 +99,32 @@ class LibraryFingerprinter:
         by_topic_dir: Path | None = None,
         reader: CatalogReader | None = None,
     ) -> None:
-        self.catalog_dir = Path(catalog_dir or LIBRARY_CATALOG_DIR)
-        self.papers_dir = Path(papers_dir or LIBRARY_PAPERS_DIR)
-        self.by_topic_dir = Path(by_topic_dir or PAPERS_BY_TOPIC_DIR)
+        self.catalog_dir = _logical_path(catalog_dir or LIBRARY_CATALOG_DIR)
+        self.papers_dir = _logical_path(papers_dir or LIBRARY_PAPERS_DIR)
+        self.by_topic_dir = _logical_path(by_topic_dir or PAPERS_BY_TOPIC_DIR)
         self.reader = reader or CatalogReader()
 
     def capture(self, *, snapshot: CatalogSnapshot | None = None) -> LibraryFingerprint:
         payload: dict[str, Any] = {"schema_version": FINGERPRINT_SCHEMA_VERSION}
 
         payload["catalog_files"] = {
-            path.name: {"sha256": file_sha256(path), "size": path.stat().st_size}
-            for path in sorted(self.catalog_dir.glob("*"))
-            if path.is_file()
+            _logical_path(path).name: {
+                "sha256": file_sha256(path),
+                "size": _windows_io_path(path).stat().st_size,
+            }
+            for path in sorted(_windows_io_path(self.catalog_dir).glob("*"))
+            if _windows_io_path(path).is_file()
         }
 
         papers: dict[str, dict[str, Any]] = {}
-        if self.papers_dir.is_dir():
-            for path in sorted(self.papers_dir.iterdir()):
-                if path.is_file():
-                    papers[path.name] = {"sha256": file_sha256(path), "size": path.stat().st_size}
+        if _windows_io_path(self.papers_dir).is_dir():
+            for path in sorted(_windows_io_path(self.papers_dir).iterdir()):
+                if _windows_io_path(path).is_file():
+                    logical = _logical_path(path)
+                    papers[logical.name] = {
+                        "sha256": file_sha256(path),
+                        "size": _windows_io_path(path).stat().st_size,
+                    }
         payload["papers_files"] = papers
         payload["papers_file_count"] = len(papers)
 
@@ -145,11 +154,13 @@ class LibraryFingerprinter:
         payload["unique_topic_values"] = len(unique_topics)
 
         view: dict[str, int] = {}
-        if self.by_topic_dir.is_dir():
-            for path in sorted(self.by_topic_dir.rglob("*")):
-                if path.is_file():
-                    relative = path.relative_to(self.by_topic_dir).as_posix()
-                    view[relative] = path.stat().st_size
+        if _windows_io_path(self.by_topic_dir).is_dir():
+            root = _logical_path(self.by_topic_dir)
+            for path in sorted(_windows_io_path(self.by_topic_dir).rglob("*")):
+                if _windows_io_path(path).is_file():
+                    logical = _logical_path(path)
+                    relative = logical.relative_to(root).as_posix()
+                    view[relative] = _windows_io_path(path).stat().st_size
         payload["papers_by_topic"] = dict(sorted(view.items()))
         payload["papers_by_topic_entries"] = len(view)
 
@@ -159,7 +170,7 @@ class LibraryFingerprinter:
 
 
 def load_fingerprint(path: Path) -> LibraryFingerprint:
-    return LibraryFingerprint(payload=json.loads(Path(path).read_text(encoding="utf-8-sig")))
+    return LibraryFingerprint(payload=json.loads(_windows_io_path(path).read_text(encoding="utf-8-sig")))
 
 
 __all__ = [

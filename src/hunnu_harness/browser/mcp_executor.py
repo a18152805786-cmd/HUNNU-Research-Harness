@@ -43,6 +43,7 @@ from .commands import (
     SessionHandle,
     UnsupportedCommand,
 )
+from ..paths import _logical_path, _windows_io_path
 
 
 MCP_VERSION_BASELINE = "0.0.79"
@@ -226,9 +227,14 @@ class MCPExecutor:
         if max_download_wait_seconds <= 0:
             raise ValueError("max_download_wait_seconds must be positive")
         self.client = client
-        self.downloads_dir = Path(downloads_dir).expanduser().resolve()
-        self.mcp_path_base = Path(mcp_path_base).expanduser().resolve() if mcp_path_base else None
-        roots = tuple(Path(root).expanduser().resolve() for root in (artifact_roots or (self.downloads_dir,)))
+        self.downloads_dir = _logical_path(Path(downloads_dir).expanduser())
+        self.mcp_path_base = (
+            _logical_path(Path(mcp_path_base).expanduser()) if mcp_path_base else None
+        )
+        roots = tuple(
+            _logical_path(Path(root).expanduser())
+            for root in (artifact_roots or (self.downloads_dir,))
+        )
         if not roots:
             raise ValueError("MCPExecutor requires at least one artifact root")
         self._artifact_roots = roots
@@ -897,15 +903,18 @@ class MCPExecutor:
         return name if name and name == raw else None
 
     def _download_directory_state(self) -> dict[Path, tuple[int, int, int]]:
-        if not self.downloads_dir.is_dir():
+        downloads_io = _windows_io_path(self.downloads_dir)
+        if not downloads_io.is_dir():
             return {}
         state: dict[Path, tuple[int, int, int]] = {}
-        for candidate in self.downloads_dir.iterdir():
+        for raw_candidate in downloads_io.iterdir():
             try:
-                if not candidate.is_file():
+                candidate = _logical_path(raw_candidate)
+                candidate_io = _windows_io_path(candidate)
+                if not candidate_io.is_file():
                     continue
-                resolved = candidate.resolve()
-                stat = resolved.stat()
+                resolved = _logical_path(candidate)
+                stat = _windows_io_path(resolved).stat()
             except OSError:
                 continue
             state[resolved] = (stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
@@ -1012,7 +1021,7 @@ class MCPExecutor:
         if suffix not in _DOWNLOAD_FINAL_SUFFIXES:
             return None
         try:
-            with path.open("rb") as stream:
+            with _windows_io_path(path).open("rb") as stream:
                 header = stream.read(512)
         except OSError as exc:
             raise DownloadFailure(f"MCP downloaded artifact could not be read: {path}") from exc
@@ -1040,8 +1049,9 @@ class MCPExecutor:
         )
         previous_size: int | None = None
         while time.monotonic() <= deadline:
-            if path.is_file():
-                size = path.stat().st_size
+            path_io = _windows_io_path(path)
+            if path_io.is_file():
+                size = path_io.stat().st_size
                 if previous_size == size:
                     return path
                 previous_size = size
@@ -1062,11 +1072,11 @@ class MCPExecutor:
                 candidates.append(self.mcp_path_base / raw)
         approved_candidates: list[Path] = []
         for candidate in candidates:
-            resolved = candidate.resolve()
+            resolved = _logical_path(candidate)
             if not any(resolved == root or resolved.is_relative_to(root) for root in self._artifact_roots):
                 continue
             approved_candidates.append(resolved)
-            if resolved.is_file():
+            if _windows_io_path(resolved).is_file():
                 return resolved
         if approved_candidates:
             # The MCP event can precede the final filesystem rename. Return

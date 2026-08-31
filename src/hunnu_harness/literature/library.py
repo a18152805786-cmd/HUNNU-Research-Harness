@@ -13,7 +13,6 @@ import os
 import re
 import shutil
 import stat
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -25,6 +24,13 @@ from ..paths import (
     LIBRARY_CATALOG_JSONL,
     LIBRARY_IMPORT_STAGING_DIR,
     LIBRARY_ROOT,
+    _WINDOWS_EXTENDED_PATH_LIMIT,
+    _WINDOWS_MAX_COMPONENT_LENGTH,
+    _TRANSACTION_TOKEN_LENGTH,
+    _logical_path,
+    _transaction_token,
+    _windows_io_path,
+    _windows_path_units,
     require_output_path,
 )
 from .fulltext import (
@@ -128,14 +134,19 @@ def _unique_strings(values: Iterable[Any]) -> list[str]:
     return result
 
 
+def _library_sha256_file(path: Path) -> str:
+    return sha256_file(_windows_io_path(path))
+
+
 def _atomic_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+    temporary_io = _windows_io_path(temporary)
     try:
-        temporary.write_text(content, encoding="utf-8", newline="\n")
-        temporary.replace(path)
+        temporary_io.write_text(content, encoding="utf-8", newline="\n")
+        temporary_io.replace(_windows_io_path(path))
     finally:
-        temporary.unlink(missing_ok=True)
+        temporary_io.unlink(missing_ok=True)
 
 
 class GlobalPaperLibrary:
@@ -148,9 +159,23 @@ class GlobalPaperLibrary:
         allow_outside_output_for_tests: bool = False,
         make_managed_read_only: bool = True,
     ) -> None:
-        self.library_root = Path(library_root).resolve()
+        try:
+            self.library_root = _logical_path(library_root)
+        except OSError as exc:
+            raise ValueError(
+                "Global Paper Library cannot resolve its configured Output Root path. "
+                "Set HUNNU_HARNESS_OUTPUT_ROOT to a shorter, shallower directory "
+                "and retry."
+            ) from exc
         if not allow_outside_output_for_tests:
-            self.library_root = require_output_path(self.library_root, label="Global Paper Library")
+            try:
+                self.library_root = require_output_path(self.library_root, label="Global Paper Library")
+            except OSError as exc:
+                raise ValueError(
+                    "Global Paper Library cannot initialize because its configured Output Root "
+                    "path is too deep for Windows path resolution. Set "
+                    "HUNNU_HARNESS_OUTPUT_ROOT to a shorter, shallower directory and retry."
+                ) from exc
         self.path_base = self.library_root.parent
         self.papers_dir = self.library_root / "papers"
         self.notes_dir = self.library_root / "notes"
@@ -159,8 +184,9 @@ class GlobalPaperLibrary:
         self.catalog_csv_path = self.catalog_dir / LIBRARY_CATALOG_CSV.name
         self.import_staging_dir = self.library_root / LIBRARY_IMPORT_STAGING_DIR.name
         self.review_dir = self.import_staging_dir / "review"
-        self.transaction_dir = self.import_staging_dir / ".transactions"
+        self.transaction_dir = self.library_root / ".transactions"
         self.make_managed_read_only = make_managed_read_only
+        self._check_windows_path_lengths()
         self.ensure_contract()
 
     def ensure_contract(self) -> None:
@@ -172,21 +198,85 @@ class GlobalPaperLibrary:
             self.review_dir,
             self.transaction_dir,
         ):
-            directory.mkdir(parents=True, exist_ok=True)
-        if self.catalog_csv_path.exists() and not self.catalog_jsonl_path.exists():
+            _windows_io_path(directory).mkdir(parents=True, exist_ok=True)
+        if _windows_io_path(self.catalog_csv_path).exists() and not _windows_io_path(
+            self.catalog_jsonl_path
+        ).exists():
             raise LibraryCatalogError(
                 "CSV projection exists without the JSONL source of truth; refusing to guess"
             )
-        if not self.catalog_jsonl_path.exists():
+        if not _windows_io_path(self.catalog_jsonl_path).exists():
             self._commit_catalog_only([])
-        elif not self.catalog_csv_path.exists():
+        elif not _windows_io_path(self.catalog_csv_path).exists():
             self._commit_catalog_only(self._load_catalog())
+
+    def _check_windows_path_lengths(self) -> None:
+        """Reject only paths that Windows extended-length I/O cannot support."""
+
+        if os.name != "nt":
+            return
+
+        alternate_name = f"P{'0' * 12}__{'0' * 64}.pdf"
+        staging_name = f"{'0' * 64}.pdf"
+        derived_paths = (
+            ("library root", self.library_root),
+            ("managed papers directory", self.papers_dir),
+            ("notes directory", self.notes_dir),
+            ("catalog directory", self.catalog_dir),
+            ("catalog JSONL", self.catalog_jsonl_path),
+            ("catalog CSV", self.catalog_csv_path),
+            ("import staging directory", self.import_staging_dir),
+            ("review directory", self.review_dir),
+            ("transaction directory", self.transaction_dir),
+            ("primary managed paper", self.papers_dir / "P000000000000.pdf"),
+            ("alternate managed paper", self.papers_dir / alternate_name),
+            (
+                "catalog transaction JSONL",
+                self.transaction_dir / f"papers.{'0' * _TRANSACTION_TOKEN_LENGTH}.jsonl.tmp",
+            ),
+            (
+                "catalog transaction CSV",
+                self.transaction_dir / f"papers.{'0' * _TRANSACTION_TOKEN_LENGTH}.csv.tmp",
+            ),
+            (
+                "managed-file transaction",
+                self.transaction_dir / f".{alternate_name}.{'0' * _TRANSACTION_TOKEN_LENGTH}.tmp",
+            ),
+            ("staging candidate", self.import_staging_dir / "candidates" / staging_name),
+            (
+                "staging sidecar",
+                self.import_staging_dir / "candidates" / f"{staging_name[:-4]}.staging.json",
+            ),
+        )
+        for label, path in derived_paths:
+            io_path = _windows_io_path(path)
+            units = _windows_path_units(io_path)
+            if units >= _WINDOWS_EXTENDED_PATH_LIMIT:
+                raise ValueError(
+                    "Global Paper Library cannot initialize because a derived Windows path "
+                    f"is too long ({label}: {units} UTF-16 code units): {path}. "
+                    f"The configured Output Root ({self.path_base}) is too deep or too long; set "
+                    "HUNNU_HARNESS_OUTPUT_ROOT to a shorter, shallower directory "
+                    "(for example C:\\HUNNU-Output) and retry."
+                )
+            for component in path.parts:
+                if component == path.anchor:
+                    continue
+                component_units = _windows_path_units(component)
+                if component_units > _WINDOWS_MAX_COMPONENT_LENGTH:
+                    raise ValueError(
+                        "Global Paper Library cannot initialize because a derived Windows path "
+                        f"component is too long ({label}: {component_units} UTF-16 code units). "
+                        f"The configured Output Root ({self.path_base}) is too deep or too long; set "
+                        "HUNNU_HARNESS_OUTPUT_ROOT to a shorter, shallower directory "
+                        "and retry."
+                    )
 
     def notes_path(self, paper_id: str, *, create: bool = False) -> Path:
         self._require_paper_id(paper_id)
         path = self.notes_dir / paper_id
         if create:
-            path.mkdir(parents=True, exist_ok=True)
+            _windows_io_path(path).mkdir(parents=True, exist_ok=True)
         return path
 
     def ingest_acquired_fulltext(
@@ -245,9 +335,12 @@ class GlobalPaperLibrary:
         version_role: str,
         require_target_identity: bool,
     ) -> LibraryIngestResult:
-        source = Path(source).resolve()
-        source_digest_before = sha256_file(source) if source.exists() and source.is_file() else UNKNOWN
-        validation = AuthorizedFullTextValidator.validate(source, full_text_format, record=record)
+        source = _logical_path(source)
+        source_io = _windows_io_path(source)
+        source_digest_before = (
+            _library_sha256_file(source) if source_io.exists() and source_io.is_file() else UNKNOWN
+        )
+        validation = AuthorizedFullTextValidator.validate(source_io, full_text_format, record=record)
         if not validation.passed:
             disposition = (
                 LibraryDisposition.INVALID_PDF
@@ -276,7 +369,7 @@ class GlobalPaperLibrary:
         external_identity_reason = UNKNOWN
         if source_type == "EXTERNAL_IMPORT":
             verification = verify_external_paper_identity(
-                source,
+                source_io,
                 record,
                 validation=validation,
             )
@@ -332,7 +425,7 @@ class GlobalPaperLibrary:
                     reason=f"Same-work evidence is already cataloged under {conflicting_paper}",
                 )
             destination = self.papers_dir / f"{paper_id}{extension}"
-            if destination.exists():
+            if _windows_io_path(destination).exists():
                 return self._reject(
                     LibraryDisposition.IDENTITY_CONFLICT,
                     record,
@@ -367,7 +460,11 @@ class GlobalPaperLibrary:
             version = next((item for item in existing.get("versions", []) if item.get("sha256") == digest), None)
             if version is not None:
                 managed = self._absolute_managed_path(version.get("managed_path", UNKNOWN))
-                if managed is None or not managed.exists() or sha256_file(managed) != digest:
+                if (
+                    managed is None
+                    or not _windows_io_path(managed).exists()
+                    or _library_sha256_file(managed) != digest
+                ):
                     return self._reject(
                         LibraryDisposition.IDENTITY_CONFLICT,
                         record,
@@ -403,7 +500,7 @@ class GlobalPaperLibrary:
                 )
 
             destination = self.papers_dir / f"{paper_id}__{digest}{extension}"
-            if destination.exists():
+            if _windows_io_path(destination).exists():
                 return self._reject(
                     LibraryDisposition.IDENTITY_CONFLICT,
                     record,
@@ -642,12 +739,13 @@ class GlobalPaperLibrary:
         return None
 
     def _load_catalog(self) -> list[dict[str, Any]]:
-        if not self.catalog_jsonl_path.exists():
+        catalog_path = _windows_io_path(self.catalog_jsonl_path)
+        if not catalog_path.exists():
             return []
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
         try:
-            lines = self.catalog_jsonl_path.read_text(encoding="utf-8-sig").splitlines()
+            lines = catalog_path.read_text(encoding="utf-8-sig").splitlines()
             for line_number, line in enumerate(lines, start=1):
                 if not line.strip():
                     continue
@@ -682,40 +780,40 @@ class GlobalPaperLibrary:
                 temporary_dir=self.transaction_dir,
             )
             managed_created = True
-            notes_path.mkdir(parents=True, exist_ok=True)
+            _windows_io_path(notes_path).mkdir(parents=True, exist_ok=True)
             if self.make_managed_read_only:
-                destination.chmod(destination.stat().st_mode & ~stat.S_IWRITE)
-            json_temp.replace(self.catalog_jsonl_path)
+                destination_io = _windows_io_path(destination)
+                destination_io.chmod(destination_io.stat().st_mode & ~stat.S_IWRITE)
+            _windows_io_path(json_temp).replace(_windows_io_path(self.catalog_jsonl_path))
             json_committed = True
-            csv_temp.replace(self.catalog_csv_path)
+            _windows_io_path(csv_temp).replace(_windows_io_path(self.catalog_csv_path))
         except Exception:
             if managed_created and not json_committed:
-                destination.chmod(destination.stat().st_mode | stat.S_IWRITE)
-                destination.unlink(missing_ok=True)
+                GlobalPaperLibrary._unlink_read_only_path(destination)
             raise
         finally:
-            json_temp.unlink(missing_ok=True)
-            csv_temp.unlink(missing_ok=True)
+            GlobalPaperLibrary._unlink_read_only_path(json_temp)
+            GlobalPaperLibrary._unlink_read_only_path(csv_temp)
 
     def _commit_catalog_only(self, catalog: list[dict[str, Any]]) -> None:
         json_temp, csv_temp = self._prepare_catalog_files(catalog)
         try:
-            json_temp.replace(self.catalog_jsonl_path)
-            csv_temp.replace(self.catalog_csv_path)
+            _windows_io_path(json_temp).replace(_windows_io_path(self.catalog_jsonl_path))
+            _windows_io_path(csv_temp).replace(_windows_io_path(self.catalog_csv_path))
         finally:
-            json_temp.unlink(missing_ok=True)
-            csv_temp.unlink(missing_ok=True)
+            GlobalPaperLibrary._unlink_read_only_path(json_temp)
+            GlobalPaperLibrary._unlink_read_only_path(csv_temp)
 
     def _prepare_catalog_files(self, catalog: list[dict[str, Any]]) -> tuple[Path, Path]:
         ordered = sorted(catalog, key=lambda item: str(item["paper_id"]).casefold())
-        transaction = f"{os.getpid()}.{uuid.uuid4().hex}"
+        transaction = _transaction_token()
         json_temp = self.transaction_dir / f"papers.{transaction}.jsonl.tmp"
         csv_temp = self.transaction_dir / f"papers.{transaction}.csv.tmp"
         json_content = "".join(
             json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in ordered
         )
-        json_temp.write_text(json_content, encoding="utf-8", newline="\n")
-        with csv_temp.open("w", encoding="utf-8-sig", newline="") as handle:
+        _windows_io_path(json_temp).write_text(json_content, encoding="utf-8", newline="\n")
+        with _windows_io_path(csv_temp).open("w", encoding="utf-8-sig", newline="") as handle:
             fields = (
                 "paper_id",
                 "doi",
@@ -760,22 +858,22 @@ class GlobalPaperLibrary:
         *,
         temporary_dir: Path | None = None,
     ) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
+        _windows_io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+        if _windows_io_path(destination).exists():
             raise FileExistsError(f"Managed destination exists: {destination}")
         temporary_root = Path(temporary_dir) if temporary_dir is not None else destination.parent
-        temporary_root.mkdir(parents=True, exist_ok=True)
-        temporary = temporary_root / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+        _windows_io_path(temporary_root).mkdir(parents=True, exist_ok=True)
+        temporary = temporary_root / f".{destination.name}.{_transaction_token()}.tmp"
         destination_created = False
         try:
-            shutil.copy2(source, temporary)
-            if sha256_file(temporary) != digest:
+            shutil.copy2(_windows_io_path(source), _windows_io_path(temporary))
+            if _library_sha256_file(temporary) != digest:
                 raise OSError("COPY verification failed: source and temporary SHA256 differ")
             # The hard-link commit is atomic and fails if the destination appears
             # concurrently.  It never replaces an existing managed paper.
-            os.link(temporary, destination)
+            os.link(_windows_io_path(temporary), _windows_io_path(destination))
             destination_created = True
-            if sha256_file(destination) != digest:
+            if _library_sha256_file(destination) != digest:
                 raise OSError("COPY verification failed: destination SHA256 differs")
         except Exception:
             if destination_created:
@@ -788,11 +886,12 @@ class GlobalPaperLibrary:
     def _unlink_read_only_path(path: Path) -> None:
         """Remove a controlled transaction path even when copy2 preserved ReadOnly."""
 
+        path_io = _windows_io_path(path)
         try:
-            path.chmod(path.stat().st_mode | stat.S_IWRITE)
+            path_io.chmod(path_io.stat().st_mode | stat.S_IWRITE)
         except FileNotFoundError:
             return
-        path.unlink(missing_ok=True)
+        path_io.unlink(missing_ok=True)
 
     def _reject(
         self,
@@ -839,7 +938,7 @@ class GlobalPaperLibrary:
 
     def _relative(self, path: Path) -> str:
         try:
-            return path.resolve().relative_to(self.path_base.resolve()).as_posix()
+            return _logical_path(path).relative_to(_logical_path(self.path_base)).as_posix()
         except ValueError:
             raise ValueError("Managed library paths must share the configured Output Root")
 
@@ -847,8 +946,9 @@ class GlobalPaperLibrary:
         text = str(value).strip()
         if not text or text == UNKNOWN:
             return None
-        candidate = (self.path_base / Path(text)).resolve()
-        if candidate != self.papers_dir and not candidate.is_relative_to(self.papers_dir):
+        candidate = _logical_path(self.path_base / Path(text))
+        papers_dir = _logical_path(self.papers_dir)
+        if candidate != papers_dir and not candidate.is_relative_to(papers_dir):
             return None
         return candidate
 
@@ -859,11 +959,12 @@ class GlobalPaperLibrary:
 
     @staticmethod
     def _source_unchanged(source: Path, digest_before: str) -> bool:
+        source_io = _windows_io_path(source)
         return (
             digest_before != UNKNOWN
-            and source.exists()
-            and source.is_file()
-            and sha256_file(source) == digest_before
+            and source_io.exists()
+            and source_io.is_file()
+            and _library_sha256_file(source) == digest_before
         )
 
 
@@ -873,27 +974,28 @@ class ExternalPaperImporter:
     def __init__(self, library: GlobalPaperLibrary | None = None) -> None:
         self.library = library or GlobalPaperLibrary()
         self.candidates_dir = self.library.import_staging_dir / "candidates"
-        self.candidates_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.candidates_dir).mkdir(parents=True, exist_ok=True)
 
     def stage_pdf(self, source: Path) -> StagedPaperCandidate:
-        source = Path(source).resolve()
-        if not source.exists() or not source.is_file():
+        source = _logical_path(source)
+        source_io = _windows_io_path(source)
+        if not source_io.exists() or not source_io.is_file():
             raise FileNotFoundError(f"External paper candidate does not exist: {source}")
-        digest_before = sha256_file(source)
+        digest_before = _library_sha256_file(source)
         staged = self.candidates_dir / f"{digest_before}.pdf"
-        if staged.exists():
-            if sha256_file(staged) != digest_before:
+        if _windows_io_path(staged).exists():
+            if _library_sha256_file(staged) != digest_before:
                 raise FileExistsError("Staging destination exists with conflicting content")
         else:
             self.library._copy_no_overwrite_verified(source, staged, digest_before)
-        if sha256_file(source) != digest_before:
+        if _library_sha256_file(source) != digest_before:
             raise OSError("External source changed during COPY staging")
 
         sidecar = staged.with_suffix(".staging.json")
         original_paths: list[str] = []
-        if sidecar.exists():
+        if _windows_io_path(sidecar).exists():
             try:
-                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+                payload = json.loads(_windows_io_path(sidecar).read_text(encoding="utf-8"))
                 original_paths.extend(payload.get("OriginalSourcePaths", []))
             except (OSError, json.JSONDecodeError, AttributeError) as exc:
                 raise LibraryCatalogError("Staging sidecar is unreadable; refusing to overwrite it") from exc
@@ -920,17 +1022,18 @@ class ExternalPaperImporter:
         staged_pdf: Path,
         metadata: Mapping[str, Any],
     ) -> LibraryIngestResult:
-        staged_pdf = Path(staged_pdf).resolve()
+        staged_pdf = _logical_path(staged_pdf)
+        candidates_dir = _logical_path(self.candidates_dir)
         if not (
-            staged_pdf == self.candidates_dir.resolve()
-            or staged_pdf.is_relative_to(self.candidates_dir.resolve())
+            staged_pdf == candidates_dir
+            or staged_pdf.is_relative_to(candidates_dir)
         ):
             raise UnsafeImportSource("External imports must come from library/import_staging/candidates")
         sidecar = staged_pdf.with_suffix(".staging.json")
-        if not sidecar.exists():
+        if not _windows_io_path(sidecar).exists():
             raise UnsafeImportSource("Staged candidate is missing its COPY provenance sidecar")
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
-        if payload.get("SHA256") != sha256_file(staged_pdf):
+        payload = json.loads(_windows_io_path(sidecar).read_text(encoding="utf-8"))
+        if payload.get("SHA256") != _library_sha256_file(staged_pdf):
             raise UnsafeImportSource("Staged candidate no longer matches its recorded SHA256")
 
         staged_digest = str(payload["SHA256"])
@@ -959,7 +1062,7 @@ class ExternalPaperImporter:
             ),
         )
         validation = AuthorizedFullTextValidator.validate(
-            staged_pdf,
+            _windows_io_path(staged_pdf),
             FullTextFormat.PDF,
             record=claimed_record,
         )
@@ -982,7 +1085,7 @@ class ExternalPaperImporter:
                 reason=reason,
             )
         verification = verify_external_paper_identity(
-            staged_pdf,
+            _windows_io_path(staged_pdf),
             claimed_record,
             validation=validation,
         )

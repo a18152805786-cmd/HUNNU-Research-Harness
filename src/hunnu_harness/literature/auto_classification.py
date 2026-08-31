@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from ..paths import LIBRARY_CATALOG_JSONL, OUTPUT_ROOT
+from ..paths import LIBRARY_CATALOG_JSONL, OUTPUT_ROOT, _logical_path, _windows_io_path
 from .classification import (
     ClassificationInput,
     ClassificationMode,
@@ -130,7 +130,7 @@ class PostAcquisitionClassifier:
         )
         self.classifier = classifier or WorkClassifier(taxonomy=taxonomy)
         self.view = view or TopicViewBuilder()
-        self.catalog_path = Path(catalog_path or LIBRARY_CATALOG_JSONL)
+        self.catalog_path = _logical_path(catalog_path or LIBRARY_CATALOG_JSONL)
         self.fulltext_reader = fulltext_reader
 
     @property
@@ -161,12 +161,13 @@ class PostAcquisitionClassifier:
         )
 
     def _catalog_entry(self, paper_id: str) -> Mapping[str, Any] | None:
-        if not self.catalog_path.exists():
+        catalog_io = _windows_io_path(self.catalog_path)
+        if not catalog_io.exists():
             return None
         import json
 
         try:
-            text = self.catalog_path.read_text(encoding="utf-8")
+            text = catalog_io.read_text(encoding="utf-8")
         except OSError:
             return None
         for line in text.splitlines():
@@ -619,7 +620,7 @@ def _absolute_managed(value: str) -> str:
     candidate = Path(value)
     if candidate.is_absolute():
         return str(candidate)
-    return str((OUTPUT_ROOT / candidate).resolve())
+    return str(_logical_path(OUTPUT_ROOT / candidate))
 
 
 def _readable_name(catalog: Mapping[str, Any], paper_id: str, managed: str) -> str:

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .pdf_preferences import DEFAULT_RESEARCH_CHROME_PROFILE
+from ..paths import _logical_path, _windows_io_path
 
 # Not Chrome's conventional 9222: a Harness browser should not silently adopt,
 # or be adopted by, some other tool's debugging session.
@@ -138,16 +139,16 @@ def start_persistent_browser(
     if existing.running:
         return existing
 
-    profile = Path(profile_dir or DEFAULT_RESEARCH_CHROME_PROFILE).expanduser().resolve()
-    locks = tuple(profile.glob("Singleton*"))
+    profile = _logical_path(Path(profile_dir or DEFAULT_RESEARCH_CHROME_PROFILE).expanduser())
+    locks = tuple(_windows_io_path(profile).glob("Singleton*"))
     if locks:
         raise PersistentBrowserError(
             "Research Chrome profile is already held by a browser without a debugging port; "
             "close it before starting the persistent one"
         )
-    profile.mkdir(parents=True, exist_ok=True)
+    _windows_io_path(profile).mkdir(parents=True, exist_ok=True)
     chrome = Path(chrome_executable)
-    if not chrome.is_file():
+    if not _windows_io_path(chrome).is_file():
         raise PersistentBrowserError(f"Chrome executable not found: {chrome}")
 
     command = [
