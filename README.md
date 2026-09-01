@@ -1,4 +1,4 @@
-# HUNNU Research Harness v0.3.1
+# HUNNU Research Harness v0.3.2
 
 ## 给安装 Agent 的指引（拿到 zip 后先读这一节）
 
