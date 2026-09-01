@@ -12,7 +12,7 @@ import inspect
 import re
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from .authorized_file_capture import (
     AcquisitionMethod,
@@ -681,6 +681,7 @@ class LocalPlaywrightExecutor:
         from . import browser_directed_download as directed_module
         from .browser_directed_download import (
             BrowserDirectedDownload,
+            DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
             DirectedDownloadFailure,
             lease_for,
             pii_from_url,
@@ -689,14 +690,26 @@ class LocalPlaywrightExecutor:
         spec = command.capture
         # The locked identity, in order of directness: the authorized URL when
         # the caller supplied one, otherwise the control the caller bound the
-        # command to, otherwise the article the page is on.  All three are the
-        # same paper by the time a download command is issued -- the adapter has
-        # already refused any control not bound to the locked article.
+        # command to, otherwise the article the page is on, otherwise the
+        # resolved control's own href.  All four are the same paper by the time
+        # a download command is issued -- the adapter has already refused any
+        # control not bound to the locked article.
         locked_pii = pii_from_url(getattr(spec, "expected_url", "") or "")
         if not locked_pii:
             locked_pii = pii_from_url(command.target.css or "")
         if not locked_pii:
             locked_pii = pii_from_url(self._page_url(self._require_page()))
+        if not locked_pii:
+            get_attribute = getattr(locator, "get_attribute", None)
+            if callable(get_attribute):
+                try:
+                    href = await _maybe_await(get_attribute("href"))
+                except Exception:
+                    href = None
+                if isinstance(href, str):
+                    locked_pii = pii_from_url(
+                        urljoin(self._page_url(self._require_page()), href)
+                    )
         if not locked_pii:
             # Nothing to bind the download to.  A file that cannot be tied to
             # the locked target must not be accepted merely for arriving.
@@ -704,10 +717,17 @@ class LocalPlaywrightExecutor:
                 "Directed download requires a target naming the paper being downloaded"
             )
 
+        declared_hosts = getattr(spec, "trusted_hosts", ()) if spec is not None else ()
+        allowed_hosts = (
+            frozenset(host.casefold() for host in declared_hosts)
+            if declared_hosts
+            else DIRECTED_DOWNLOAD_DEFAULT_HOSTS
+        )
         directed = BrowserDirectedDownload(
             session=session,
             download_dir=self.downloads_dir,
             locked_pii=locked_pii,
+            allowed_hosts=allowed_hosts,
             lease=lease_for(backend),
             # Read from the module rather than taken as dataclass defaults, so
             # the waits are one adjustable place instead of values frozen when

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from ..paths import _windows_io_path
 
@@ -43,8 +43,21 @@ ELSEVIER_PDF_HOSTS = frozenset(
     }
 )
 
+# Intentional allowlist widening: attached-mode adapters that issue a bare
+# DownloadCommand have no DownloadCaptureSpec.trusted_hosts declaration channel.
+# CNKI's vetted single-paper controls deliver through these explicit hosts.
+DIRECTED_DOWNLOAD_DEFAULT_HOSTS = ELSEVIER_PDF_HOSTS | frozenset(
+    {"bar.cnki.net", "download.cnki.net"}
+)
+
 _PII_IN_URL = re.compile(r"[?&]pii=([A-Za-z0-9]+)", re.IGNORECASE)
 _PII_IN_PATH = re.compile(r"/pii/([A-Za-z0-9]+)", re.IGNORECASE)
+_OUP_ARTICLE_PDF_PATH = re.compile(
+    r"/article-pdf/(?:[^/?#]+/)+([A-Za-z0-9][A-Za-z0-9._-]*)\.pdf$",
+    re.IGNORECASE,
+)
+_CNKI_ORDER_HOST = "bar.cnki.net"
+_CNKI_ORDER_PATH = "/bar/download/order"
 
 DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS = 45.0
 DEFAULT_COMPLETION_TIMEOUT_SECONDS = 120.0
@@ -87,14 +100,31 @@ class DirectedDownloadResult:
 def pii_from_url(url: str) -> str:
     """The paper identifier a download URL names, or empty when it names none.
 
-    The query parameter is preferred over the path: a delivery URL carries the
-    article's own identifier in ``pii=`` while its path is the storage layout.
+    Existing ``pii=`` and ``/pii/`` forms keep priority.  The only additional
+    identities are an OUP main-article PDF stem and a CNKI single-paper order
+    id; an arbitrary PDF filename remains insufficient.
     """
 
+    value = url or ""
     for pattern in (_PII_IN_URL, _PII_IN_PATH):
-        found = pattern.search(url or "")
+        found = pattern.search(value)
         if found:
             return found.group(1)
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+
+    found = _OUP_ARTICLE_PDF_PATH.search(parsed.path)
+    if found:
+        return found.group(1)
+
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host == _CNKI_ORDER_HOST and parsed.path.casefold() == _CNKI_ORDER_PATH:
+        for key, candidate in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.casefold() == "id" and candidate:
+                return candidate
     return ""
 
 
@@ -173,7 +203,7 @@ class BrowserDirectedDownload:
     session: Any
     download_dir: Path
     locked_pii: str
-    allowed_hosts: frozenset[str] = ELSEVIER_PDF_HOSTS
+    allowed_hosts: frozenset[str] = DIRECTED_DOWNLOAD_DEFAULT_HOSTS
     will_begin_timeout: float = DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS
     completion_timeout: float = DEFAULT_COMPLETION_TIMEOUT_SECONDS
     settle_seconds: float = DEFAULT_SETTLE_SECONDS
@@ -341,6 +371,7 @@ class BrowserDirectedDownload:
 __all__ = [
     "DEFAULT_COMPLETION_TIMEOUT_SECONDS",
     "DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS",
+    "DIRECTED_DOWNLOAD_DEFAULT_HOSTS",
     "ELSEVIER_PDF_HOSTS",
     "BrowserDirectedDownload",
     "DirectedDownloadFailure",
