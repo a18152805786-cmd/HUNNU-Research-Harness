@@ -1111,6 +1111,7 @@ class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(command.target.css)
             self.assertEqual(command.target.text, "PDF下载")
             self.assertTrue(command.target.exact_text)
+            self.assertEqual(command.identity_labels, (record.title,))
 
     async def test_failed_pdf_download_does_not_blindly_retry_caj(self) -> None:
         snapshot = fixture("cnki_article_snapshot.yml")
@@ -1147,8 +1148,13 @@ class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
         access = CNKIAdapter.check_fulltext_access_snapshot(snapshot, source_url=ARTICLE_URL)
         with isolated_fetch_ledger() as ledger:
             adapter.fetch_ledger = ledger
-            with self.assertRaises(SourceUnavailable):
+            with self.assertRaises(SourceUnavailable) as caught:
                 await adapter.download_fulltext(record, access)
+
+        self.assertIn(
+            "DownloadFailure: download result is uncertain",
+            str(caught.exception),
+        )
 
         downloads = [item for item in browser.commands if isinstance(item, DownloadCommand)]
         self.assertEqual(len(downloads), 1)

@@ -6,11 +6,12 @@ staged while the run reported that no download had happened, because the
 browser's own account of the download removes that dependency.
 
 What these pin is that removing it costs nothing in rigour.  The paper's
-identifier has to match either the recognised URL identity or the exact stem of
-a suggested ``.pdf``/``.caj`` filename; the delivery host still has to be one
-this Harness recognises; only the GUID of *this* download counts, and only after
-the browser says it completed.  A file that merely turns up in the directory
-proves nothing and is never enough.
+identifier has to match the recognised URL identity, the exact stem of a
+suggested ``.pdf``/``.caj`` filename, or a sufficiently long bibliographic label
+the adapter explicitly declared; the delivery host still has to be one this
+Harness recognises; only the GUID of *this* download counts, and only after the
+browser says it completed.  A file that merely turns up in the directory proves
+nothing and is never enough.
 """
 
 from __future__ import annotations
@@ -52,6 +53,10 @@ CNKI_ORDER_ID = "CNKI_ORDER_20260901_ABC123"
 CNKI_ORDER_URL = (
     f"https://bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}&filename=paper.pdf"
 )
+CNKI_TITLE = "数字化转型与企业分工：专业化还是纵向一体化"
+CNKI_AUTHOR = "袁淳"
+CNKI_DECLARED_FILENAME = f"{CNKI_TITLE}_{CNKI_AUTHOR}.pdf"
+CNKI_OPAQUE_DELIVERY_URL = "https://download.cnki.net/final/paper?token=opaque"
 PDF_BYTES = b"%PDF-1.7\n" + b"x" * 4096 + b"\n%%EOF\n"
 
 
@@ -107,6 +112,7 @@ class _Fixture:
         root: Path,
         *,
         locked: str = PII,
+        locked_labels: tuple[str, ...] = (),
         allowed_hosts: frozenset[str] = DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
     ) -> None:
         self.session = _Session()
@@ -115,6 +121,7 @@ class _Fixture:
             session=self.session,
             download_dir=self.dir,
             locked_pii=locked,
+            locked_labels=locked_labels,
             allowed_hosts=allowed_hosts,
             will_begin_timeout=0.6,
             completion_timeout=1.2,
@@ -229,6 +236,55 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(result.source_url_host, OUP_CDN_HOST)
             self.assertEqual(result.path.name, OUP_FILENAME)
 
+    def test_declared_title_label_claims_filename_with_author_suffix(self) -> None:
+        self.assertEqual(pii_from_url(CNKI_OPAQUE_DELIVERY_URL), "")
+        with temp_root("bdd-declared-title-") as tmp:
+            fixture = _Fixture(
+                Path(tmp),
+                locked=CNKI_ORDER_ID,
+                locked_labels=(CNKI_TITLE,),
+            )
+
+            async def script(f):
+                f.session.emit(
+                    "Browser.downloadWillBegin",
+                    begin(
+                        url=CNKI_OPAQUE_DELIVERY_URL,
+                        filename=CNKI_DECLARED_FILENAME,
+                    ),
+                )
+                f.land(CNKI_DECLARED_FILENAME)
+                f.session.emit("Browser.downloadProgress", progress())
+
+            result = run(fixture, script)
+
+            self.assertEqual(result.source_pii, CNKI_TITLE)
+            self.assertEqual(result.source_url_host, "download.cnki.net")
+            self.assertEqual(result.path.name, CNKI_DECLARED_FILENAME)
+
+    def test_declared_label_matching_normalizes_nfkc_case_and_whitespace(self) -> None:
+        label = "数字化转型:Professional Evidence"
+        filename = "数字化 转型：professional evidence_袁淳.caj"
+        with temp_root("bdd-declared-normalized-") as tmp:
+            fixture = _Fixture(
+                Path(tmp),
+                locked=CNKI_ORDER_ID,
+                locked_labels=(label,),
+            )
+
+            async def script(f):
+                f.session.emit(
+                    "Browser.downloadWillBegin",
+                    begin(url=CNKI_OPAQUE_DELIVERY_URL, filename=filename),
+                )
+                f.land(filename)
+                f.session.emit("Browser.downloadProgress", progress())
+
+            result = run(fixture, script)
+
+            self.assertEqual(result.source_pii, label)
+            self.assertEqual(result.path.name, filename)
+
     def test_the_browser_is_pointed_at_this_run(self) -> None:
         with temp_root("bdd-dir-") as tmp:
             fixture = _Fixture(Path(tmp))
@@ -264,11 +320,15 @@ class RejectionTests(unittest.TestCase):
         script,
         *,
         locked: str = PII,
+        locked_labels: tuple[str, ...] = (),
         allowed_hosts: frozenset[str] = DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
     ) -> str:
         with temp_root("bdd-reject-") as tmp:
             fixture = _Fixture(
-                Path(tmp), locked=locked, allowed_hosts=allowed_hosts
+                Path(tmp),
+                locked=locked,
+                locked_labels=locked_labels,
+                allowed_hosts=allowed_hosts,
             )
             with self.assertRaises(DirectedDownloadFailure) as caught:
                 run(fixture, script)
@@ -319,6 +379,63 @@ class RejectionTests(unittest.TestCase):
             locked=OUP_PII,
             allowed_hosts=frozenset({OUP_CDN_HOST}),
         )
+
+    def test_title_filename_is_not_claimed_without_declared_labels(self) -> None:
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(
+                    url=CNKI_OPAQUE_DELIVERY_URL,
+                    filename=CNKI_DECLARED_FILENAME,
+                ),
+            )
+            f.land(CNKI_DECLARED_FILENAME)
+            f.session.emit("Browser.downloadProgress", progress())
+
+        message = self._expect_failure(
+            "DOWNLOAD_EVENT_TIMEOUT",
+            script,
+            locked=CNKI_ORDER_ID,
+        )
+        self.assertIn("declared labels: 0", message)
+
+    def test_declared_title_label_does_not_bypass_the_host_allowlist(self) -> None:
+        untrusted = "https://evil.example/cdn/download?token=opaque"
+
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(url=untrusted, filename=CNKI_DECLARED_FILENAME),
+            )
+            f.land(CNKI_DECLARED_FILENAME)
+            f.session.emit("Browser.downloadProgress", progress())
+
+        self._expect_failure(
+            "DOWNLOAD_SOURCE_HOST_REJECTED",
+            script,
+            locked=CNKI_ORDER_ID,
+            locked_labels=(CNKI_TITLE,),
+        )
+
+    def test_declared_label_shorter_than_six_normalized_characters_is_not_claimed(self) -> None:
+        short_label = "短标题"
+        filename = f"{short_label}_作者.pdf"
+
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(url=CNKI_OPAQUE_DELIVERY_URL, filename=filename),
+            )
+            f.land(filename)
+            f.session.emit("Browser.downloadProgress", progress())
+
+        message = self._expect_failure(
+            "DOWNLOAD_EVENT_TIMEOUT",
+            script,
+            locked=CNKI_ORDER_ID,
+            locked_labels=(short_label,),
+        )
+        self.assertIn("declared labels: 1", message)
 
     def test_a_locked_suggested_filename_does_not_bypass_the_host_allowlist(self) -> None:
         untrusted = "https://evil.example/cdn/download?token=opaque"
