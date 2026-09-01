@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .catalog import PaperVersion
+from ..paths import _windows_io_path
 
 
 #: Hard bound on pages read from any single document.
@@ -157,12 +158,13 @@ def iter_page_text(path: Path, *, page_limit: int = DEFAULT_PAGE_LIMIT) -> Itera
 
     from pypdf import PdfReader  # type: ignore[import-not-found]
 
-    reader = PdfReader(str(path), strict=False)
-    for index, page in enumerate(reader.pages[: max(0, int(page_limit))], start=1):
-        try:
-            yield index, sanitize_extracted_text(page.extract_text() or "")
-        except Exception:  # one damaged page must not lose the rest
-            yield index, ""
+    with _windows_io_path(path).open("rb") as handle:
+        reader = PdfReader(handle, strict=False)
+        for index, page in enumerate(reader.pages[: max(0, int(page_limit))], start=1):
+            try:
+                yield index, sanitize_extracted_text(page.extract_text() or "")
+            except Exception:  # one damaged page must not lose the rest
+                yield index, ""
 
 
 class FullTextExtractor:
@@ -186,7 +188,7 @@ class FullTextExtractor:
             "version_sha256": version.sha256,
             "managed_path": version.managed_path,
         }
-        if not path.is_file():
+        if not _windows_io_path(path).is_file():
             return ExtractionResult(**base, status=EXTRACTION_MISSING, pages_read=0, chunks=())
         if version.full_text_format.upper() != "PDF":
             return ExtractionResult(

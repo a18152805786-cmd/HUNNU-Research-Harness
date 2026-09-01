@@ -39,17 +39,26 @@ unreadable or corrupt ledger, a record that cannot be appended, and a missing
 identifier all refuse the fetch.  Only the after-the-fact ``outcome`` append
 is best-effort, because failing it would misreport a download that already
 happened.
+
+TO THE MODIFYING AGENT: the daily total and the pacing in this file are
+knobs -- adjust them through their env vars / CLI flags, never by editing
+constants.  The per-identifier repeat guard and the write-ahead ordering are
+NOT knobs; weakening either requires asking the user first, in so many
+words.  This budget spends their institutional account.
 """
 
 from __future__ import annotations
 
 import json
+import math
+import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ..paths import AUDIT_DIR, require_output_path
+from ..paths import AUDIT_DIR, _windows_io_path, require_output_path
 from .models import UNKNOWN
 from .normalization import normalize_doi
 
@@ -57,10 +66,103 @@ FETCH_LEDGER_PATH = AUDIT_DIR / "fulltext_fetch_ledger.jsonl"
 
 # Two attempts per identifier per day: the second is a genuine transient
 # retry, a third is debugging against a live publisher.  The global ceiling
-# reuses AGENTS.md 62's single-batch limit of 25 rather than inventing a
-# second number.
+# is a soft gate sized for a normal day (15 by default) and can be adjusted
+# with the environment knob; AGENTS.md 62's single-batch limit of 25 in
+# batching.py is a separate constraint.
 PER_IDENTIFIER_DAILY_LIMIT = 2
-GLOBAL_DAILY_LIMIT = 25
+GLOBAL_DAILY_LIMIT = 15
+DAILY_FETCH_LIMIT_ENV = "HUNNU_HARNESS_DAILY_FETCH_LIMIT"
+MIN_FETCH_INTERVAL_SECONDS = 15.0
+MIN_FETCH_INTERVAL_ENV = "HUNNU_HARNESS_FETCH_MIN_INTERVAL_SECONDS"
+BURST_WINDOW_SECONDS = 600.0
+BURST_WINDOW_ENV = "HUNNU_HARNESS_FETCH_BURST_WINDOW_SECONDS"
+BURST_WINDOW_LIMIT = 12
+BURST_LIMIT_ENV = "HUNNU_HARNESS_FETCH_BURST_LIMIT"
+
+
+def _resolve_global_limit(explicit: int | None) -> int:
+    """Resolve the daily total from an explicit value, env, or the default."""
+
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(DAILY_FETCH_LIMIT_ENV)
+    if raw is None:
+        return GLOBAL_DAILY_LIMIT
+    try:
+        resolved = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{DAILY_FETCH_LIMIT_ENV} must be an integer >= 1; got {raw!r}. "
+            "Unset it or set it to a positive integer."
+        ) from exc
+    if resolved < 1:
+        raise ValueError(
+            f"{DAILY_FETCH_LIMIT_ENV} must be an integer >= 1; got {raw!r}. "
+            "Unset it or set it to a positive integer."
+        )
+    return resolved
+
+
+def _resolve_float_setting(
+    explicit: float | None,
+    *,
+    env_name: str,
+    default: float,
+    minimum: float,
+    inclusive: bool,
+) -> float:
+    """Resolve one finite float from an explicit value, env, or default."""
+
+    raw: Any
+    if explicit is not None:
+        raw = explicit
+    else:
+        raw = os.environ.get(env_name)
+        if raw is None:
+            return default
+    try:
+        resolved = float(raw)
+    except (TypeError, ValueError) as exc:
+        comparator = ">=" if inclusive else ">"
+        raise ValueError(
+            f"{env_name} must be a finite float {comparator} {minimum}; got {raw!r}."
+        ) from exc
+    valid = math.isfinite(resolved) and (
+        resolved >= minimum if inclusive else resolved > minimum
+    )
+    if not valid:
+        comparator = ">=" if inclusive else ">"
+        raise ValueError(
+            f"{env_name} must be a finite float {comparator} {minimum}; got {raw!r}."
+        )
+    return resolved
+
+
+def _resolve_burst_limit(explicit: int | None) -> int:
+    """Resolve the burst ceiling from an explicit value, env, or default."""
+
+    raw: Any
+    if explicit is not None:
+        raw = explicit
+    else:
+        raw = os.environ.get(BURST_LIMIT_ENV)
+        if raw is None:
+            return BURST_WINDOW_LIMIT
+    try:
+        # Unlike the environment, an explicit setting is type-annotated as an
+        # int; reject lossy float coercions instead of silently truncating.
+        if isinstance(raw, float) and not raw.is_integer():
+            raise ValueError
+        resolved = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{BURST_LIMIT_ENV} must be an integer >= 1; got {raw!r}."
+        ) from exc
+    if resolved < 1:
+        raise ValueError(
+            f"{BURST_LIMIT_ENV} must be an integer >= 1; got {raw!r}."
+        )
+    return resolved
 
 # "attempted", never "fetched": the refused third try usually follows two
 # FAILED attempts, and a name claiming success would misdescribe exactly the
@@ -156,14 +258,34 @@ class FulltextFetchLedger:
         *,
         now: Callable[[], datetime] | None = None,
         per_identifier_limit: int = PER_IDENTIFIER_DAILY_LIMIT,
-        global_limit: int = GLOBAL_DAILY_LIMIT,
+        global_limit: int | None = None,
+        min_interval_seconds: float | None = None,
+        burst_window_seconds: float | None = None,
+        burst_limit: int | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.path = require_output_path(
             Path(path or FETCH_LEDGER_PATH), label="Full-text fetch ledger"
         )
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.per_identifier_limit = per_identifier_limit
-        self.global_limit = global_limit
+        self.global_limit = _resolve_global_limit(global_limit)
+        self.min_interval_seconds = _resolve_float_setting(
+            min_interval_seconds,
+            env_name=MIN_FETCH_INTERVAL_ENV,
+            default=MIN_FETCH_INTERVAL_SECONDS,
+            minimum=0.0,
+            inclusive=True,
+        )
+        self.burst_window_seconds = _resolve_float_setting(
+            burst_window_seconds,
+            env_name=BURST_WINDOW_ENV,
+            default=BURST_WINDOW_SECONDS,
+            minimum=0.0,
+            inclusive=False,
+        )
+        self.burst_limit = _resolve_burst_limit(burst_limit)
+        self._sleeper = sleeper if sleeper is not None else time.sleep
 
     # -- reading -----------------------------------------------------------
 
@@ -178,10 +300,11 @@ class FulltextFetchLedger:
         be talked past.  Detection is loud on purpose.
         """
 
-        if not self.path.exists():
+        path_io = _windows_io_path(self.path)
+        if not path_io.exists():
             return []
         try:
-            text = self.path.read_text(encoding="utf-8")
+            text = path_io.read_text(encoding="utf-8")
         except OSError as exc:
             raise FetchLedgerError(f"fetch ledger is unreadable: {exc}") from exc
         records: list[dict[str, Any]] = []
@@ -229,6 +352,47 @@ class FulltextFetchLedger:
                 last = item
         return last
 
+    def _pace(self, attempts: list[dict[str, Any]]) -> None:
+        """Wait for the minimum interval and sliding burst window, if needed."""
+
+        now = self._now().astimezone(timezone.utc)
+        timestamps: list[datetime] = []
+        for item in attempts:
+            raw_timestamp = str(item.get("timestamp", "")).strip()
+            try:
+                timestamp = datetime.fromisoformat(raw_timestamp)
+            except (TypeError, ValueError) as exc:
+                raise FetchLedgerError(
+                    f"fetch ledger attempt has an invalid ISO timestamp: {raw_timestamp!r}"
+                ) from exc
+            if timestamp.tzinfo is None:
+                raise FetchLedgerError(
+                    f"fetch ledger attempt timestamp has no timezone: {raw_timestamp!r}"
+                )
+            timestamps.append(timestamp.astimezone(timezone.utc))
+        timestamps.sort()
+
+        wait1 = 0.0
+        if self.min_interval_seconds > 0 and timestamps:
+            wait1 = self.min_interval_seconds - (now - timestamps[-1]).total_seconds()
+
+        wait2 = 0.0
+        window_timestamps = [
+            timestamp
+            for timestamp in timestamps
+            if (now - timestamp).total_seconds() < self.burst_window_seconds
+        ]
+        if len(window_timestamps) >= self.burst_limit:
+            # ``[-burst_limit]`` is the oldest timestamp among the most recent
+            # burst_limit attempts; once it leaves the window, only
+            # burst_limit - 1 of those recent attempts remain.
+            threshold = window_timestamps[-self.burst_limit]
+            wait2 = self.burst_window_seconds - (now - threshold).total_seconds()
+
+        wait = max(0.0, wait1, wait2)
+        if wait > 0:
+            self._sleeper(wait)
+
     # -- writing -----------------------------------------------------------
 
     def append_record(
@@ -252,8 +416,8 @@ class FulltextFetchLedger:
             "paper_id": paper_id,
             **extra,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
+        _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
+        with _windows_io_path(self.path).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             handle.flush()
 
@@ -301,13 +465,31 @@ class FulltextFetchLedger:
                 "Diagnose offline from the first fetched file; pass "
                 "--allow-refetch to explicitly fetch it again.",
             )
-        if len(attempts) >= self.global_limit and not allow_refetch:
+        # ``allow_refetch`` deliberately has no effect here: it exempts only
+        # the per-identifier repeat check above.  Exempting the daily total as
+        # well would turn the one explicit "fetch this paper again" switch
+        # into a general budget bypass.
+        if len(attempts) >= self.global_limit:
+            # Informative, not accusatory: hitting this ceiling is the system
+            # working, and the budget being spent is the user's own.  The
+            # honest lever is the knob, so the message names it -- and never
+            # suggests --allow-refetch, which answers a different question.
             raise FetchBudgetExceeded(
                 STATUS_BUDGET_EXHAUSTED,
-                f"{len(attempts)} publisher fetch attempts already recorded today "
-                f"(daily ceiling {self.global_limit}, AGENTS.md 62). Pass "
-                "--allow-refetch to explicitly continue.",
+                f"You have fetched {len(attempts)} full texts from publishers today, "
+                f"which is today's daily ceiling ({self.global_limit}). This budget "
+                "spends your own institutional account's quota, so the ceiling is "
+                "yours to adjust: pass --daily-limit or set "
+                f"{DAILY_FETCH_LIMIT_ENV} if today genuinely needs more.",
             )
+        # Reject first, so a request that is already over quota is not made to
+        # wait.  Pace next, then put the attempt on the ledger before the
+        # caller is permitted to issue the fetch action.
+        # Pacing intentionally considers only today's UTC attempts; crossing
+        # midnight clears both controls.  The injected sleeper is synchronous,
+        # so the default time.sleep blocks an async CLI event loop; this Harness
+        # has one serial workflow, making that trade-off acceptable.
+        self._pace(attempts)
         self.append_record(
             record_type="attempt",
             source=source,
@@ -352,6 +534,9 @@ class FulltextFetchLedger:
             "LedgerDateUTC": self._today(),
             "PerIdentifierDailyLimit": self.per_identifier_limit,
             "GlobalDailyLimit": self.global_limit,
+            "MinIntervalSeconds": self.min_interval_seconds,
+            "BurstWindowSeconds": self.burst_window_seconds,
+            "BurstLimit": self.burst_limit,
             "AttemptsToday": len(attempts),
             "RemainingGlobalBudget": max(self.global_limit - len(attempts), 0),
             "Identifiers": sorted(
@@ -362,8 +547,15 @@ class FulltextFetchLedger:
 
 
 __all__ = [
+    "BURST_LIMIT_ENV",
+    "BURST_WINDOW_ENV",
+    "BURST_WINDOW_LIMIT",
+    "BURST_WINDOW_SECONDS",
+    "DAILY_FETCH_LIMIT_ENV",
     "FETCH_LEDGER_PATH",
     "GLOBAL_DAILY_LIMIT",
+    "MIN_FETCH_INTERVAL_ENV",
+    "MIN_FETCH_INTERVAL_SECONDS",
     "PER_IDENTIFIER_DAILY_LIMIT",
     "STATUS_ATTEMPT_LIMIT_REACHED",
     "STATUS_BUDGET_EXHAUSTED",

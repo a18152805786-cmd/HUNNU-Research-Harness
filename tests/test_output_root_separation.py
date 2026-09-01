@@ -18,6 +18,7 @@ from hunnu_harness.paths import (
     AUDIT_DIR,
     AUTHORIZED_DOWNLOADS_DIR,
     CORE_ROOT,
+    DEFAULT_OUTPUT_ROOT,
     DOWNLOADS_ROOT,
     LOGS_DIR,
     LIBRARY_CATALOG_CSV,
@@ -51,9 +52,14 @@ from hunnu_harness.relocation import (
 
 
 class OutputRootPathTests(unittest.TestCase):
-    def test_core_and_output_roots_are_distinct_siblings(self):
+    def test_core_output_isolation_and_default_derivation_contracts_remain_intact(self):
         self.assertNotEqual(CORE_ROOT, OUTPUT_ROOT)
-        self.assertEqual(OUTPUT_ROOT, CORE_ROOT.with_name("HUNNU-Research-Harness-Output"))
+        self.assertFalse(is_within(OUTPUT_ROOT, CORE_ROOT))
+        self.assertFalse(is_within(CORE_ROOT, OUTPUT_ROOT))
+        self.assertEqual(
+            DEFAULT_OUTPUT_ROOT,
+            CORE_ROOT.with_name(f"{CORE_ROOT.name}-Output"),
+        )
 
     def test_every_runtime_root_is_derived_from_output_root(self):
         runtime_roots = (

@@ -6,6 +6,7 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import unquote
 
+from ..paths import _windows_io_path
 from .models import UNKNOWN, LiteratureRecord
 
 
@@ -65,7 +66,7 @@ def stable_paper_id(*, doi: str = UNKNOWN, title: str = UNKNOWN, year: str = UNK
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with _windows_io_path(path).open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()

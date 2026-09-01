@@ -26,6 +26,16 @@ SCOPE_STATEMENT = (
 #: A concept with fewer local works than this is reported as thinly covered.
 THIN_COVERAGE = 3
 
+#: Below this many works, coverage analysis is refused outright: on a
+#: five-work library "everything is a gap" is a fact about the library's size,
+#: not about anything a researcher should act on, and a technically-correct
+#: but misleading answer is worse than a refusal.
+MIN_WORKS_FOR_COVERAGE = 30
+
+#: Between the floor and this ceiling the analysis runs, but carries an
+#: explicit small-library warning.
+SMALL_LIBRARY_CEILING = 100
+
 
 @dataclass
 class ConceptCoverage:
@@ -63,6 +73,35 @@ class CoverageAnalyzer:
         self.navigator = navigator
 
     def analyze(self, query: str, *, top: int = 25) -> dict[str, Any]:
+        works_in_library = self.navigator.snapshot.work_count
+        if works_in_library < MIN_WORKS_FOR_COVERAGE:
+            payload = self.navigator.envelope()
+            payload.update(
+                {
+                    "status": "REFUSED_LIBRARY_TOO_SMALL",
+                    "scope": SCOPE_STATEMENT,
+                    "query": query,
+                    "works_in_library": works_in_library,
+                    "minimum_works_for_coverage": MIN_WORKS_FOR_COVERAGE,
+                    "why_refused": (
+                        f"This library holds {works_in_library} works. On a corpus this "
+                        "small, coverage analysis reports 'under-covered' almost "
+                        "everywhere, and that pattern reflects the size of the library, "
+                        "not the state of any research area. A technically correct but "
+                        "misleading answer is worse than this refusal."
+                    ),
+                    "how_to_proceed": (
+                        "Accumulate the corpus first: acquire validated full texts with "
+                        "the acquisition pipeline (hunnu-harness acquire / the live-* "
+                        "commands) or import individual PDFs via library-stage + "
+                        f"library-import. Coverage analysis answers from "
+                        f"{MIN_WORKS_FOR_COVERAGE} works, and stops warning about "
+                        f"library size above {SMALL_LIBRARY_CEILING}."
+                    ),
+                }
+            )
+            return payload
+
         parsed = parse_query(query)
         search = self.navigator.search(query, top=top, use_fulltext=False)
         results = search["results"]
@@ -119,6 +158,14 @@ class CoverageAnalyzer:
                 ),
             }
         )
+        if works_in_library <= SMALL_LIBRARY_CEILING:
+            payload["small_library_warning"] = (
+                f"This library holds {works_in_library} works "
+                f"(warning band: {MIN_WORKS_FOR_COVERAGE}-{SMALL_LIBRARY_CEILING}). "
+                "Coverage judgments over a corpus this small are dominated by what "
+                "happens to have been acquired; treat every 'under-covered' line as "
+                "a fact about this collection, and weigh it accordingly."
+            )
         return payload
 
     def _concept_coverage(self, key: str) -> ConceptCoverage:
@@ -214,4 +261,11 @@ class CoverageAnalyzer:
         }
 
 
-__all__ = ["ConceptCoverage", "CoverageAnalyzer", "SCOPE_STATEMENT", "THIN_COVERAGE"]
+__all__ = [
+    "ConceptCoverage",
+    "CoverageAnalyzer",
+    "MIN_WORKS_FOR_COVERAGE",
+    "SCOPE_STATEMENT",
+    "SMALL_LIBRARY_CEILING",
+    "THIN_COVERAGE",
+]

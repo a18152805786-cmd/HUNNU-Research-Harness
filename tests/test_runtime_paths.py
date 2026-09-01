@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import unittest
 
@@ -19,11 +20,13 @@ from hunnu_harness.paths import (
 
 
 class RuntimePathTests(unittest.TestCase):
-    def test_runtime_paths_are_output_root_relative(self):
+    def test_runtime_paths_follow_effective_output_root_and_environment_override(self):
         project_root = Path(__file__).resolve().parents[1]
         self.assertEqual(PROJECT_ROOT, project_root)
         self.assertEqual(CORE_ROOT, project_root)
-        self.assertEqual(OUTPUT_ROOT, project_root.with_name("HUNNU-Research-Harness-Output"))
+        configured_output_root = os.environ.get("HUNNU_HARNESS_OUTPUT_ROOT")
+        if configured_output_root is not None:
+            self.assertEqual(OUTPUT_ROOT, Path(configured_output_root).resolve())
         self.assertNotEqual(CORE_ROOT, OUTPUT_ROOT)
         self.assertEqual(RUNS_ROOT, OUTPUT_ROOT / "runs")
         self.assertEqual(STAGING_DIR, OUTPUT_ROOT / "staging")

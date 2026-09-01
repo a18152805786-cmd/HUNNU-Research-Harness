@@ -24,6 +24,8 @@ from ..paths import (
     LIBRARY_CATALOG_JSONL,
     LIBRARY_TOPICS_JSONL,
     OUTPUT_ROOT,
+    _logical_path,
+    _windows_io_path,
 )
 from ..literature.models import UNKNOWN
 from ..literature.normalization import normalize_doi, normalize_person, normalize_title
@@ -88,12 +90,12 @@ class PaperVersion:
 
         candidate = Path(self.managed_path)
         if candidate.is_absolute():
-            return candidate
-        return OUTPUT_ROOT / candidate
+            return _logical_path(candidate)
+        return _logical_path(OUTPUT_ROOT / candidate)
 
     def exists(self) -> bool:
         try:
-            return self.absolute_path.is_file()
+            return _windows_io_path(self.absolute_path).is_file()
         except OSError:
             return False
 
@@ -239,7 +241,7 @@ def _iter_jsonl(path: Path, source: str, degraded: list[Degradation]) -> Iterato
     """Yield objects from a JSONL file, recording rather than raising on damage."""
 
     try:
-        raw = path.read_text(encoding="utf-8-sig")
+        raw = _windows_io_path(path).read_text(encoding="utf-8-sig")
     except OSError as exc:
         degraded.append(Degradation(source=source, detail=f"unreadable: {exc}", locator=str(path)))
         return
@@ -322,11 +324,11 @@ class CatalogReader:
         catalog_path: Path | None = None,
         topics_path: Path | None = None,
     ) -> None:
-        self.catalog_path = Path(catalog_path or LIBRARY_CATALOG_JSONL)
-        self.topics_path = Path(topics_path or LIBRARY_TOPICS_JSONL)
+        self.catalog_path = _logical_path(catalog_path or LIBRARY_CATALOG_JSONL)
+        self.topics_path = _logical_path(topics_path or LIBRARY_TOPICS_JSONL)
 
     def load(self) -> CatalogSnapshot:
-        if not self.catalog_path.is_file():
+        if not _windows_io_path(self.catalog_path).is_file():
             raise LibraryUnavailable(
                 f"Paper catalog not found: {self.catalog_path}. "
                 "The Navigator reads the Global Paper Library; it never creates one."
@@ -374,7 +376,7 @@ class CatalogReader:
     # -- internals ---------------------------------------------------------
 
     def _load_topics(self, degraded: list[Degradation]) -> dict[str, Mapping[str, Any]]:
-        if not self.topics_path.is_file():
+        if not _windows_io_path(self.topics_path).is_file():
             degraded.append(
                 Degradation(
                     source="paper_topics.jsonl",

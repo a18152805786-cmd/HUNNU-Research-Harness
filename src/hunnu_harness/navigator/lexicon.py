@@ -1,25 +1,26 @@
-"""Auditable cross-language concept table.
+"""Auditable cross-language concept matching backed by replaceable data.
 
-The corpus writes one construct several ways -- ``AI washing``, ``人工智能漂洗``,
-``AI漂洗``, ``漂智``, ``talk-walk gap`` -- and a query in one language recalls at
-most half the works unless the two vocabularies are bridged.
+The Navigator works offline and keeps every expansion visible to callers.  A
+small JSON vocabulary is therefore easier to review, test, and replace than a
+learned representation.  A distribution ships with a default vocabulary, but
+an Output Root override may replace it wholesale or leave the vocabulary
+empty.
 
-The bridge is this explicit table rather than a learned embedding, for three
-reasons drawn from discovery: there is no embedding client in the environment,
-the Navigator must work offline, and an agent has to be able to see exactly what
-its query was expanded into.  A table is diffable, testable, and reviewable; a
-vector is none of those.
-
-Each concept also declares a *facet*, which is what lets a research-question
+Each configured concept declares a *facet*, which lets a research-question
 query report roles (CORE / MECHANISM / OUTCOME / METHOD) instead of an
 undifferentiated ranked list.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import Enum
+from importlib import resources
+from pathlib import Path
+from typing import Any
 
+from .. import paths
 from .tokenize import fold
 
 
@@ -52,7 +53,7 @@ FACET_TO_ROLE: dict[Facet, RelevanceRole] = {
 
 @dataclass(frozen=True)
 class Concept:
-    """One research construct and every surface form seen in this corpus."""
+    """One configured construct and its searchable surface forms."""
 
     key: str
     facet: Facet
@@ -63,209 +64,94 @@ class Concept:
         return tuple(dict.fromkeys(fold(term) for term in self.terms if fold(term)))
 
 
-# Terms are grounded in the actual 179-work corpus and in the frozen taxonomy's
-# 39 subtopic values.  ``topics`` names taxonomy subtopics whose presence on a
-# work is itself evidence for the concept.
-CONCEPTS: tuple[Concept, ...] = (
-    Concept(
-        key="ai_washing",
-        facet=Facet.PHENOMENON,
-        terms=(
-            "ai washing", "aiwashing", "ai-washing", "artificial intelligence washing",
-            "人工智能漂洗", "ai漂洗", "漂洗", "漂智", "智能漂洗",
-            "talk walk gap", "talk-walk gap", "ai narrative", "ai narratives",
-            "虚假的智能", "伦理漂洗",
-        ),
-        topics=("AI漂洗",),
-    ),
-    Concept(
-        key="greenwashing",
-        facet=Facet.PHENOMENON,
-        terms=("greenwashing", "greenwash", "green washing", "漂绿", "洗绿", "环境漂绿"),
-    ),
-    Concept(
-        key="artificial_intelligence",
-        facet=Facet.CONTEXT,
-        terms=(
-            "artificial intelligence", "ai", "machine learning", "robot", "robots",
-            "人工智能", "智能化", "机器人", "算法", "大模型", "生成式人工智能",
-        ),
-        topics=("人工智能与机器人",),
-    ),
-    Concept(
-        key="digital_transformation",
-        facet=Facet.CONTEXT,
-        terms=(
-            "digital transformation", "digitalization", "digitization", "digital economy",
-            "数字化转型", "数字化", "数字经济", "数智化",
-        ),
-        topics=("数字化转型", "数字经济"),
-    ),
-    Concept(
-        key="audit_risk",
-        facet=Facet.MECHANISM,
-        terms=(
-            "audit", "audits", "audit risk", "auditor", "auditors",
-            "audit fee", "audit fees", "audit opinion", "audit quality",
-            "audit effort", "assurance", "internal control",
-            "审计", "审计风险", "审计师", "审计费用", "审计意见", "注册会计师",
-            "内部控制", "风险决策", "鉴证",
-        ),
-        topics=("审计与内部控制",),
-    ),
-    Concept(
-        key="information_disclosure",
-        facet=Facet.MECHANISM,
-        terms=(
-            "disclosure", "information disclosure", "voluntary disclosure",
-            "information asymmetry", "textual disclosure", "annual report tone",
-            "信息披露", "披露", "信息不对称", "年报", "文本披露", "语调",
-        ),
-        topics=("信息披露",),
-    ),
-    Concept(
-        key="agency_governance",
-        facet=Facet.MECHANISM,
-        terms=(
-            "agency cost", "agency costs", "corporate governance", "monitoring",
-            "external governance", "board", "institutional investor",
-            "代理成本", "公司治理", "外部治理", "监督", "董事会", "机构投资者",
-        ),
-        topics=("公司治理与代理成本",),
-    ),
-    Concept(
-        key="financing_constraint",
-        facet=Facet.MECHANISM,
-        terms=(
-            "financing constraint", "financing constraints", "financial constraint",
-            "bank loan", "bank loans", "credit", "cost of debt", "cost of capital",
-            "融资约束", "银行贷款", "信贷", "债务成本", "资本成本", "融资成本",
-        ),
-        topics=("融资约束与资本配置", "债务与资本成本", "银行信贷与金融发展"),
-    ),
-    Concept(
-        key="earnings_quality",
-        facet=Facet.OUTCOME,
-        terms=(
-            "earnings quality", "earnings management", "accrual", "accruals",
-            "discretionary accruals", "financial reporting quality", "restatement",
-            "盈余质量", "盈余管理", "应计", "可操控性应计", "财务报告质量", "财务重述",
-        ),
-        topics=("盈余质量与财务报告",),
-    ),
-    Concept(
-        key="innovation",
-        facet=Facet.OUTCOME,
-        terms=(
-            "innovation", "innovative", "patent", "patents", "r&d", "research and development",
-            "创新", "技术创新", "专利", "研发", "创新绩效", "新质生产力",
-        ),
-        topics=("企业创新", "技术进步与产业升级"),
-    ),
-    Concept(
-        key="firm_value",
-        facet=Facet.OUTCOME,
-        terms=(
-            "firm value", "firm performance", "market value", "tobin q", "tobin's q",
-            "stock price crash", "crash risk", "market reaction", "stock return",
-            "企业价值", "企业绩效", "市值", "股价崩盘", "崩盘风险", "市场反应", "股票收益",
-        ),
-        topics=("股价与市场波动",),
-    ),
-    Concept(
-        key="productivity",
-        facet=Facet.OUTCOME,
-        terms=(
-            "productivity", "total factor productivity", "tfp", "efficiency",
-            "resource allocation", "misallocation",
-            "生产率", "全要素生产率", "效率", "资源配置", "资源错配",
-        ),
-        topics=("生产率与资源配置", "金融错配与资源配置"),
-    ),
-    Concept(
-        key="risk_resilience",
-        facet=Facet.OUTCOME,
-        terms=(
-            "risk taking", "risk-taking", "uncertainty", "resilience",
-            "organizational resilience", "supply chain resilience",
-            "风险承担", "不确定性", "韧性", "组织韧性", "供应链韧性",
-        ),
-        topics=("风险承担与不确定性", "企业与组织韧性", "供应链韧性"),
-    ),
-    Concept(
-        key="esg",
-        facet=Facet.OUTCOME,
-        terms=(
-            "esg", "corporate social responsibility", "csr", "environmental",
-            "carbon", "green finance", "green innovation",
-            "环境", "社会责任", "绿色金融", "绿色创新", "碳排放", "环境规制",
-        ),
-        topics=("ESG与社会责任", "绿色金融与绿色创新", "环境规制与污染治理"),
-    ),
-    Concept(
-        key="labor",
-        facet=Facet.OUTCOME,
-        terms=(
-            "employment", "labor", "labour", "wage", "wages", "human capital",
-            "income distribution", "pay gap",
-            "就业", "劳动", "工资", "人力资本", "收入分配", "薪酬差距",
-        ),
-        topics=("劳动市场与就业", "工资与收入分配", "人力资本"),
-    ),
-    Concept(
-        key="supply_chain",
-        facet=Facet.CONTEXT,
-        terms=(
-            "supply chain", "global value chain", "gvc", "customer", "supplier",
-            "trade", "export", "import",
-            "供应链", "全球价值链", "产业链", "客户", "供应商", "贸易", "出口", "进口",
-        ),
-        topics=("供应链与产业链", "全球价值链与国际化"),
-    ),
-    Concept(
-        key="executive_behaviour",
-        facet=Facet.MECHANISM,
-        terms=(
-            "ceo", "executive", "management", "manager", "overconfidence",
-            "incentive", "compensation", "managerial myopia",
-            "高管", "管理者", "过度自信", "激励", "薪酬", "管理层短视",
-        ),
-        topics=("高管激励与管理者行为",),
-    ),
-    Concept(
-        key="analyst_market",
-        facet=Facet.MECHANISM,
-        terms=(
-            "analyst", "analysts", "forecast", "short selling", "media coverage",
-            "media monitoring", "investor attention",
-            "分析师", "预测", "卖空", "融资融券", "媒体监督", "媒体关注", "投资者关注",
-        ),
-        topics=("分析师与资本市场", "卖空与市场机制"),
-    ),
-    Concept(
-        key="identification_method",
-        facet=Facet.METHOD,
-        terms=(
-            "difference in differences", "difference-in-differences", "did",
-            "instrumental variable", "instrumental variables", "iv",
-            "regression discontinuity", "rdd", "propensity score matching", "psm",
-            "natural experiment", "quasi natural experiment", "endogeneity",
-            "robustness", "placebo", "staggered", "fixed effects",
-            "双重差分", "工具变量", "断点回归", "倾向得分匹配", "自然实验",
-            "准自然实验", "内生性", "稳健性", "安慰剂", "固定效应", "识别策略",
-        ),
-        topics=("计量方法与研究设计",),
-    ),
-    Concept(
-        key="measurement",
-        facet=Facet.METHOD,
-        terms=(
-            "measurement", "index construction", "text analysis", "textual analysis",
-            "machine learning measure", "multimodal", "word embedding",
-            "指标构建", "测度", "文本分析", "多模态", "词向量", "指数构建",
-        ),
-    ),
-)
+_DEFAULT_RESOURCE_NAME = "lexicon.default.json"
+_UNSET = object()
+
+
+def _invalid_lexicon(source: object, detail: str) -> ValueError:
+    return ValueError(
+        f"Invalid Navigator lexicon at {source}: {detail}. "
+        "Repair it as JSON with a top-level 'concepts' array whose entries "
+        "contain key, facet, terms, and topics, or remove the override to "
+        "use the packaged default."
+    )
+
+
+def _read_json(source: Any) -> Any:
+    try:
+        with source.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise _invalid_lexicon(source, f"JSON parsing failed ({exc.msg})") from exc
+    except (OSError, UnicodeError) as exc:
+        raise _invalid_lexicon(source, f"the file could not be read ({exc})") from exc
+
+
+def _string_list(value: Any, *, source: object, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise _invalid_lexicon(source, f"'{field_name}' must be a JSON array of strings")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise _invalid_lexicon(source, f"'{field_name}' must contain non-empty strings only")
+    return tuple(item.strip() for item in value)
+
+
+def _concepts_from_payload(payload: Any, *, source: object) -> tuple[Concept, ...]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("concepts"), list):
+        raise _invalid_lexicon(source, "the top level must contain a 'concepts' array")
+
+    concepts: list[Concept] = []
+    seen_keys: set[str] = set()
+    for index, item in enumerate(payload["concepts"]):
+        if not isinstance(item, dict):
+            raise _invalid_lexicon(source, f"concepts[{index}] must be an object")
+        required = {"key", "facet", "terms", "topics"}
+        missing = sorted(required - item.keys())
+        if missing:
+            raise _invalid_lexicon(source, f"concepts[{index}] is missing {', '.join(missing)}")
+        key = item["key"]
+        facet_value = item["facet"]
+        if not isinstance(key, str) or not key.strip():
+            raise _invalid_lexicon(source, f"concepts[{index}].key must be a non-empty string")
+        normalized_key = key.strip()
+        if normalized_key in seen_keys:
+            raise _invalid_lexicon(source, f"duplicate concept key {normalized_key!r}")
+        if not isinstance(facet_value, str):
+            raise _invalid_lexicon(source, f"concepts[{index}].facet must be a string")
+        try:
+            facet = Facet(facet_value)
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in Facet)
+            raise _invalid_lexicon(
+                source,
+                f"concepts[{index}].facet {facet_value!r} is invalid; expected one of {allowed}",
+            ) from exc
+        terms = _string_list(item["terms"], source=source, field_name=f"concepts[{index}].terms")
+        if not terms:
+            raise _invalid_lexicon(source, f"concepts[{index}].terms cannot be empty")
+        topics = _string_list(item["topics"], source=source, field_name=f"concepts[{index}].topics")
+        concepts.append(Concept(key=normalized_key, facet=facet, terms=terms, topics=topics))
+        seen_keys.add(normalized_key)
+    return tuple(concepts)
+
+
+def load_concepts(
+    *, override_path: Path | str | None = None, default_resource: Any = _UNSET
+) -> tuple[Concept, ...]:
+    """Load the user override, packaged default, or a valid empty vocabulary."""
+
+    candidate = Path(override_path or paths.NAVIGATOR_LEXICON_JSON)
+    if candidate.exists():
+        return _concepts_from_payload(_read_json(candidate), source=candidate)
+
+    resource = default_resource
+    if resource is _UNSET:
+        resource = resources.files(__package__).joinpath(_DEFAULT_RESOURCE_NAME)
+    if resource is not None and resource.is_file():
+        return _concepts_from_payload(_read_json(resource), source=resource)
+    return ()
+
+
+CONCEPTS: tuple[Concept, ...] = load_concepts()
 
 
 CONCEPTS_BY_KEY: dict[str, Concept] = {concept.key: concept for concept in CONCEPTS}

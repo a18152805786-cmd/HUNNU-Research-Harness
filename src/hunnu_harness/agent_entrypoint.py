@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -40,7 +39,13 @@ from .official_web import (
     OfficialWebExecutionBroker,
     OfficialWebRequest,
 )
-from .paths import OUTPUT_ROOT, V0217_RUN_ROOT, require_output_path
+from .paths import (
+    OUTPUT_ROOT,
+    V0217_RUN_ROOT,
+    _transaction_token,
+    _windows_io_path,
+    require_output_path,
+)
 from .workflows import run_cnrds_download
 
 if TYPE_CHECKING:
@@ -1016,19 +1021,23 @@ def write_dry_run_result(
 
     root = require_output_path(Path(run_root), label="Agent dry-run artifacts")
     path = root / "results" / "AGENT_REQUEST_DRY_RUN.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
     payload = {
         "GeneratedAt": datetime.now(timezone.utc).isoformat(),
         "DryRun": True,
         **decision.as_dict(),
     }
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(sanitize_value(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    temporary.replace(path)
+    temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+    temporary_io = _windows_io_path(temporary)
+    try:
+        temporary_io.write_text(
+            json.dumps(sanitize_value(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        temporary_io.replace(_windows_io_path(path))
+    finally:
+        temporary_io.unlink(missing_ok=True)
     return path
 
 
@@ -1042,7 +1051,9 @@ def add_agent_route_arguments(parser: argparse.ArgumentParser) -> None:
 
 def route_from_cli_args(args: argparse.Namespace) -> int:
     if getattr(args, "request_json", None):
-        payload: Mapping[str, Any] = json.loads(args.request_json.read_text(encoding="utf-8-sig"))
+        payload: Mapping[str, Any] = json.loads(
+            _windows_io_path(args.request_json).read_text(encoding="utf-8-sig")
+        )
     else:
         payload = {"Query": args.text}
     decision = AgentRequestRouter().route(payload)

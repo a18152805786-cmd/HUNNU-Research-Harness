@@ -45,6 +45,7 @@ from .commands import (
     UnsupportedCommand,
 )
 from .transport import BrowserTransportError
+from ..paths import _windows_io_path
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -533,11 +534,11 @@ class LocalPlaywrightExecutor:
     def _target_path(self, suggested_filename: str) -> Path:
         if self.downloads_dir is None:
             raise DownloadFailure("Local browser downloads_dir is unavailable")
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.downloads_dir).mkdir(parents=True, exist_ok=True)
         base = self.downloads_dir / self._safe_filename(suggested_filename)
         target = base
         counter = 1
-        while target.exists():
+        while _windows_io_path(target).exists():
             target = base.with_name(f"{base.stem}_{counter}{base.suffix}")
             counter += 1
         return target
@@ -619,7 +620,7 @@ class LocalPlaywrightExecutor:
                 if not callable(save_as):
                     raise UnsupportedCommand("Local download object does not expose save_as")
                 await _maybe_await(save_as(str(target)))
-                if not target.is_file():
+                if not _windows_io_path(target).is_file():
                     raise DownloadFailure("Playwright download completed without a local file")
                 artifact = DownloadArtifact.from_path(
                     target,
@@ -797,7 +798,7 @@ class LocalPlaywrightExecutor:
                     raise AuthenticatedFetchFailure("Authenticated response does not expose body()")
                 payload = bytes(await _maybe_await(body_method()))
                 target = self._target_path(command.suggested_filename)
-                target.write_bytes(payload)
+                _windows_io_path(target).write_bytes(payload)
                 artifact = DownloadArtifact.from_path(
                     target,
                     suggested_filename=command.suggested_filename,

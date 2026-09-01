@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from .paths import CORE_ROOT, OUTPUT_ROOT, is_within
+from .paths import CORE_ROOT, OUTPUT_ROOT, _logical_path, _windows_io_path, is_within
 
 
 class RelocationClassification(StrEnum):
@@ -48,15 +48,15 @@ FORMAL_ROOT_FILES = frozenset(
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with _windows_io_path(path).open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def classify_core_path(path: Path, *, core_root: Path = CORE_ROOT) -> RelocationClassification:
-    candidate = Path(path).resolve()
-    root = Path(core_root).resolve()
+    candidate = _logical_path(path)
+    root = _logical_path(core_root)
     if not is_within(candidate, root):
         return RelocationClassification.UNCERTAIN
     relative = candidate.relative_to(root)
@@ -103,8 +103,8 @@ class RelocationRecord:
 
 
 def verify_relocated_file(expected_sha256: str, destination: Path) -> bool:
-    candidate = Path(destination)
-    return candidate.is_file() and sha256_file(candidate) == expected_sha256
+    candidate = _logical_path(destination)
+    return _windows_io_path(candidate).is_file() and sha256_file(candidate) == expected_sha256
 
 
 def record_verified_relocation(
@@ -115,11 +115,13 @@ def record_verified_relocation(
     sha256_before: str,
     size: int,
 ) -> RelocationRecord:
+    source = _logical_path(source)
+    destination = _logical_path(destination)
     after = sha256_file(destination)
     changed = after != sha256_before
     return RelocationRecord(
-        old_path=str(Path(source)),
-        new_path=str(Path(destination)),
+        old_path=str(source),
+        new_path=str(destination),
         classification=classification.value,
         size=size,
         sha256_before=sha256_before,

@@ -510,7 +510,7 @@ closed.
 The current Codex configuration intends to run Playwright MCP against:
 
 - Chrome executable: the installed Research Chrome/Chrome executable;
-- dedicated user-data-dir: C:\Users\<user>\ResearchHarness\chrome-profile;
+- dedicated user-data-dir: `%USERPROFILE%\ResearchHarness\chrome-profile`;
 - MCP output directory under the Harness OutputRoot staging area.
 
 The local Python Playwright backend separately launches a persistent context
@@ -954,7 +954,7 @@ Current process evidence confirms:
 
     BrowserLaunchModel=Model 1
     WhoStartsBrowserProcess=Playwright MCP cli.js
-    ResearchChromeProfilePath=C:\Users\<user>\ResearchHarness\chrome-profile
+    ResearchChromeProfilePath=%USERPROFILE%\ResearchHarness\chrome-profile
     ActiveMCPCLI -> Chrome child with --user-data-dir=<Research profile>
     ChromeLaunchTransport=--remote-debugging-pipe
 

@@ -507,6 +507,19 @@ class PaperNavigator:
                 "results": [result.as_dict() for result in results[:top]],
             }
         )
+        if self._snapshot.work_count == 0:
+            # Zero results from zero works is not a retrieval outcome, and an
+            # agent left to guess reads it as "nothing relevant exists".  Say
+            # what is actually true: nothing has been acquired yet.
+            payload["status"] = "EMPTY_LIBRARY"
+            payload["empty_library_note"] = (
+                "The Global Paper Library holds no works yet, so no query can "
+                "match anything. This is the expected state of a fresh install, "
+                "not a defect. The library fills as the acquisition pipeline "
+                "archives validated full texts (hunnu-harness acquire / the "
+                "live-* commands), or as individual PDFs pass library-stage + "
+                "library-import."
+            )
         return payload
 
     def _stage1(self, parsed: ParsedQuery) -> list[ScoredDocument]:

@@ -65,3 +65,26 @@ def isolated_fetch_ledger_path(monkeypatch):
             f"{REAL_FETCH_LEDGER_PATH} (before={before}, after={after}); "
             "publisher fetch budget is live state and tests must never write it"
         )
+
+
+@pytest.fixture(autouse=True)
+def clear_fetch_ledger_tuning_environment(monkeypatch):
+    """Assert shipped defaults so user-set fetch knobs cannot break self-checks.
+
+    Tests using ``patch.dict`` still take effect after this fixture's setup.
+    """
+
+    from hunnu_harness.literature.fetch_ledger import (
+        BURST_LIMIT_ENV,
+        BURST_WINDOW_ENV,
+        DAILY_FETCH_LIMIT_ENV,
+        MIN_FETCH_INTERVAL_ENV,
+    )
+
+    for env_name in (
+        DAILY_FETCH_LIMIT_ENV,
+        MIN_FETCH_INTERVAL_ENV,
+        BURST_WINDOW_ENV,
+        BURST_LIMIT_ENV,
+    ):
+        monkeypatch.delenv(env_name, raising=False)

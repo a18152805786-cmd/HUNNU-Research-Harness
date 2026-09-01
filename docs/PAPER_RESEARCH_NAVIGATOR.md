@@ -5,7 +5,7 @@
 The Global Paper Library holds 179 scholarly WORKS as 192 physical files, all
 catalogued. Every one of them is reachable through the commands below. There is
 no paper in this environment that requires a filesystem hunt to find, and a
-`glob` over `Desktop`, `Downloads`, `D:\BaiduNetdiskDownload`, or any Baidu/
+`glob` over `Desktop`, `Downloads`, or a personal cloud/thesis archive/
 Obsidian folder is both slower and less correct than one Navigator call.
 
 ---

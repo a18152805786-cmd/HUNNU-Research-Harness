@@ -7,10 +7,22 @@ import os
 from pathlib import Path
 
 from . import __version__
-from .browser.playwright_backend import PlaywrightUnavailable
+from .browser.playwright_backend import PlaywrightUnavailable, discover_chrome_executable
 from .browser.pdf_preferences import ResearchChromePdfPreference, ResearchChromePreferenceError
 from .browser.session import ResearchBrowser
-from .paths import LIBRARY_ROOT, OUTPUT_ROOT, CORE_ROOT, STAGING_DIR
+from .cli_output import CliReport, attach_json_flag
+from .paths import LIBRARY_ROOT, OUTPUT_ROOT, CORE_ROOT, STAGING_DIR, _windows_io_path
+
+
+def _bool_plain(value: object) -> object:
+    return str(value).lower() if isinstance(value, bool) else value
+
+
+def _audit_report(args: argparse.Namespace, audit_items: dict) -> CliReport:
+    report = CliReport(bool(getattr(args, "json", False)))
+    for key, value in audit_items.items():
+        report.put(key, value, plain=_bool_plain(value))
+    return report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("browser-start", help="Start a dedicated Playwright Chrome profile")
     start.add_argument("--profile", type=Path, default=Path(os.environ.get("HUNNU_RESEARCH_PROFILE", Path.home() / "ResearchHarness" / "chrome-profile")))
     start.add_argument("--downloads", type=Path, default=STAGING_DIR)
-    start.add_argument("--chrome", type=Path, default=Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"))
+    start.add_argument("--chrome", type=Path, default=discover_chrome_executable())
     start.add_argument("--headless", action="store_true")
     pdf_download = sub.add_parser(
         "browser-configure-pdf-download",
@@ -133,10 +145,102 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    sub.add_parser(
+        "capabilities",
+        help="What this build supports: sources, knobs, exit-code ladder (JSON, no probing)",
+    )
+    sub.add_parser(
+        "doctor",
+        help="Is this machine ready: Python, Playwright, Chrome, Output Root, budget (JSON, no network)",
+    )
+
+    acquire = sub.add_parser(
+        "acquire",
+        help=(
+            "Run one bounded live acquisition against a supported source, in the "
+            "user's own authenticated Research Chrome (spends their quota)"
+        ),
+    )
+    acquire.add_argument(
+        "--source",
+        required=True,
+        choices=("sciencedirect", "springerlink", "cnki", "oxfordacademic"),
+        help="Which publisher adapter to drive",
+    )
+    acquire_selector = acquire.add_mutually_exclusive_group(required=True)
+    acquire_selector.add_argument("--title")
+    acquire_selector.add_argument("--doi")
+    acquire_selector.add_argument("--request-json", type=Path)
+    acquire.add_argument("--run-root", type=Path, default=None)
+    acquire.add_argument("--profile", type=Path, default=None)
+    acquire.add_argument("--chrome", type=Path, default=None)
+    acquire.add_argument("--max-results", type=int, default=None)
+    acquire.add_argument("--max-downloads", type=int, choices=range(0, 2), default=None)
+    acquire.add_argument("--headless", action="store_true")
+    acquire.add_argument(
+        "--daily-limit",
+        type=int,
+        default=None,
+        help=(
+            "Override the daily publisher fetch total (default 15; also "
+            "HUNNU_HARNESS_DAILY_FETCH_LIMIT); this is your account's quota knob"
+        ),
+    )
+    acquire.add_argument(
+        "--allow-refetch",
+        action="store_true",
+        help=(
+            "Explicitly permit fetching the same paper again after the "
+            "per-identifier repeat check refused it; never lifts the daily total"
+        ),
+    )
+    acquire.add_argument(
+        "--human-wait",
+        type=float,
+        default=None,
+        help="Seconds to hold the page for a person to clear a challenge (springerlink only)",
+    )
+
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
+    # One contract across the whole CLI: with --json, stdout is exactly one
+    # json.loads-able document.  Commands already emitting one accept the
+    # flag as a no-op.
+    attach_json_flag(sub)
     return parser
+
+
+def _acquire_to_literature_argv(args: argparse.Namespace) -> list[str]:
+    """Translate ``acquire --source X`` onto the literature ``live-X`` surface.
+
+    The literature parser stays the single owner of per-source defaults
+    (run roots, result caps); this translation forwards only what the caller
+    actually set, so those defaults keep applying.
+    """
+
+    argv: list[str] = [f"live-{args.source}"]
+    for flag, value in (
+        ("--title", args.title),
+        ("--doi", args.doi),
+        ("--request-json", args.request_json),
+        ("--run-root", args.run_root),
+        ("--profile", args.profile),
+        ("--chrome", args.chrome),
+        ("--max-results", args.max_results),
+        ("--max-downloads", args.max_downloads),
+        ("--daily-limit", args.daily_limit),
+        ("--human-wait", args.human_wait),
+    ):
+        if value is not None:
+            argv.extend([flag, str(value)])
+    if args.headless:
+        argv.append("--headless")
+    if args.allow_refetch:
+        argv.append("--allow-refetch")
+    if getattr(args, "json", False):
+        argv.append("--json")
+    return argv
 
 
 async def _start(args: argparse.Namespace) -> int:
@@ -156,23 +260,27 @@ async def _start(args: argparse.Namespace) -> int:
             chrome_executable=args.chrome,
         )
     except PersistentBrowserError as exc:
-        print("DedicatedProfileStarted=false")
-        print(f"Reason={exc}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("DedicatedProfileStarted", False, plain="false")
+        report.put("Reason", str(exc))
+        report.flush()
         return 2
-    for key, value in status.as_dict().items():
-        print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-    print("DedicatedProfileStarted=true")
-    print("BrowserLeftRunning=true")
+    report = _audit_report(args, status.as_dict())
+    report.put("DedicatedProfileStarted", True, plain="true")
+    report.put("BrowserLeftRunning", True, plain="true")
+    report.flush()
     return 0
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.command == "env":
-        print(f"CoreRoot={CORE_ROOT}")
-        print(f"OutputRoot={OUTPUT_ROOT}")
-        print(f"LibraryRoot={LIBRARY_ROOT}")
-        print(f"Python={os.sys.executable}")
+        report = CliReport(bool(getattr(args, "json", False)))
+        report.put("CoreRoot", str(CORE_ROOT))
+        report.put("OutputRoot", str(OUTPUT_ROOT))
+        report.put("LibraryRoot", str(LIBRARY_ROOT))
+        report.put("Python", os.sys.executable)
+        report.flush()
         return 0
     if args.command == "browser-start":
         return asyncio.run(_start(args))
@@ -180,29 +288,31 @@ def main() -> int:
         try:
             audit = ResearchChromePdfPreference(args.profile).configure_direct_download()
         except ResearchChromePreferenceError as exc:
-            print(f"PdfDirectDownloadConfigured=false")
-            print(f"Reason={exc}")
+            report = CliReport(bool(getattr(args, "json", False)))
+            report.put("PdfDirectDownloadConfigured", False, plain="false")
+            report.put("Reason", str(exc))
+            report.flush()
             return 2
-        for key, value in audit.as_dict().items():
-            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-        print("PdfDirectDownloadConfigured=true")
+        report = _audit_report(args, audit.as_dict())
+        report.put("PdfDirectDownloadConfigured", True, plain="true")
+        report.flush()
         return 0
     if args.command == "browser-status":
         from .browser.persistent_browser import probe
 
-        status = probe()
-        for key, value in status.as_dict().items():
-            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
+        _audit_report(args, probe().as_dict()).flush()
         return 0
     if args.command == "browser-stop":
         import asyncio as _asyncio
 
         from .browser.persistent_browser import probe
 
+        report = CliReport(bool(getattr(args, "json", False)))
         status = probe()
         if not status.running:
-            print("PersistentBrowserRunning=false")
-            print("Reason=No persistent Research Chrome is listening")
+            report.put("PersistentBrowserRunning", False, plain="false")
+            report.put("Reason", "No persistent Research Chrome is listening")
+            report.flush()
             return 0
 
         async def _shutdown() -> None:
@@ -213,20 +323,40 @@ def main() -> int:
                 await browser.close()
 
         _asyncio.run(_shutdown())
-        print("PersistentBrowserStopped=true")
-        print("SessionEnded=true")
+        report.put("PersistentBrowserStopped", True, plain="true")
+        report.put("SessionEnded", True, plain="true")
+        report.flush()
         return 0
     if args.command == "browser-configure-session-restore":
         try:
             audit = ResearchChromePdfPreference(args.profile).configure_session_restore()
         except ResearchChromePreferenceError as exc:
-            print("SessionRestoreConfigured=false")
-            print(f"Reason={exc}")
+            report = CliReport(bool(getattr(args, "json", False)))
+            report.put("SessionRestoreConfigured", False, plain="false")
+            report.put("Reason", str(exc))
+            report.flush()
             return 2
-        for key, value in audit.as_dict().items():
-            print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-        print("SessionRestoreConfigured=true")
+        report = _audit_report(args, audit.as_dict())
+        report.put("SessionRestoreConfigured", True, plain="true")
+        report.flush()
         return 0
+    if args.command == "capabilities":
+        from .diagnostics import build_capabilities
+
+        print(json.dumps(build_capabilities(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "doctor":
+        from .diagnostics import build_doctor
+
+        payload, exit_code = build_doctor()
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return exit_code
+    if args.command == "acquire":
+        # The literature module owns the live path end to end (it constructs
+        # its own PlaywrightBrowser; no host MCP client is involved).
+        from .literature.cli import main as literature_main
+
+        return literature_main(_acquire_to_literature_argv(args))
     if args.command == "agent-route":
         from .agent_entrypoint import route_from_cli_args
 
@@ -256,9 +386,11 @@ def main() -> int:
         except FetchLedgerError as exc:
             # A ledger that cannot be read refuses fetches (fail closed), so
             # say that plainly instead of printing a half-true budget.
-            print("LedgerReadable=false")
-            print(f"Reason={exc}")
-            print("FetchesWillBeRefused=true")
+            report = CliReport(bool(getattr(args, "json", False)))
+            report.put("LedgerReadable", False, plain="false")
+            report.put("Reason", str(exc))
+            report.put("FetchesWillBeRefused", True, plain="true")
+            report.flush()
             return 2
         print(json.dumps(usage, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
@@ -279,7 +411,7 @@ def main() -> int:
     if args.command == "library-import":
         from .literature.library import ExternalPaperImporter, LibraryDisposition
 
-        metadata = json.loads(args.metadata_json.read_text(encoding="utf-8-sig"))
+        metadata = json.loads(_windows_io_path(args.metadata_json).read_text(encoding="utf-8-sig"))
         if not isinstance(metadata, dict):
             raise ValueError("Library import metadata JSON must contain one object")
         result = ExternalPaperImporter().import_staged_pdf(args.source, metadata)

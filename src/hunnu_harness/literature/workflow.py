@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
-from ..paths import TEMP_DIR, is_within
+from ..paths import TEMP_DIR, _windows_io_path, is_within
 from .adapters.base import (
     LiteratureSourceAdapter,
     LiteratureSourceError,
@@ -28,7 +28,7 @@ from .downloads import (
     LiteratureDownloadManager,
     UnauthorizedFullTextError,
 )
-from .fetch_ledger import FetchLedgerError
+from .fetch_ledger import FetchBudgetExceeded, FetchLedgerError
 from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
 from .auto_classification import PostAcquisitionClassifier
 from .library import GlobalPaperLibrary
@@ -494,6 +494,20 @@ class LiteratureAcquisitionWorkflow:
                     record.error_status = RunStatus.FULLTEXT_NOT_AUTHORIZED.value
                     record.error_reason = str(exc)
                     status = RunStatus.PARTIAL_SUCCESS
+                except FetchBudgetExceeded as exc:
+                    # A budget refusal is not a download failure: the run goes
+                    # on, but the record carries the ledger's own status so the
+                    # CLI can report -- and exit on -- "budget", not "failed".
+                    record.error_status = exc.status
+                    record.error_reason = str(exc)
+                    errors.append(str(exc))
+                    status = RunStatus.PARTIAL_SUCCESS
+                    self.logger.log(
+                        "fulltext_fetch_refused_by_budget",
+                        status=exc.status,
+                        paper_id=record.paper_id,
+                        reason=str(exc),
+                    )
                 except (
                     InvalidFullTextDownload,
                     LiteratureSourceError,
@@ -532,9 +546,10 @@ class LiteratureAcquisitionWorkflow:
             await asyncio.sleep(self.delay)
 
     def _query_log_count(self) -> int:
-        if not self.writer.query_log_path.exists():
+        query_log_io = _windows_io_path(self.writer.query_log_path)
+        if not query_log_io.exists():
             return 0
-        with self.writer.query_log_path.open("r", encoding="utf-8-sig") as handle:
+        with query_log_io.open("r", encoding="utf-8-sig") as handle:
             return max(0, sum(1 for _ in handle) - 1)
 
     def _finalize(

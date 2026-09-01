@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import re
 import shutil
 import time
@@ -11,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..paths import require_output_path
+from ..paths import _logical_path, _transaction_token, _windows_io_path, require_output_path
 
 
 _TEMPORARY_SUFFIXES = (".crdownload", ".part", ".partial", ".download", ".tmp")
@@ -36,7 +35,7 @@ class ManualDownloadCandidateRejected(ManualDownloadHandoffError):
 
 def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with _windows_io_path(path).open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
@@ -207,16 +206,16 @@ class ManualDownloadHandoff:
         *,
         allow_outside_output_for_tests: bool = False,
     ) -> None:
-        self.watch_directory = Path(watch_directory).resolve()
-        self.staging_directory = Path(staging_directory).resolve()
-        if not self.watch_directory.is_dir():
+        self.watch_directory = _logical_path(watch_directory)
+        self.staging_directory = _logical_path(staging_directory)
+        if not _windows_io_path(self.watch_directory).is_dir():
             raise FileNotFoundError(f"Manual download watch directory does not exist: {self.watch_directory}")
         if not allow_outside_output_for_tests:
             self.staging_directory = require_output_path(
                 self.staging_directory,
                 label="Manual download controlled staging",
             )
-        self.staging_directory.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.staging_directory).mkdir(parents=True, exist_ok=True)
         self.allow_outside_output_for_tests = allow_outside_output_for_tests
 
     @staticmethod
@@ -230,17 +229,22 @@ class ManualDownloadHandoff:
     @staticmethod
     def _has_pdf_header(path: Path) -> bool:
         try:
-            with path.open("rb") as handle:
+            with _windows_io_path(path).open("rb") as handle:
                 return handle.read(5) == b"%PDF-"
         except OSError:
             return False
 
     def snapshot(self, *, hash_existing_pdfs: bool = False) -> DownloadDirectorySnapshot:
         files: list[DownloadFileSnapshot] = []
-        for path in sorted(self.watch_directory.iterdir(), key=lambda item: item.name.casefold()):
-            if not path.is_file():
+        for raw_path in sorted(
+            _windows_io_path(self.watch_directory).iterdir(),
+            key=lambda item: item.name.casefold(),
+        ):
+            path = _logical_path(raw_path)
+            path_io = _windows_io_path(path)
+            if not path_io.is_file():
                 continue
-            stat = path.stat()
+            stat = path_io.stat()
             digest = _sha256(path) if hash_existing_pdfs and self._is_pdf(path) else "not_recorded"
             files.append(
                 DownloadFileSnapshot(
@@ -316,7 +320,7 @@ class ManualDownloadHandoff:
                     counts.pop(path, None)
             for path in scan.completed_candidates:
                 try:
-                    stat = path.stat()
+                    stat = _windows_io_path(path).stat()
                 except OSError:
                     continue
                 signature = (stat.st_size, stat.st_mtime_ns)
@@ -331,7 +335,7 @@ class ManualDownloadHandoff:
                 valid = tuple(
                     path
                     for path in scan.completed_candidates
-                    if path.stat().st_size > 0 and self._has_pdf_header(path)
+                    if _windows_io_path(path).stat().st_size > 0 and self._has_pdf_header(path)
                 )
                 if len(valid) > 1:
                     raise ManualDownloadCandidateAmbiguous(
@@ -361,67 +365,77 @@ class ManualDownloadHandoff:
         *,
         controlled_filename: str,
     ) -> ManualDownloadHandoffResult:
-        source = detection.source_path.resolve()
+        source = _logical_path(detection.source_path)
+        source_io = _windows_io_path(source)
         if source.parent != self.watch_directory:
             raise ManualDownloadCandidateRejected("Detected candidate is outside the armed watch directory")
-        if not source.is_file() or source.stat().st_size <= 0 or not self._has_pdf_header(source):
+        if not source_io.is_file() or source_io.stat().st_size <= 0 or not self._has_pdf_header(source):
             raise ManualDownloadCandidateRejected("Detected candidate is not a completed PDF")
         safe_name = _SAFE_FILENAME.sub("_", Path(controlled_filename).name).strip("._")
         if not safe_name.casefold().endswith(".pdf"):
             safe_name = f"{safe_name or 'manual-download'}.pdf"
         destination = self.staging_directory / safe_name
         digest = _sha256(source)
-        if destination.exists() and _sha256(destination) != digest:
+        if _windows_io_path(destination).exists() and _sha256(destination) != digest:
             destination = destination.with_name(f"{destination.stem}_{digest[:12]}.pdf")
-        if source != destination and not destination.exists():
-            shutil.copy2(source, destination)
-        if not destination.is_file() or _sha256(destination) != digest:
+        if source != destination and not _windows_io_path(destination).exists():
+            shutil.copy2(source_io, _windows_io_path(destination))
+        destination_io = _windows_io_path(destination)
+        if not destination_io.is_file() or _sha256(destination) != digest:
             raise ManualDownloadHandoffError("Controlled staging copy failed SHA256 verification")
         return ManualDownloadHandoffResult(
             source_path=source,
             staged_path=destination,
             after=detection.after,
             new_download_candidates=detection.new_download_candidates,
-            original_manual_download_preserved=source.is_file(),
+            original_manual_download_preserved=source_io.is_file(),
         )
 
     def save_state(self, state: ManualDownloadHandoffState, path: Path) -> Path:
-        destination = Path(path).resolve()
+        destination = _logical_path(path)
         if not self.allow_outside_output_for_tests:
             destination = require_output_path(destination, label="Manual download handoff state")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-        temporary.write_text(
-            json.dumps(state.as_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        temporary.replace(destination)
+        _windows_io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{_transaction_token()}.tmp")
+        temporary_io = _windows_io_path(temporary)
+        try:
+            temporary_io.write_text(
+                json.dumps(state.as_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            temporary_io.replace(_windows_io_path(destination))
+        finally:
+            temporary_io.unlink(missing_ok=True)
         return destination
 
     def save_result(self, result: ManualDownloadHandoffResult, path: Path) -> Path:
-        destination = Path(path).resolve()
+        destination = _logical_path(path)
         if not self.allow_outside_output_for_tests:
             destination = require_output_path(destination, label="Manual download handoff result")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-        temporary.write_text(
-            json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        temporary.replace(destination)
+        _windows_io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{_transaction_token()}.tmp")
+        temporary_io = _windows_io_path(temporary)
+        try:
+            temporary_io.write_text(
+                json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            temporary_io.replace(_windows_io_path(destination))
+        finally:
+            temporary_io.unlink(missing_ok=True)
         return destination
 
     @staticmethod
     def load_state(path: Path) -> ManualDownloadHandoffState:
-        payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        payload = json.loads(_windows_io_path(path).read_text(encoding="utf-8-sig"))
         return ManualDownloadHandoffState.from_mapping(payload)
 
     def _validate_state(self, state: ManualDownloadHandoffState) -> None:
-        if state.watch_directory.resolve() != self.watch_directory:
+        if _logical_path(state.watch_directory) != self.watch_directory:
             raise ManualDownloadHandoffError("Handoff state watch directory does not match")
-        if state.staging_directory.resolve() != self.staging_directory:
+        if _logical_path(state.staging_directory) != self.staging_directory:
             raise ManualDownloadHandoffError("Handoff state staging directory does not match")
 
 

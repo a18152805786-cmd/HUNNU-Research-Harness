@@ -27,6 +27,9 @@ from ..paths import (
     PAPER_RETRIEVAL_INDEX_DIR,
     PAPER_RETRIEVAL_INDEX_MANIFEST,
     PAPER_RETRIEVAL_ROOT,
+    _logical_path,
+    _transaction_token,
+    _windows_io_path,
     require_output_path,
 )
 from .catalog import CatalogSnapshot, PaperWork
@@ -50,7 +53,7 @@ def _timestamp() -> str:
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with _windows_io_path(path).open("rb") as handle:
         while block := handle.read(chunk_size):
             digest.update(block)
     return digest.hexdigest()
@@ -64,11 +67,15 @@ def _safe_digest(path: Path) -> str:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    require_output_path(path, label="Navigator index path")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.{hashlib.sha256(content.encode()).hexdigest()[:8]}.tmp")
-    temporary.write_text(content, encoding="utf-8", newline="\n")
-    temporary.replace(path)
+    logical = require_output_path(path, label="Navigator index path")
+    _windows_io_path(logical.parent).mkdir(parents=True, exist_ok=True)
+    temporary = logical.with_name(f"{logical.name}.{_transaction_token()}.tmp")
+    temporary_io = _windows_io_path(temporary)
+    try:
+        temporary_io.write_text(content, encoding="utf-8", newline="\n")
+        temporary_io.replace(_windows_io_path(logical))
+    finally:
+        temporary_io.unlink(missing_ok=True)
 
 
 @dataclass
@@ -136,12 +143,14 @@ class NavigatorIndex:
         extractor: FullTextExtractor | None = None,
         resolver: PreferredVersionResolver | None = None,
     ) -> None:
-        self.root = Path(root or PAPER_RETRIEVAL_ROOT)
-        self.index_dir = self.root / "index" if root else Path(PAPER_RETRIEVAL_INDEX_DIR)
-        self.manifest_path = self.index_dir / "manifest.json" if root else Path(PAPER_RETRIEVAL_INDEX_MANIFEST)
-        self.fulltext_dir = self.index_dir / "fulltext" if root else Path(PAPER_RETRIEVAL_FULLTEXT_DIR)
+        self.root = _logical_path(root or PAPER_RETRIEVAL_ROOT)
+        self.index_dir = self.root / "index" if root else _logical_path(PAPER_RETRIEVAL_INDEX_DIR)
+        self.manifest_path = self.index_dir / "manifest.json" if root else _logical_path(PAPER_RETRIEVAL_INDEX_MANIFEST)
+        self.fulltext_dir = self.index_dir / "fulltext" if root else _logical_path(PAPER_RETRIEVAL_FULLTEXT_DIR)
         self.fulltext_manifest_path = (
-            self.index_dir / "fulltext_manifest.json" if root else Path(PAPER_RETRIEVAL_FULLTEXT_MANIFEST)
+            self.index_dir / "fulltext_manifest.json"
+            if root
+            else _logical_path(PAPER_RETRIEVAL_FULLTEXT_MANIFEST)
         )
         self.extractor = extractor or FullTextExtractor()
         self.resolver = resolver or PreferredVersionResolver()
@@ -149,10 +158,11 @@ class NavigatorIndex:
     # -- status ------------------------------------------------------------
 
     def read_manifest(self) -> IndexManifest | None:
-        if not self.manifest_path.is_file():
+        manifest_io = _windows_io_path(self.manifest_path)
+        if not manifest_io.is_file():
             return None
         try:
-            payload = json.loads(self.manifest_path.read_text(encoding="utf-8-sig"))
+            payload = json.loads(manifest_io.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             return None
         if not isinstance(payload, dict):
@@ -167,11 +177,11 @@ class NavigatorIndex:
                 "index_dir": str(self.index_dir),
             }
             return (
-                IndexStatus.ABSENT if not self.manifest_path.exists() else IndexStatus.UNREADABLE,
+                IndexStatus.ABSENT if not _windows_io_path(self.manifest_path).exists() else IndexStatus.UNREADABLE,
                 detail,
             )
         current_catalog = _safe_digest(snapshot.catalog_path)
-        current_topics = _safe_digest(snapshot.topics_path) if snapshot.topics_path.is_file() else ""
+        current_topics = _safe_digest(snapshot.topics_path) if _windows_io_path(snapshot.topics_path).is_file() else ""
         fresh = manifest.catalog_sha256 == current_catalog and manifest.topics_sha256 == current_topics
         detail = {
             "built_at": manifest.built_at,
@@ -241,8 +251,8 @@ class NavigatorIndex:
         """
 
         require_output_path(self.root, label="Navigator index root")
-        self.index_dir.mkdir(parents=True, exist_ok=True)
-        self.fulltext_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.index_dir).mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.fulltext_dir).mkdir(parents=True, exist_ok=True)
 
         selected = set(only) if only is not None else None
         entries: dict[str, dict[str, Any]] = {}
@@ -301,7 +311,7 @@ class NavigatorIndex:
             schema_version=INDEX_SCHEMA_VERSION,
             built_at=_timestamp(),
             catalog_sha256=_safe_digest(snapshot.catalog_path),
-            topics_sha256=_safe_digest(snapshot.topics_path) if snapshot.topics_path.is_file() else "",
+            topics_sha256=_safe_digest(snapshot.topics_path) if _windows_io_path(snapshot.topics_path).is_file() else "",
             work_count=snapshot.work_count,
             version_count=snapshot.version_count,
             topic_assignment_count=snapshot.topic_assignment_count,
@@ -333,8 +343,8 @@ class NavigatorIndex:
 
     def drop(self) -> None:
         require_output_path(self.index_dir, label="Navigator index dir")
-        if self.index_dir.exists():
-            shutil.rmtree(self.index_dir)
+        if _windows_io_path(self.index_dir).exists():
+            shutil.rmtree(_windows_io_path(self.index_dir))
 
     # -- validate ----------------------------------------------------------
 
@@ -366,7 +376,7 @@ class NavigatorIndex:
                 )
             if int(entry.get("chunk_count", 0)) > 0:
                 path = self._chunk_path(work.paper_id)
-                if not path.is_file():
+                if not _windows_io_path(path).is_file():
                     problems.append({"paper_id": work.paper_id, "problem": "chunk file missing"})
 
         return {
@@ -420,17 +430,18 @@ class NavigatorIndex:
 
     def _remove_chunk_file(self, paper_id: str) -> None:
         path = self._chunk_path(paper_id)
-        if path.exists():
+        if _windows_io_path(path).exists():
             require_output_path(path, label="Navigator chunk file")
-            path.unlink()
+            _windows_io_path(path).unlink()
 
     def _read_chunks(self, paper_id: str) -> tuple[Chunk, ...]:
         path = self._chunk_path(paper_id)
-        if not path.is_file():
+        path_io = _windows_io_path(path)
+        if not path_io.is_file():
             return ()
         chunks: list[Chunk] = []
         try:
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
+            for line in path_io.read_text(encoding="utf-8-sig").splitlines():
                 if not line.strip():
                     continue
                 chunks.append(Chunk.from_dict(json.loads(line)))
@@ -439,10 +450,11 @@ class NavigatorIndex:
         return tuple(chunks)
 
     def _read_fulltext_manifest(self) -> dict[str, dict[str, Any]]:
-        if not self.fulltext_manifest_path.is_file():
+        manifest_io = _windows_io_path(self.fulltext_manifest_path)
+        if not manifest_io.is_file():
             return {}
         try:
-            payload = json.loads(self.fulltext_manifest_path.read_text(encoding="utf-8-sig"))
+            payload = json.loads(manifest_io.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             return {}
         entries = payload.get("entries") if isinstance(payload, dict) else None

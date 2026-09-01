@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..paths import RUNS_ROOT, require_output_path
+from ..paths import (
+    RUNS_ROOT,
+    _logical_path,
+    _transaction_token,
+    _windows_io_path,
+    require_output_path,
+)
 from .models import DownloadManifestEntry, LiteratureRecord, LiteratureSearchRequest, QueryLogEntry, UNKNOWN
 from .security import sanitize_value
 
@@ -69,10 +74,14 @@ SCREENING_FIELDS = (
 
 
 def _atomic_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(content, encoding="utf-8", newline="\n")
-    temporary.replace(path)
+    _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+    temporary_io = _windows_io_path(temporary)
+    try:
+        temporary_io.write_text(content, encoding="utf-8", newline="\n")
+        temporary_io.replace(_windows_io_path(path))
+    finally:
+        temporary_io.unlink(missing_ok=True)
 
 
 class LiteratureArtifactWriter:
@@ -84,12 +93,12 @@ class LiteratureArtifactWriter:
         *,
         allow_outside_project_for_tests: bool = False,
     ):
-        self.run_root = Path(run_root).resolve()
+        self.run_root = _logical_path(run_root)
         if not allow_outside_project_for_tests:
             self.run_root = require_output_path(self.run_root, label="Literature run artifacts")
-        self.run_root.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.run_root).mkdir(parents=True, exist_ok=True)
         self.downloads_dir = self.run_root / "downloads"
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.downloads_dir).mkdir(parents=True, exist_ok=True)
 
     @property
     def search_request_path(self) -> Path:
@@ -141,9 +150,10 @@ class LiteratureArtifactWriter:
         return self.search_request_path
 
     def append_query_log(self, entry: QueryLogEntry) -> Path:
-        exists = self.query_log_path.exists() and self.query_log_path.stat().st_size > 0
-        self.query_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.query_log_path.open("a", encoding="utf-8-sig" if not exists else "utf-8", newline="") as handle:
+        query_log_io = _windows_io_path(self.query_log_path)
+        exists = query_log_io.exists() and query_log_io.stat().st_size > 0
+        _windows_io_path(self.query_log_path.parent).mkdir(parents=True, exist_ok=True)
+        with query_log_io.open("a", encoding="utf-8-sig" if not exists else "utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=QUERY_LOG_FIELDS, extrasaction="ignore")
             if not exists:
                 writer.writeheader()
@@ -298,16 +308,20 @@ AutoWriteToObsidian=false
 
     @staticmethod
     def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-        temporary.replace(path)
+        _windows_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{_transaction_token()}.tmp")
+        temporary_io = _windows_io_path(temporary)
+        try:
+            with temporary_io.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            temporary_io.replace(_windows_io_path(path))
+        finally:
+            temporary_io.unlink(missing_ok=True)
 
     def _relative_or_name(self, path: Path) -> Path:
         try:
-            return path.resolve().relative_to(self.run_root)
+            return _logical_path(path).relative_to(_logical_path(self.run_root))
         except (ValueError, OSError):
             return Path(path.name)

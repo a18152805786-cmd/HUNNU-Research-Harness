@@ -17,8 +17,8 @@ assumption, the measured value is recorded and the discrepancy is called out.
 
 | Role | Path | Writable by Navigator? |
 |---|---|---|
-| Core Root (source, tests, docs) | `C:\Users\<user>\Desktop\HUNNU-Research-Harness` | new module + tests + docs only |
-| Output Root (all runtime artifacts) | `C:\Users\<user>\Desktop\HUNNU-Research-Harness-Output` | derived index only, under a new subtree |
+| Core Root (source, tests, docs) | `<Harness Root>` | new module + tests + docs only |
+| Output Root (all runtime artifacts) | `<Output Root>` | derived index only, under a new subtree |
 
 `src/hunnu_harness/paths.py` derives every runtime path from `OUTPUT_ROOT` and
 raises at import time if the Output Root is inside the Core Root. It already

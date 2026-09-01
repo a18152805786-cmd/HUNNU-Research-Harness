@@ -1,3 +1,13 @@
+"""The adapter contract every publisher source implements.
+
+TO THE MODIFYING AGENT: ``authorize_publisher_fetch`` is the write-ahead
+budget gate -- there is deliberately no way to construct an adapter whose
+publisher fetches are unbudgeted, and the execution boundary matches adapter
+identity exactly (``type(adapter) is expected_type``; ``isinstance`` would
+readmit subclass substitution).  Weakening either requires asking the user
+first, in so many words.
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -108,9 +118,13 @@ class LiteratureSourceAdapter(ABC):
     # means the real ledger in the Output Root's audit directory -- there is
     # deliberately no way to construct an adapter whose publisher fetches are
     # unbudgeted.  Tests inject an isolated ledger here; ``allow_refetch`` is
-    # the explicit CLI override for a refused fetch.
+    # the explicit CLI override for the per-identifier repeat check only --
+    # the daily total binds regardless.
     fetch_ledger: FulltextFetchLedger | None = None
     allow_refetch: bool = False
+    # Applies only to the bare ledger construction path; an injected
+    # ``fetch_ledger`` always takes precedence.
+    daily_fetch_limit: int | None = None
 
     def __init__(self, browser: BrowserCommandPort | Any | None):
         # ``None`` remains valid for parser-only/finalizer construction.  Any
@@ -200,7 +214,7 @@ class LiteratureSourceAdapter(ABC):
         cannot be budgeted at all; both fail the download, never bypass it.
         """
 
-        ledger = self.fetch_ledger or FulltextFetchLedger()
+        ledger = self.fetch_ledger or FulltextFetchLedger(global_limit=self.daily_fetch_limit)
         return ledger.authorize_fetch(
             source=self.name,
             identifier=ledger_identifier(record, prefer=identifier),

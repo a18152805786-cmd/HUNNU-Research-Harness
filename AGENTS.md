@@ -1,5 +1,45 @@
 # HUNNU Research Harness — Agent Rules
 
+## If you are an agent MODIFYING this harness (read this first)
+
+The 71 numbered rules below are written for agents *using* the harness. You,
+fixing a bug in it, face a different temptation: for an agent whose goal is
+"make the error go away", a fail-closed check looks like the thing in the way.
+Every one of these edits makes the immediate error disappear, and every one of
+them removes the protection someone's institutional account depends on:
+
+- a rate/budget refusal → raising the constant or deleting the check;
+- `type(adapter) is expected_type` → `isinstance`, "more Pythonic" (it is the
+  gate that rejects subclass substitution, and it is exact on purpose);
+- a manual-authentication stop → adding an automatic retry;
+- `require_output_path` in the way of a write → removing the call.
+
+Before you touch a guard, know these three things:
+
+1. **The tunable knobs already exist.** The daily fetch total
+   (`--daily-limit` / `HUNNU_HARNESS_DAILY_FETCH_LIMIT`), pacing
+   (`HUNNU_HARNESS_FETCH_MIN_INTERVAL_SECONDS`, burst window/limit), the
+   Output Root (`HUNNU_HARNESS_OUTPUT_ROOT`), Chrome and profile paths — all
+   adjustable without editing a line. If a limit is genuinely wrong for your
+   user, the knob is the fix, and the knob belongs to the user.
+2. **Some things are deliberately not knobs.** The 2-per-identifier daily
+   repeat guard is loop detection (it once caught the same PDF being fetched
+   13 times in a day); the manual-authentication stops, the cookie/credential
+   boundary, and the Core/Output separation are non-negotiable. Files that
+   carry such guards say so in their header: weakening them requires asking
+   the user first, in so many words — it is their account and their data.
+3. **Failing tests name what you broke.** This suite's test names are written
+   as sentences ("this failing means --allow-refetch became a general budget
+   bypass"). If your change turns one red, the test is talking to you; do not
+   delete it, and do not "fix" it to agree with the regression.
+
+`docs/AGENTS_ENFORCEMENT_AUDIT.md` maps all 71 rules to their enforcement
+(code-enforced vs prose) — use it to find what you are actually touching.
+When a needed change weakens any code-enforced rule, stop and put the
+decision to the user in plain language.
+
+---
+
 1. Never enter university passwords, personal passwords, OTPs, or MFA codes.
 2. Stop at CAPTCHA, MFA, WebVPN, CAS, or any manual authentication page.
 3. Verify URL, database, module, and table before every download.
@@ -16,7 +56,7 @@
 14. Default authorized downloads go to the separate Harness Output Root.
 15. Default manifests go to the separate Harness Output Root.
 16. Runtime logs, screenshots, staging files, review packages, runs, audit files, and temporary artifacts remain inside the Harness Output Root.
-17. Formal thesis datasets may be exported to D:\BaiduNetdiskDownload\论文数据 only when explicitly requested.
+17. Formal thesis datasets may be exported to the formal thesis data directory explicitly specified by the user only when explicitly requested.
 18. Never place test, smoke-test, or runtime files in the thesis data directory.
 
 ## Browser control surface
@@ -41,8 +81,8 @@
 
 ## Core / output separation
 
-33. Harness source/core root: `C:\Users\<user>\Desktop\HUNNU-Research-Harness`.
-34. Harness runtime/output root: `C:\Users\<user>\Desktop\HUNNU-Research-Harness-Output`.
+33. Harness source/core root: the directory containing this repository.
+34. Harness runtime/output root: the sibling directory `<repository-directory-name>-Output`, unless overridden by `HUNNU_HARNESS_OUTPUT_ROOT`.
 35. All Harness runtime/generated artifacts default to the Output Root, including runs, audits, logs, screenshots, manifests, review packages, staging, authorized downloads, browser output, quarantine, and temporary runtime artifacts. The Core Root is not a runtime destination.
 36. The Output Root is not a second Harness repository: never copy source, adapters, tests, fixtures, configuration, reusable scripts, or dependency metadata there as a parallel implementation.
 
@@ -104,7 +144,7 @@ This section defines **how** an Agent calls Harness after global routing has sel
 
 ## Paper Research Navigator (retrieval layer v0.1)
 
-64. To find literature the Harness may already hold, query the Navigator before anything else: `paper-search`, `paper-lookup`, `paper-fulltext`, `paper-related`, `paper-pack`, `paper-gaps`, `paper-verify-citation` on the `hunnu-harness` CLI, or `hunnu_harness.navigator.PaperNavigator` in process. Do not glob the disk, search `Desktop`/`Downloads`/`D:\BaiduNetdiskDownload`/Obsidian history, or guess a paper path. The full contract is `docs/PAPER_RESEARCH_NAVIGATOR.md`.
+64. To find literature the Harness may already hold, query the Navigator before anything else: `paper-search`, `paper-lookup`, `paper-fulltext`, `paper-related`, `paper-pack`, `paper-gaps`, `paper-verify-citation` on the `hunnu-harness` CLI, or `hunnu_harness.navigator.PaperNavigator` in process. Do not glob the disk, search `Desktop`/`Downloads`/a personal cloud or thesis archive directory/Obsidian history, or guess a paper path. The full contract is `docs/PAPER_RESEARCH_NAVIGATOR.md`.
 
 65. Retrieval is WORK-first. A `paper_id` is the logical identity; the 192 physical files are versions of the 179 works and must never be treated as separate papers. Open only the path the Navigator returns in `preferred_version.absolute_path`; never construct a path from a `paper_id`, because three managed files carry a historical name that differs from the `paper_id` of the work that owns them.
 
@@ -118,4 +158,4 @@ This section defines **how** an Agent calls Harness after global routing has sel
 
 70. `REVIEW_REQUIRED` is resolved by `library-confirm-topics --paper-id <id> --topic "<domain>\<subtopic>"`, repeating `--topic` for several. Never edit `paper_topics.jsonl`, `paper_topics.csv`, or `topic_links.csv` by hand, never call `TopicStore` directly to settle a topic, and never create a folder under `papers_by_topic\`. The command confirms only what classification proposed for that work, re-checks the frozen taxonomy regardless, and records the assignment as `HUMAN_CONFIRMED` in `Output Root\library\topic_assignment_provenance.jsonl` so a human decision is distinguishable from an automatic one. Confirming a second, different set is refused: changing a settled assignment is a reclassification, not a confirmation. `--allow-taxonomy-override` confirms a taxonomy topic that was not proposed and is the only way to file a topic the classifier did not raise; it still cannot invent one. If the command fails it changes nothing, so retry it rather than repairing state by hand.
 
-71. A real publisher download is acceptance, never a diagnostic. When a fetch fails after the bytes arrived, the first fetched file *is* the evidence -- diagnose offline from it, the manifests, and the logs; "run it once more to see" spends institutional quota and risks abuse detection. Every adapter full-text fetch is budgeted by the write-ahead ledger in `Output Rootuditulltext_fetch_ledger.jsonl` (two attempts per identifier per UTC day, 25 per day overall per Rule 62), and the attempt is recorded before the action, so a fetch whose later steps fail still counts. Check `hunnu-harness library-fetch-budget` before a run instead of the browser download history. Re-fetching the same paper requires the explicit `--allow-refetch` flag and a stated reason; the ledger records the override. The ledger is runtime state, not corpus: it never enters the corpus fingerprint and never carries a username, an account, or a device name.
+71. A real publisher download is acceptance, never a diagnostic. When a fetch fails after the bytes arrived, the first fetched file *is* the evidence -- diagnose offline from it, the manifests, and the logs; "run it once more to see" spends institutional quota and risks abuse detection. Every adapter full-text fetch is budgeted by the write-ahead ledger in `Output Root\audit\fulltext_fetch_ledger.jsonl` -- two attempts per identifier per UTC day (a loop guard, deliberately not configurable), plus a daily total that defaults to 15 and is the user's own knob (--daily-limit / HUNNU_HARNESS_DAILY_FETCH_LIMIT; Rule 62's 25 is the separate single-batch ceiling). The attempt is recorded before the action, so a fetch whose later steps fail still counts, and consecutive fetches are paced (15s minimum spacing, 12 per 10 minutes by default). Check `hunnu-harness library-fetch-budget` before a run instead of the browser download history. Re-fetching the same paper requires the explicit `--allow-refetch` flag and a stated reason; the ledger records the override, and the flag never lifts the daily total. The ledger is runtime state, not corpus: it never enters the corpus fingerprint and never carries a username, an account, or a device name.

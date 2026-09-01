@@ -7,7 +7,8 @@ paths:
   archive_root: ../HUNNU-Research-Harness-Output/downloads/authorized
   downloads_watch:
     - ../HUNNU-Research-Harness-Output/staging
-  dedicated_profile: C:/Users/<user>/ResearchHarness/chrome-profile
+  # Example only; runtime uses HUNNU_RESEARCH_PROFILE or the CLI --profile option.
+  dedicated_profile: '%USERPROFILE%\ResearchHarness\chrome-profile'
   logs: ../HUNNU-Research-Harness-Output/logs
   manifests: ../HUNNU-Research-Harness-Output/manifests
   screenshots: ../HUNNU-Research-Harness-Output/screenshots
@@ -22,7 +23,8 @@ paths:
 browser:
   engine: playwright
   headless: false
-  chrome_executable: C:/Program Files/Google/Chrome/Application/chrome.exe
+  # Example only; runtime uses HUNNU_RESEARCH_CHROME or the CLI --chrome option, then auto-discovers Chrome.
+  chrome_executable: null
   connect_over_cdp_endpoint: null
   allow_daily_profile: false
   pdf_direct_download: true

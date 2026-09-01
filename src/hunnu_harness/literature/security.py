@@ -1,3 +1,11 @@
+"""Sanitization and leak scanning for everything the Harness writes down.
+
+TO THE MODIFYING AGENT: this is the single sanitization policy for audit
+logs and agent-facing output.  Narrowing a pattern here, or exempting a key
+because redaction "hides useful detail", widens what reaches disk -- ask the
+user first, in so many words.  Over-redaction is the intended failure mode.
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
+
+from ..paths import _windows_io_path
 
 
 SENSITIVE_TERMS = (
@@ -96,7 +106,7 @@ class LiteratureAuditLogger:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
 
     def log(self, action: str, *, status: str, **details: Any) -> None:
         event = {
@@ -105,7 +115,7 @@ class LiteratureAuditLogger:
             "status": sanitize_text(status),
             **sanitize_value(details),
         }
-        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+        with _windows_io_path(self.path).open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
@@ -162,10 +172,11 @@ def scan_files_for_sensitive_leaks(paths: Iterable[Path]) -> list[SensitiveLeakF
     findings: list[SensitiveLeakFinding] = []
     for path in paths:
         candidate = Path(path)
-        if not candidate.exists() or not candidate.is_file():
+        candidate_io = _windows_io_path(candidate)
+        if not candidate_io.exists() or not candidate_io.is_file():
             continue
         try:
-            content = candidate.read_text(encoding="utf-8")
+            content = candidate_io.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
         findings.extend(scan_text_for_sensitive_leaks(content, path=candidate))

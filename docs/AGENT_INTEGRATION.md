@@ -111,7 +111,7 @@ Authentication remains manual. The Agent entry point never handles passwords, co
 All runtime evidence, including dry-run results, goes beneath:
 
 ```text
-C:\Users\<user>\Desktop\HUNNU-Research-Harness-Output
+Output Root (by default, the sibling directory `<repository-name>-Output`, or `HUNNU_HARNESS_OUTPUT_ROOT`)
 ```
 
 The Core Root remains code, tests, fixtures, configuration, and documentation only. For authorized full text, use the web page for search/metadata/access/normal download, then read the validated local file for full-text evidence extraction and analysis:
@@ -135,4 +135,4 @@ The caller builds a `SourceCapabilityRegistry` from the existing Adapter registr
 
 The Coordinator contains no source-specific branches. A future Adapter joins by registering its capabilities and a preflight handler. An existing local PDF or manual download handoff is not current-session unattended readiness evidence.
 
-Runtime manifests are written below `C:\Users\<user>\Desktop\HUNNU-Research-Harness-Output\runs\Harness_V028_MultiSource_Preflight_Coordinator`. The formal research run stays stopped until every planned source is ready; partial execution requires explicit user approval.
+Runtime manifests are written below `<Output Root>\runs\Harness_V028_MultiSource_Preflight_Coordinator`. The formal research run stays stopped until every planned source is ready; partial execution requires explicit user approval.

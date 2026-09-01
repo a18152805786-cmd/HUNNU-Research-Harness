@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -352,7 +353,7 @@ class ProvenanceTests(unittest.TestCase):
             _review_work(fixture)
             fixture.service().confirm_topics("PR1", [AI_WASHING])
             raw = fixture.provenance.path.read_text(encoding="utf-8")
-            for leak in ("<user>", "C:\\Users", "username", "USERNAME"):
+            for leak in ("719" + "66", "C:" + chr(92) + "Users", "username", "USERNAME"):
                 self.assertNotIn(leak, raw)
 
     def test_human_confirmed_is_recorded_after_confirmation_succeeds(self) -> None:
@@ -516,6 +517,72 @@ class SharedApplyPathTests(unittest.TestCase):
             paper_id="PZ", status=ClassificationStatus.REVIEW_REQUIRED
         )
         self.assertFalse(result.is_classified)
+
+
+class DistributionSanitizationTests(unittest.TestCase):
+    """The distribution must not reacquire personal paths or archive names.
+
+    This is a tracked-text full-repository gate.  A failure means a personal
+    path or archive label was reintroduced into the distributable repository;
+    the sentinel values are assembled at runtime so this test cannot exempt
+    its own source from the scan.
+    """
+
+    def test_tracked_text_files_have_no_personal_distribution_fingerprints(self) -> None:
+        """Scan every tracked text file for personal path/archive fingerprints."""
+
+        root = Path(__file__).resolve().parents[1]
+        try:
+            toplevel = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            result = subprocess.run(
+                ["git", "ls-files", "-z"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.skipTest(
+                "no git metadata here: an extracted distribution has no tracked-file "
+                "list to scan; this gate runs in the repository"
+            )
+        if Path(toplevel).resolve() != root:
+            self.skipTest(
+                "this tree is not its own git repository (an extracted copy inside "
+                "some other repo); the scan gate runs in the Harness repository"
+            )
+        if not result.stdout.strip():
+            self.skipTest("git returned no tracked files; scanning is repository-only")
+        user_segment = "719" + "66"
+        sentinels = (
+            user_segment,
+            "Baidu" + "NetdiskDownload",
+            "\u8bba\u6587" + "\u6570\u636e",
+            "C:" + chr(92) + "Users" + chr(92) + user_segment,
+        )
+        leaks: list[tuple[str, str]] = []
+        for raw_name in result.stdout.split(b"\0"):
+            if not raw_name:
+                continue
+            relative = raw_name.decode("utf-8")
+            path = root / relative
+            content = path.read_bytes()
+            if b"\0" in content:
+                continue
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            for sentinel in sentinels:
+                if sentinel in text:
+                    leaks.append((relative, sentinel))
+        self.assertEqual(leaks, [], "personal distribution fingerprints found: " + repr(leaks))
 
 
 if __name__ == "__main__":
