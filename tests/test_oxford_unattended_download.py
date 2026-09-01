@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,10 @@ from hunnu_harness.literature.models import (
     LiteratureSearchRequest,
     RunStatus,
 )
+from hunnu_harness.literature.institutional import (
+    InstitutionalResolutionTrigger,
+    InstitutionalRouteResult,
+)
 from hunnu_harness.literature.normalization import sha256_file
 from hunnu_harness.literature.workflow import finalize_unattended_download_acceptance
 
@@ -42,6 +47,10 @@ from literature_test_support import isolated_fetch_ledger, write_minimal_pdf_wit
 TITLE = "Double/debiased machine learning for treatment and structural parameters"
 DOI = "10.1111/ectj.12097"
 PDF_URL = "https://academic.oup.com/ectj/article-pdf/21/1/C1/27684918/ectj00c1.pdf"
+GATEWAY_PDF_URL = (
+    "https://yclib.hunnu.edu.cn/vpn/983/https/OPAQUE-OXFORD-ROUTE"
+    "/ectj/article-pdf/21/1/C1/27684918/ectj00c1.pdf"
+)
 
 
 def _profile(root: Path, payload: dict[str, object]) -> Path:
@@ -88,6 +97,14 @@ def _access() -> AccessDecision:
         reason="Purchased: official article PDF is accessible",
         download_url=PDF_URL,
         download_locator=f'a[href="{PDF_URL}"]',
+    )
+
+
+def _gateway_access() -> AccessDecision:
+    return replace(
+        _access(),
+        download_url=GATEWAY_PDF_URL,
+        download_locator=f'a[href="{GATEWAY_PDF_URL}"]',
     )
 
 
@@ -237,7 +254,11 @@ class OxfordUnattendedStateTests(unittest.IsolatedAsyncioTestCase):
             adapter.fetch_ledger = ledger_scope.__enter__()
             self.addCleanup(ledger_scope.__exit__, None, None, None)
 
+            trusted_hosts: tuple[str, ...] = ()
+
             async def capture(*_: object, **kwargs: object) -> AuthorizedFileCaptureResult:
+                nonlocal trusted_hosts
+                trusted_hosts = kwargs["trusted_hosts"]
                 await kwargs["official_action"]()
                 return AuthorizedFileCaptureResult(
                     path=captured,
@@ -265,6 +286,63 @@ class OxfordUnattendedStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(record.manual_download_handoff_used)
             self.assertFalse(record.human_download_action)
             self.assertTrue(record.oxford_unattended_download_ready)
+            self.assertEqual(
+                trusted_hosts,
+                ("academic.oup.com", "oup.silverchair-cdn.com"),
+            )
+
+    async def test_gateway_capture_also_declares_silverchair_delivery_host(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            browser = _Browser(root)
+            captured = root / "captured.pdf"
+            captured.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            adapter = OxfordAcademicAdapter(
+                browser,
+                allow_capture_outside_output_for_tests=True,
+            )
+            adapter.bind_institutional_route(
+                InstitutionalRouteResult(
+                    requested_source="OxfordAcademic",
+                    resolution_trigger=InstitutionalResolutionTrigger.ACCESS_ROUTE_UNKNOWN,
+                    institutional_route_resolved=True,
+                    institutional_target_database_match=True,
+                    publisher_entry_url="https://yclib.hunnu.edu.cn/vpn/",
+                    publisher_navigation_url="https://yclib.hunnu.edu.cn/vpn/",
+                )
+            )
+            ledger_scope = isolated_fetch_ledger()
+            adapter.fetch_ledger = ledger_scope.__enter__()
+            self.addCleanup(ledger_scope.__exit__, None, None, None)
+            trusted_hosts: tuple[str, ...] = ()
+
+            async def capture(*_: object, **kwargs: object) -> AuthorizedFileCaptureResult:
+                nonlocal trusted_hosts
+                trusted_hosts = kwargs["trusted_hosts"]
+                await kwargs["official_action"]()
+                return AuthorizedFileCaptureResult(
+                    path=captured,
+                    acquisition_method=AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
+                    source_host="yclib.hunnu.edu.cn",
+                    source_route="HUNNU_GATEWAY_TO_OXFORD",
+                    download_event_emitted=True,
+                    authorized_pdf_response_captured=False,
+                )
+
+            with patch.object(BrowserAuthorizedFileCapture, "capture_pdf", new=capture), patch.object(
+                OxfordAcademicAdapter,
+                "validate_pdf_identity",
+                return_value=OxfordPDFIdentityResult(True, True, True, True),
+            ):
+                await adapter.download_fulltext(_record(), _gateway_access())
+            self.assertEqual(
+                trusted_hosts,
+                (
+                    "academic.oup.com",
+                    "yclib.hunnu.edu.cn",
+                    "oup.silverchair-cdn.com",
+                ),
+            )
 
     async def test_manual_handoff_is_not_unattended_ready(self) -> None:
         with tempfile.TemporaryDirectory() as td:

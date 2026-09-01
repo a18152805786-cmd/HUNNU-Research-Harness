@@ -854,9 +854,13 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
                     timeout_ms=self._capture_timeout_ms,
                     capture=DownloadCaptureSpec(
                         trusted_hosts=(
-                            (self.official_host, self.hunnu_gateway_host)
+                            (
+                                self.official_host,
+                                self.hunnu_gateway_host,
+                                "oup.silverchair-cdn.com",
+                            )
                             if self._gateway_trusted()
-                            else (self.official_host,)
+                            else (self.official_host, "oup.silverchair-cdn.com")
                         ),
                         provenance_host=provenance_host,
                         source_route=source_route,

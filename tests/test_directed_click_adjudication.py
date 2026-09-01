@@ -33,6 +33,9 @@ PII = "SLOCALPII123"
 FILENAME = f"1-s2.0-{PII}-main.pdf"
 EXPECTED_URL = f"https://www.sciencedirect.com/science/article/pii/{PII}/pdfft?md5=abc"
 SOURCE_URL = f"https://pdf.sciencedirectassets.com/1/main.pdf?pii={PII}&X-Amz-Signature=s"
+OUP_PDF_URL = "https://academic.oup.com/rfs/article-pdf/36/9/3603/51141974/hhad021.pdf"
+CNKI_ORDER_ID = "CNKI_ORDER_20260901_ABC123"
+CNKI_ORDER_URL = f"https://bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}"
 PDF_BYTES = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
 
 
@@ -61,10 +64,16 @@ class _Backend:
     """An attached persistent browser, as the executor sees one."""
 
     attached = True
-    page = object()
     context = object()
 
-    def __init__(self, downloads_dir: Path, session: _Session) -> None:
+    def __init__(
+        self,
+        downloads_dir: Path,
+        session: _Session,
+        *,
+        page_url: str = "about:blank",
+    ) -> None:
+        self.page = type("_Page", (), {"url": page_url})()
         self.downloads_dir = downloads_dir
         self._cdp = session
 
@@ -72,11 +81,24 @@ class _Backend:
 class _Locator:
     """A control whose click either settles, or does not."""
 
-    def __init__(self, session: _Session, directory: Path, *, behaviour: str) -> None:
+    def __init__(
+        self,
+        session: _Session,
+        directory: Path,
+        *,
+        behaviour: str,
+        source_url: str = SOURCE_URL,
+        href: object = None,
+    ) -> None:
         self.session = session
         self.directory = directory
         self.behaviour = behaviour
+        self.source_url = source_url
+        self.href = href
         self.clicked = 0
+
+    async def get_attribute(self, name: str) -> object:
+        return self.href if name == "href" else None
 
     async def click(self, **kwargs):  # noqa: ANN003
         self.clicked += 1
@@ -86,7 +108,7 @@ class _Locator:
         # the click itself ever settles.
         self.session.emit(
             "Browser.downloadWillBegin",
-            {"guid": "g1", "url": SOURCE_URL, "suggestedFilename": FILENAME},
+            {"guid": "g1", "url": self.source_url, "suggestedFilename": FILENAME},
         )
         self.directory.mkdir(parents=True, exist_ok=True)
         if self.behaviour != "incomplete":
@@ -98,7 +120,7 @@ class _Locator:
             )
         if self.behaviour in {"timeout-after-download", "incomplete", "invalid-pdf"}:
             raise TimeoutError(
-                f"Timeout 30000ms exceeded waiting for {SOURCE_URL}"
+                f"Timeout 30000ms exceeded waiting for {self.source_url}"
             )
 
 
@@ -115,18 +137,36 @@ def command() -> DownloadCommand:
     )
 
 
-def attempt(behaviour: str, tmp: Path):
+def attempt(
+    behaviour: str,
+    tmp: Path,
+    *,
+    download_command: DownloadCommand | None = None,
+    source_url: str = SOURCE_URL,
+    href: object = None,
+    page_url: str = "about:blank",
+):
     session = _Session()
     directory = tmp / "staging"
-    executor = LocalPlaywrightExecutor(_Backend(directory, session))
-    locator = _Locator(session, directory, behaviour=behaviour)
+    executor = LocalPlaywrightExecutor(
+        _Backend(directory, session, page_url=page_url)
+    )
+    locator = _Locator(
+        session,
+        directory,
+        behaviour=behaviour,
+        source_url=source_url,
+        href=href,
+    )
     from hunnu_harness.browser import browser_directed_download as module
 
     original = module.DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS, module.DEFAULT_COMPLETION_TIMEOUT_SECONDS
     module.DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS = 0.5
     module.DEFAULT_COMPLETION_TIMEOUT_SECONDS = 0.8
     try:
-        result = asyncio.run(executor._directed_capture(locator, command()))
+        result = asyncio.run(
+            executor._directed_capture(locator, download_command or command())
+        )
     finally:
         module.DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS, module.DEFAULT_COMPLETION_TIMEOUT_SECONDS = original
     return result, executor, locator
@@ -140,6 +180,60 @@ def temp_root(prefix: str):
 
 
 class AdjudicationTests(unittest.TestCase):
+    def test_capture_spec_trusted_hosts_reach_the_directed_allowlist(self) -> None:
+        oup_command = DownloadCommand(
+            target=BrowserTarget(css="a#pdf"),
+            suggested_filename="TARGET.pdf",
+            capture=DownloadCaptureSpec(
+                trusted_hosts=("ACADEMIC.OUP.COM",),
+                expected_url=OUP_PDF_URL,
+                provenance_host="academic.oup.com",
+                source_route="OXFORD_DIRECT",
+            ),
+        )
+        with temp_root("adj-oup-hosts-") as tmp:
+            result, _, _ = attempt(
+                "settles",
+                Path(tmp),
+                download_command=oup_command,
+                source_url=OUP_PDF_URL,
+            )
+        self.assertEqual(result.source_host, "academic.oup.com")
+
+    def test_bare_command_uses_locator_href_identity_and_cnki_default_host(self) -> None:
+        cnki_command = DownloadCommand(
+            target=BrowserTarget(text="PDF", exact_text=True),
+            suggested_filename="TARGET.pdf",
+        )
+        with temp_root("adj-cnki-href-") as tmp:
+            result, _, locator = attempt(
+                "settles",
+                Path(tmp),
+                download_command=cnki_command,
+                source_url=CNKI_ORDER_URL,
+                href=f"//bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}",
+                page_url="https://kns.cnki.net/kcms2/article/abstract",
+            )
+        self.assertEqual(result.source_host, "bar.cnki.net")
+        self.assertEqual(locator.clicked, 1)
+
+    def test_cnki_redirect_that_drops_the_order_id_remains_fail_closed(self) -> None:
+        cnki_command = DownloadCommand(
+            target=BrowserTarget(text="PDF", exact_text=True),
+            suggested_filename="TARGET.pdf",
+        )
+        with temp_root("adj-cnki-redirect-") as tmp:
+            with self.assertRaises(DownloadFailure) as caught:
+                attempt(
+                    "settles",
+                    Path(tmp),
+                    download_command=cnki_command,
+                    source_url="https://download.cnki.net/final/paper.pdf",
+                    href=f"//bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}",
+                    page_url="https://kns.cnki.net/kcms2/article/abstract",
+                )
+        self.assertIn("DOWNLOAD_EVENT_TIMEOUT", str(caught.exception))
+
     def test_a_settled_click_with_a_completed_download_succeeds_quietly(self) -> None:
         with temp_root("adj-ok-") as tmp:
             result, executor, locator = attempt("settles", Path(tmp))

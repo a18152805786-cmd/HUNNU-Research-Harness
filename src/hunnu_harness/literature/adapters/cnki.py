@@ -53,6 +53,22 @@ _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "
 _CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
 _CNKI_2026_RESULT_CLASSES = frozenset({"fz14", "inline"})
 _CNKI_2026_DOWNLOAD_CONTROL_IDS = frozenset({"pdfdown", "cajdown"})
+_CNKI_INSTITUTION_LABEL_CLASSES = frozenset({"ecp_header_unitname", "ecp_unitaccountname"})
+_CNKI_GENERIC_LOGIN_LABELS = frozenset(
+    {
+        "个人登录",
+        "个人账号登录",
+        "机构登录",
+        "账号登录",
+        "登录",
+        "登录/注册",
+        "登录注册",
+        "请登录",
+        "立即登录",
+        "免费注册",
+        "退出",
+    }
+)
 _SEARCH_SETTLE_DELAY_SECONDS = 10.0
 _SEARCH_SETTLE_MAX_OBSERVATIONS = 3
 _CNKI_CLICK_RETRY_DELAY_SECONDS = 1.0
@@ -220,6 +236,18 @@ def _is_cnki_resource_order_url(value: str) -> bool:
         and parsed.path.casefold().rstrip("/") == _CNKI_RESOURCE_ORDER_PATH
         and bool(parse_qs(parsed.query).get("id"))
     )
+
+
+def _cnki_authenticated_institution_label(value: str) -> str:
+    """Return a concrete institution label, never a generic login control."""
+
+    label = re.sub(r"\s+", " ", value).strip()
+    compact = re.sub(r"\s+", "", label).casefold()
+    if not compact or compact in _CNKI_GENERIC_LOGIN_LABELS:
+        return ""
+    if "个人登录" in compact or "个人账号登录" in compact:
+        return ""
+    return label
 
 
 def _cnki_download_layout_priority(anchor: _Anchor, absolute_url: str) -> int:
@@ -485,6 +513,8 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         self._hidden_depths: list[int] = []
         self._non_content_depths: list[int] = []
         self._overlay_depths: list[int] = []
+        self._institution_header_depths: list[int] = []
+        self._institution_label_captures: list[tuple[int, list[str]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
@@ -513,12 +543,26 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
                 self._non_content_depths.append(depth)
             if lowered == "title":
                 self._document_title_depth += 1
+            if "ecp_header_login_area" in classes:
+                self._institution_header_depths.append(depth)
         if "ecp_header_login_status1" in classes:
             self.institution_login_status = True
+        elif (
+            {"ecp_header_login_status", "ecp_header_login"}.issubset(classes)
+            and bool(self._institution_header_depths)
+        ):
+            self.institution_login_status = True
         if "ecp_header_unitname" in classes:
-            label = re.sub(r"\s+", " ", attributes.get("title", "")).strip()
+            label = _cnki_authenticated_institution_label(attributes.get("title", ""))
             if label and "display:none" not in style and "visibility:hidden" not in style:
                 self.authenticated_institution_labels.append(label)
+        if (
+            classes & _CNKI_INSTITUTION_LABEL_CLASSES
+            and bool(self._institution_header_depths)
+            and not self._hidden_depths
+            and lowered not in _VOID_ELEMENTS
+        ):
+            self._institution_label_captures.append((len(self._open_tags), []))
         key = ""
         if lowered == "h1":
             key = "title"
@@ -550,6 +594,8 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
             self.visible_text_parts.append(stripped)
             if self._overlay_depths:
                 self.overlay_text_parts.append(stripped)
+        for _, parts in self._institution_label_captures:
+            parts.append(data)
         for _, _, parts in self._capture_stack:
             parts.append(data)
 
@@ -564,6 +610,7 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
                     self.author_links.append(author)
         super().handle_endtag(tag)
         self._close_element(lowered)
+        self._finish_institution_label_captures()
         if self._capture_stack and self._capture_stack[-1][0] == lowered:
             _, key, parts = self._capture_stack.pop()
             value = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -589,7 +636,22 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
             self._hidden_depths = [depth for depth in self._hidden_depths if depth <= remaining]
             self._non_content_depths = [depth for depth in self._non_content_depths if depth <= remaining]
             self._overlay_depths = [depth for depth in self._overlay_depths if depth <= remaining]
+            self._institution_header_depths = [
+                depth for depth in self._institution_header_depths if depth <= remaining
+            ]
             return
+
+    def _finish_institution_label_captures(self) -> None:
+        remaining = len(self._open_tags)
+        open_captures: list[tuple[int, list[str]]] = []
+        for depth, parts in self._institution_label_captures:
+            if depth <= remaining:
+                open_captures.append((depth, parts))
+                continue
+            label = _cnki_authenticated_institution_label(" ".join(parts))
+            if label and label not in self.authenticated_institution_labels:
+                self.authenticated_institution_labels.append(label)
+        self._institution_label_captures = open_captures
 
     def first_block(self, key: str) -> str:
         values = self.blocks.get(key, [])

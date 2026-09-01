@@ -27,6 +27,7 @@ from hunnu_harness.literature.institutional import (
     InstitutionalRouteResult,
 )
 from hunnu_harness.literature.models import (
+    AccessType,
     FullTextFormat,
     LiteratureRecord,
     LiteratureSearchRequest,
@@ -122,6 +123,7 @@ class CNKI2026FixtureTests(unittest.TestCase):
         )
         self.assertTrue(decision.full_text_accessible)
         self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.INSTITUTIONAL_AUTHENTICATED)
         self.assertEqual(decision.full_text_format, FullTextFormat.PDF)
         self.assertEqual(decision.download_locator, "PDF下载")
         self.assertEqual(decision.download_url, "https://bar.cnki.net/bar/download/order?id=fixture-pdf")

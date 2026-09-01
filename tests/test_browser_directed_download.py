@@ -20,6 +20,7 @@ from pathlib import Path
 
 from hunnu_harness.browser.authorized_file_capture import AcquisitionMethod
 from hunnu_harness.browser.browser_directed_download import (
+    DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
     ELSEVIER_PDF_HOSTS,
     BrowserDirectedDownload,
     DirectedDownloadFailure,
@@ -35,6 +36,13 @@ FILENAME = f"1-s2.0-{PII}-main.pdf"
 REAL_URL = (
     "https://pdf.sciencedirectassets.com/272089/1-s2.0-S1059056026X20056/"
     f"1-s2.0-{PII}/main.pdf?X-Amz-Date=20260830T121037Z&pii={PII}&tid=spdf-7373"
+)
+OUP_PDF_URL = (
+    "https://academic.oup.com/rfs/article-pdf/36/9/3603/51141974/hhad021.pdf"
+)
+CNKI_ORDER_ID = "CNKI_ORDER_20260901_ABC123"
+CNKI_ORDER_URL = (
+    f"https://bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}&filename=paper.pdf"
 )
 PDF_BYTES = b"%PDF-1.7\n" + b"x" * 4096 + b"\n%%EOF\n"
 
@@ -133,6 +141,16 @@ class IdentityTests(unittest.TestCase):
             pii_from_url(f"/science/article/pii/{OTHER_PII}/pdfft?md5=a"), OTHER_PII
         )
 
+    def test_oup_article_pdf_path_yields_the_main_article_stem(self) -> None:
+        self.assertEqual(pii_from_url(OUP_PDF_URL), "hhad021")
+
+    def test_cnki_order_url_yields_its_single_paper_order_id(self) -> None:
+        self.assertEqual(pii_from_url(CNKI_ORDER_URL), CNKI_ORDER_ID)
+
+    def test_pii_query_keeps_priority_over_the_existing_path_form(self) -> None:
+        url = f"https://www.sciencedirect.com/science/article/pii/{OTHER_PII}/pdfft?pii={PII}"
+        self.assertEqual(pii_from_url(url), PII)
+
     def test_a_url_naming_no_paper_yields_nothing(self) -> None:
         for url in ("https://example.invalid/a.pdf", "", "not a url"):
             self.assertEqual(pii_from_url(url), "")
@@ -144,6 +162,14 @@ class IdentityTests(unittest.TestCase):
         self.assertIn("www.sciencedirect.com", ELSEVIER_PDF_HOSTS)
         self.assertNotIn("example.invalid", ELSEVIER_PDF_HOSTS)
         self.assertEqual(host_of(REAL_URL), "pdf.sciencedirectassets.com")
+
+    def test_bare_attached_download_defaults_explicitly_include_cnki_delivery(self) -> None:
+        # Intentional Task H decision: a bare attached DownloadCommand has no
+        # capture-spec channel through which CNKI can declare its delivery host.
+        self.assertTrue(ELSEVIER_PDF_HOSTS.issubset(DIRECTED_DOWNLOAD_DEFAULT_HOSTS))
+        self.assertIn("bar.cnki.net", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
+        self.assertIn("download.cnki.net", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
+        self.assertNotIn("example.invalid", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
 
 
 class AcceptanceTests(unittest.TestCase):
