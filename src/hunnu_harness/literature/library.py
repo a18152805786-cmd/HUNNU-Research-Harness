@@ -44,6 +44,14 @@ from .security import sanitize_url
 
 
 CATALOG_SCHEMA_VERSION = "0.2.11"
+# The 0.2.10 -> 0.2.11 marker bump accompanied the additive bibliographic
+# metadata correction (commit 46402be); the catalog record shapes are isomorphic.
+# Add a version here only when it shares this lineage and the current reader has
+# demonstrated long-term compatibility with it. Unknown versions must still be
+# rejected.
+COMPATIBLE_CATALOG_SCHEMA_VERSIONS: frozenset[str] = frozenset(
+    {"0.2.10", "0.2.11"}
+)
 _PAPER_ID_RE = re.compile(r"^P[0-9A-F]{12}$")
 
 
@@ -757,15 +765,16 @@ class GlobalPaperLibrary:
                     raise LibraryCatalogError(f"Duplicate PaperID in catalog: {paper_id}")
                 seen.add(paper_id)
                 declared_schema = item.get("schema_version")
-                if declared_schema != CATALOG_SCHEMA_VERSION:
+                if declared_schema not in COMPATIBLE_CATALOG_SCHEMA_VERSIONS:
                     found = "absent" if declared_schema is None else repr(declared_schema)
                     raise LibraryCatalogError(
                         f"Catalog record at line {line_number} (PaperID {paper_id}) declares "
-                        f"schema_version {found}, but this Harness build reads schema_version "
-                        f"{CATALOG_SCHEMA_VERSION!r} and refuses to silently reinterpret the "
-                        "record under different assumptions. Load the catalog with the Harness "
-                        "version that wrote it, or migrate the catalog deliberately before "
-                        "retrying; never hand-edit catalog records."
+                        f"schema_version {found}, but this Harness build accepts only the compatible "
+                        "catalog schema versions "
+                        f"{sorted(COMPATIBLE_CATALOG_SCHEMA_VERSIONS)!r} and refuses to silently "
+                        "reinterpret the record under different assumptions. Load the catalog "
+                        "with the Harness version that wrote it, or migrate the catalog deliberately "
+                        "before retrying; never hand-edit catalog records."
                     )
                 records.append(item)
         except (OSError, json.JSONDecodeError) as exc:
@@ -1158,6 +1167,7 @@ class ExternalPaperImporter:
 
 __all__ = [
     "CATALOG_SCHEMA_VERSION",
+    "COMPATIBLE_CATALOG_SCHEMA_VERSIONS",
     "ExternalPaperImporter",
     "GlobalPaperLibrary",
     "LibraryCatalogError",

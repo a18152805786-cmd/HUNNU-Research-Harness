@@ -8,6 +8,7 @@ from unittest.mock import patch
 from hunnu_harness.cli import build_parser
 from hunnu_harness.literature.library import (
     CATALOG_SCHEMA_VERSION,
+    COMPATIBLE_CATALOG_SCHEMA_VERSIONS,
     ExternalPaperImporter,
     GlobalPaperLibrary,
     LibraryCatalogError,
@@ -333,12 +334,12 @@ class ExternalImporterSafetyTests(unittest.TestCase):
 
 
 class CatalogSchemaVersionGateTests(unittest.TestCase):
-    """This gate failing to fire means the catalog is being reinterpreted silently.
+    """This gate failing to fire means a foreign catalog is reinterpreted silently.
 
     ``CATALOG_SCHEMA_VERSION`` used to be write-only: every record carried it,
-    nothing ever compared it, so a catalog written by a different Harness build
-    was read under the current build's assumptions without a word.  These tests
-    pin the load-time gate; removing it reintroduces that silent reread.
+    nothing ever compared it, so a catalog with unfamiliar assumptions was read
+    without a word. These tests pin the load-time boundary: compatible lineage
+    remains readable, while missing or foreign versions fail closed.
     """
 
     def setUp(self) -> None:
@@ -377,7 +378,7 @@ class CatalogSchemaVersionGateTests(unittest.TestCase):
             self._next_ingest()
         message = str(caught.exception)
         self.assertIn("'9.9.9'", message)
-        self.assertIn(CATALOG_SCHEMA_VERSION, message)
+        self.assertIn(repr(sorted(COMPATIBLE_CATALOG_SCHEMA_VERSIONS)), message)
         self.assertIn("PaperID", message)
         self.assertIn("migrate the catalog", message)
 
@@ -387,9 +388,18 @@ class CatalogSchemaVersionGateTests(unittest.TestCase):
             self._next_ingest()
         message = str(caught.exception)
         self.assertIn("absent", message)
-        self.assertIn(CATALOG_SCHEMA_VERSION, message)
+        self.assertIn(repr(sorted(COMPATIBLE_CATALOG_SCHEMA_VERSIONS)), message)
+
+    def test_a_lineage_compatible_historical_version_still_loads_and_ingests(self) -> None:
+        """A lineage-compatible historical record must remain readable forever."""
+        self._rewrite_first_record(lambda item: item.update(schema_version="0.2.10"))
+        result = self._next_ingest()
+        self.assertEqual(result.status, "MANAGED")
+        self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
 
     def test_the_matching_schema_version_still_loads_and_ingests(self) -> None:
+        payload = json.loads(self.library.catalog_jsonl_path.read_text(encoding="utf-8-sig"))
+        self.assertEqual(payload["schema_version"], CATALOG_SCHEMA_VERSION)
         result = self._next_ingest()
         self.assertEqual(result.status, "MANAGED")
         self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
