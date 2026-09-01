@@ -28,18 +28,21 @@ from hunnu_harness.paths import (
 
 # The sealed audit numbers this corpus is frozen at.
 #
-# Resealed at 181/194/339 on 2026-08-30, from 179/192/337.  Two papers were
-# acquired through the full chain -- searched, identity-locked, downloaded from
-# the publisher, archived -- and each was given its topic by a person after
-# classification stopped at REVIEW_REQUIRED.  The numbers are read from the
-# library itself; they are recorded here so that any *further* drift fails, and
-# moving them is a deliberate act rather than a way to get a green suite.
+# Resealed at 185/198/345 on 2026-09-01, from 181/194/339.  Four papers were
+# acquired through the full chain during the four-site live acceptance --
+# ScienceDirect, SpringerLink, CNKI, and Oxford Academic; each searched,
+# identity-locked, downloaded from the publisher by the harness itself, and
+# archived.  (The 2026-08-30 reseal, 179/192/337 -> 181/194/339, recorded the
+# first two of these; this one records the remaining CNKI and Oxford pair.)
+# The numbers are read from the library itself; they are recorded here so that
+# any *further* drift fails, and moving them is a deliberate act rather than a
+# way to get a green suite.
 #
-# Unique topics stays 39 on purpose: both papers were filed under a topic that
-# already existed, and nothing here may create a fortieth.
-EXPECTED_WORKS = 181
-EXPECTED_VERSIONS = 194
-EXPECTED_TOPIC_ASSIGNMENTS = 339
+# Unique topics stays 39 on purpose: every acquisition was filed under a topic
+# that already existed, and nothing here may create a fortieth.
+EXPECTED_WORKS = 185
+EXPECTED_VERSIONS = 198
+EXPECTED_TOPIC_ASSIGNMENTS = 345
 EXPECTED_UNIQUE_TOPICS = 39
 
 # Known fixtures in the real corpus, verified during discovery.
