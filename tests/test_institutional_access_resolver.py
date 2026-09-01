@@ -3,8 +3,19 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hunnu_harness.paths import TEMP_DIR
+from hunnu_harness.browser.commands import (
+    BrowserActionResult,
+    BrowserObservation,
+    NavigateCommand,
+    ObservationUnavailable,
+    ObserveCommand,
+    PageHandle,
+    SessionHandle,
+)
+import hunnu_harness.literature.institutional as institutional_module
 from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceLayoutChanged
 from hunnu_harness.literature.adapters.springerlink import SpringerLinkAdapter
 from hunnu_harness.literature.artifacts import LiteratureArtifactWriter
@@ -329,6 +340,69 @@ class InstitutionalResolverParsingTests(unittest.TestCase):
 
 
 class InstitutionalResolverNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_retries_one_unavailable_observation_then_succeeds(self):
+        class _SettlingPort:
+            downloads_dir = TEMP_DIR
+            session = SessionHandle()
+            page_handle = PageHandle(session=session)
+
+            def __init__(self) -> None:
+                self.observations = 0
+
+            async def execute(self, command):
+                if isinstance(command, NavigateCommand):
+                    return BrowserActionResult(self.session, self.page_handle, 0, "navigate", command.url)
+                self.assertIsInstance(command, ObserveCommand)
+                self.observations += 1
+                if self.observations == 1:
+                    raise ObservationUnavailable("page is navigating")
+                return BrowserObservation(
+                    self.session,
+                    self.page_handle,
+                    0,
+                    "https://www.hunnu.edu.cn/",
+                    html="<html><title>HUNNU</title></html>",
+                )
+
+            def assertIsInstance(self, value, expected) -> None:
+                if not isinstance(value, expected):
+                    raise AssertionError(f"expected {expected}, got {type(value)}")
+
+        port = _SettlingPort()
+        with patch.object(institutional_module, "_SNAPSHOT_SETTLE_DELAY_SECONDS", 0):
+            snapshot = await HUNNUInstitutionalAccessResolver(port)._snapshot_after_goto(
+                "https://www.hunnu.edu.cn/"
+            )
+        self.assertEqual(snapshot, ("<html><title>HUNNU</title></html>", "https://www.hunnu.edu.cn/", "HUNNU"))
+        self.assertEqual(port.observations, 2)
+
+    async def test_snapshot_reraises_after_the_bounded_observation_attempts(self):
+        class _UnavailablePort:
+            downloads_dir = TEMP_DIR
+            session = SessionHandle()
+            page_handle = PageHandle(session=session)
+
+            def __init__(self) -> None:
+                self.observations = 0
+                self.failure = ObservationUnavailable("page is still navigating")
+
+            async def execute(self, command):
+                if isinstance(command, NavigateCommand):
+                    return BrowserActionResult(self.session, self.page_handle, 0, "navigate", command.url)
+                if isinstance(command, ObserveCommand):
+                    self.observations += 1
+                    raise self.failure
+                raise AssertionError(f"unexpected command: {command}")
+
+        port = _UnavailablePort()
+        with patch.object(institutional_module, "_SNAPSHOT_SETTLE_DELAY_SECONDS", 0):
+            with self.assertRaisesRegex(ObservationUnavailable, "still navigating") as caught:
+                await HUNNUInstitutionalAccessResolver(port)._snapshot_after_goto(
+                    "https://www.hunnu.edu.cn/"
+                )
+        self.assertIs(caught.exception, port.failure)
+        self.assertEqual(port.observations, institutional_module._SNAPSHOT_SETTLE_MAX_ATTEMPTS)
+
     async def test_successful_route_records_official_steps_without_access_assumption(self):
         browser = _MockBrowser(successful_route_pages())
         resolver = HUNNUInstitutionalAccessResolver(browser)

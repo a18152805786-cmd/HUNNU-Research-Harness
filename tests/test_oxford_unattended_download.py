@@ -288,7 +288,7 @@ class OxfordUnattendedStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(record.oxford_unattended_download_ready)
             self.assertEqual(
                 trusted_hosts,
-                ("academic.oup.com", "oup.silverchair-cdn.com"),
+                ("academic.oup.com", "oup.silverchair-cdn.com", ".silverchair.com"),
             )
 
     async def test_gateway_capture_also_declares_silverchair_delivery_host(self) -> None:
@@ -341,6 +341,7 @@ class OxfordUnattendedStateTests(unittest.IsolatedAsyncioTestCase):
                     "academic.oup.com",
                     "yclib.hunnu.edu.cn",
                     "oup.silverchair-cdn.com",
+                    ".silverchair.com",
                 ),
             )
 

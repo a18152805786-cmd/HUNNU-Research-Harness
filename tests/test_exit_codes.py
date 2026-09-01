@@ -171,6 +171,38 @@ class SetupPhaseSourceErrorTests(unittest.TestCase):
         self.assertEqual(payload["Status"], "SOURCE_LAYOUT_CHANGED")
         self.assertIn("institutional route", payload["Reason"])
 
+    def test_an_unexpected_setup_exception_reports_json_and_exits_five(self) -> None:
+        class _QuietBrowser:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def start(self) -> None:
+                return None
+
+            async def lifecycle(self) -> dict:
+                return {}
+
+            async def close(self) -> None:
+                return None
+
+        class _UnexpectedFailureWorkflow:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            async def run(self, _request: object) -> None:
+                raise RuntimeError("portal goto timed out\nwhile routing")
+
+        out = io.StringIO()
+        with patch.object(literature_cli, "PlaywrightBrowser", _QuietBrowser), patch.object(
+            literature_cli, "LiteratureAcquisitionWorkflow", _UnexpectedFailureWorkflow
+        ):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = literature_cli.main(["live-cnki", "--title", "x", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, EXIT_ENV_NOT_READY)
+        self.assertEqual(payload["Status"], "SOURCE_UNAVAILABLE")
+        self.assertIn("RuntimeError", payload["Reason"])
+
 
 class ExceptionLadderTests(unittest.TestCase):
     def test_missing_playwright_is_a_missing_capability(self) -> None:

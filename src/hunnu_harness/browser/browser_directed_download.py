@@ -49,8 +49,10 @@ ELSEVIER_PDF_HOSTS = frozenset(
 # Intentional allowlist widening: attached-mode adapters that issue a bare
 # DownloadCommand have no DownloadCaptureSpec.trusted_hosts declaration channel.
 # CNKI's vetted single-paper controls deliver through these explicit hosts.
+# Live acceptance on 2026-09-01 showed that bar.cnki.net may redirect a claimed
+# single-paper order to docdown.cnki.net, which serves the actual bytes.
 DIRECTED_DOWNLOAD_DEFAULT_HOSTS = ELSEVIER_PDF_HOSTS | frozenset(
-    {"bar.cnki.net", "download.cnki.net"}
+    {"bar.cnki.net", "download.cnki.net", "docdown.cnki.net"}
 )
 
 _PII_IN_URL = re.compile(r"[?&]pii=([A-Za-z0-9]+)", re.IGNORECASE)
@@ -137,6 +139,20 @@ def host_of(url: str) -> str:
         return (urlsplit(url).hostname or "").casefold().rstrip(".")
     except ValueError:
         return ""
+
+
+def _host_is_allowed(host: str, allowed: frozenset[str]) -> bool:
+    """Match exact hosts plus explicitly declared, dot-prefixed suffixes.
+
+    A suffix entry such as ``.silverchair.com`` matches only subdomains via
+    ``endswith``; it intentionally does not authorize the bare apex domain.
+    """
+
+    normalized = host.casefold().rstrip(".")
+    return any(
+        normalized.endswith(entry) if entry.startswith(".") else normalized == entry
+        for entry in allowed
+    )
 
 
 @dataclass
@@ -387,7 +403,7 @@ class BrowserDirectedDownload:
             ) from exc
 
         host = host_of(pending.url)
-        if host not in self.allowed_hosts:
+        if not _host_is_allowed(host, self.allowed_hosts):
             raise DirectedDownloadFailure(
                 f"{DirectedDownloadOutcome.DOWNLOAD_SOURCE_HOST_REJECTED.value}: "
                 f"{host or 'unknown host'} is not a recognised publisher PDF origin"
