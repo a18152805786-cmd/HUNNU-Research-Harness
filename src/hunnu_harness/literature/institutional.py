@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from abc import ABC, abstractmethod
@@ -26,6 +27,7 @@ from .security import sanitize_url
 HUNNU_INSTITUTION_NAME = "湖南师范大学"
 HUNNU_OFFICIAL_PORTAL = "https://www.hunnu.edu.cn/"
 HUNNU_LIBRARY_HOME = "https://lib.hunnu.edu.cn/"
+HUNNU_OXFORD_ROUTE_URL_ENV = "HUNNU_OXFORD_ROUTE_URL"
 
 
 class InstitutionalResolutionTrigger(str, Enum):
@@ -301,10 +303,15 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         "SpringerLink": ("link.springer.com",),
         "OxfordAcademic": ("academic.oup.com",),
     }
+    # The HUNNU library's 2026 official homepage sends its Database Navigation
+    # link one hop to these exact Chaoxing service hosts.  They are trusted only
+    # as bounded discovery/detail surfaces; the final publisher identity lock
+    # still requires academic.oup.com or the existing HUNNU gateway contract.
     _TRUSTED_LIBRARY_SERVICE_DOMAINS = (
         "wisdom.chaoxing.com",
         "hunnulib.mh.chaoxing.com",
     )
+    _LIBRARY_OUTER_PROXY_PATH = "/engine2/general-rest/outer-proxy-type-url"
     _HUNNU_GATEWAY_DOMAINS = ("yclib.hunnu.edu.cn",)
     _LIBRARY_MARKERS = ("湖南师范大学图书馆", "图书馆", "library")
     _RESOURCE_MARKERS = (
@@ -322,6 +329,7 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         *,
         portal_url: str = HUNNU_OFFICIAL_PORTAL,
         library_url: str = HUNNU_LIBRARY_HOME,
+        oxford_route_url: str | None = None,
     ) -> None:
         backend = getattr(browser, "backend", browser)
         self.browser = ensure_browser_command_port(backend)
@@ -331,6 +339,11 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
             raise ValueError("HUNNU portal must use an official hunnu.edu.cn domain")
         if not _is_hunnu_domain(_hostname(self.library_url)):
             raise ValueError("HUNNU library must use an official hunnu.edu.cn domain")
+        self.oxford_route_url = str(
+            os.environ.get(HUNNU_OXFORD_ROUTE_URL_ENV, "")
+            if oxford_route_url is None
+            else oxford_route_url
+        ).strip()
 
     @classmethod
     def canonical_source(cls, requested_source: str) -> str:
@@ -351,6 +364,15 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         host = (parsed.hostname or "").casefold()
         return parsed.scheme in {"http", "https"} and (
             _is_hunnu_domain(host) or host in cls._TRUSTED_LIBRARY_SERVICE_DOMAINS
+        )
+
+    @classmethod
+    def is_hunnu_library_outer_proxy_url(cls, url: str) -> bool:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme in {"http", "https"}
+            and _is_hunnu_domain(parsed.hostname or "")
+            and parsed.path.casefold().rstrip("/") == cls._LIBRARY_OUTER_PROXY_PATH
         )
 
     @classmethod
@@ -401,6 +423,66 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
             parsed = urlsplit(url)
             return f"{parsed.scheme}://{parsed.hostname}/vpn/"
         return sanitize_url(url)
+
+    @classmethod
+    def configured_oxford_route_candidate(
+        cls,
+        value: str,
+    ) -> tuple[InstitutionalRouteCandidate | None, str | None]:
+        """Validate an operator-supplied Oxford entry without creating a URL bypass."""
+
+        configured = str(value).strip()
+        if not configured:
+            return None, None
+        try:
+            parsed = urlsplit(configured)
+            _ = parsed.port
+            has_userinfo = parsed.username is not None or parsed.password is not None
+            parse_ok = True
+        except ValueError:
+            has_userinfo = False
+            parse_ok = False
+        allowed = (
+            parse_ok
+            and not has_userinfo
+            and (
+                cls.is_trusted_hunnu_route_url(configured)
+                or cls.is_official_source_url("OxfordAcademic", configured)
+            )
+        )
+        if not allowed:
+            return (
+                None,
+                f"{HUNNU_OXFORD_ROUTE_URL_ENV} was rejected before navigation: the URL must "
+                "use HTTP(S), contain no userinfo, and remain on hunnu.edu.cn, an exact "
+                "trusted HUNNU library-service domain, or academic.oup.com",
+            )
+        official = cls.is_official_source_url("OxfordAcademic", configured)
+        return (
+            InstitutionalRouteCandidate(
+                display_name="Operator-configured Oxford Academic entry",
+                navigation_url=configured,
+                stable_url=sanitize_url(configured),
+                domain=_hostname(configured),
+                match_basis=(
+                    "operator-configured+official-domain"
+                    if official
+                    else "operator-configured+HUNNU-trusted-service"
+                ),
+                confidence=140,
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _oxford_discovery_guidance(stage: str) -> str:
+        return (
+            f"{stage}. The next required evidence is one rendered Oxford entry or its verified "
+            f"detail URL. A librarian or user may set {HUNNU_OXFORD_ROUTE_URL_ENV} to that "
+            "Oxford entry URL; it must remain on hunnu.edu.cn, an exact trusted HUNNU "
+            "library-service domain, or academic.oup.com and will still pass the existing "
+            "target/publisher identity locks"
+        )
 
     @classmethod
     def _parse(cls, html: str) -> _RouteHTMLParser:
@@ -470,12 +552,23 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
 
     @classmethod
     def discover_resource_entries(cls, html: str, *, base_url: str) -> list[InstitutionalRouteCandidate]:
-        return cls._discover_hunnu_entries(
+        candidates = cls._discover_hunnu_entries(
             html,
             base_url=base_url,
             markers=cls._RESOURCE_MARKERS,
             basis="HUNNU visible resource label",
         )
+        prioritized = [
+            replace(
+                candidate,
+                match_basis="HUNNU 2026 official database-navigation proxy",
+                confidence=candidate.confidence + 30,
+            )
+            if cls.is_hunnu_library_outer_proxy_url(candidate.navigation_url)
+            else candidate
+            for candidate in candidates
+        ]
+        return cls._deduplicate_candidates(prioritized)
 
     @classmethod
     def _discover_hunnu_entries(
@@ -691,6 +784,19 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
             raise ValueError("An explicit InstitutionalResolutionTrigger is required")
 
         steps: list[InstitutionalRouteStep] = []
+        configured_entry: InstitutionalRouteCandidate | None = None
+        if canonical == "OxfordAcademic" and self.oxford_route_url:
+            configured_entry, configuration_error = self.configured_oxford_route_candidate(
+                self.oxford_route_url
+            )
+            if configuration_error is not None:
+                return self._failure(
+                    canonical,
+                    trigger,
+                    steps,
+                    match=False,
+                    reason=configuration_error,
+                )
         portal_html, portal_url, portal_title = await self._snapshot_after_goto(self.portal_url)
         if not self.is_official_hunnu_url(portal_url):
             return self._failure(
@@ -736,10 +842,14 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
             result="official library reached",
         )
 
-        database_candidates = self.discover_database_entries(
-            library_html,
-            base_url=library_url,
-            requested_source=canonical,
+        database_candidates = (
+            [configured_entry]
+            if configured_entry is not None
+            else self.discover_database_entries(
+                library_html,
+                base_url=library_url,
+                requested_source=canonical,
+            )
         )
         if not database_candidates:
             resource_entries = self.discover_resource_entries(library_html, base_url=library_url)
@@ -753,12 +863,17 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
                     reason="Multiple equally ranked HUNNU resource-navigation entries were found",
                 )
             if resource_entry is None:
+                reason = "No visible HUNNU electronic-resource entry was found"
+                if canonical == "OxfordAcademic":
+                    reason = self._oxford_discovery_guidance(
+                        "No visible HUNNU Database Navigation entry was found on the official library page"
+                    )
                 return self._failure(
                     canonical,
                     trigger,
                     steps,
                     match=False,
-                    reason="No visible HUNNU electronic-resource entry was found",
+                    reason=reason,
                 )
             resource_html, resource_url, resource_title = await self._snapshot_after_goto(
                 resource_entry.navigation_url
@@ -786,16 +901,25 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
 
         database_entry, database_match = self.choose_candidate(database_candidates)
         if database_entry is None:
+            if canonical == "OxfordAcademic" and database_match is False:
+                stage_domain = steps[-1].official_domain if steps else UNKNOWN
+                reason = self._oxford_discovery_guidance(
+                    "Reached the HUNNU Database Navigation service at "
+                    f"{stage_domain}, but its JavaScript-rendered resource list exposed no "
+                    "verifiable OxfordAcademic entry in the available HTML"
+                )
+            else:
+                reason = (
+                    "InstitutionalTargetDatabaseMatch=uncertain"
+                    if database_match == "uncertain"
+                    else f"No verified HUNNU entry for {canonical} was found"
+                )
             return self._failure(
                 canonical,
                 trigger,
                 steps,
                 match=database_match,
-                reason=(
-                    "InstitutionalTargetDatabaseMatch=uncertain"
-                    if database_match == "uncertain"
-                    else f"No verified HUNNU entry for {canonical} was found"
-                ),
+                reason=reason,
             )
 
         destination = database_entry.navigation_url
@@ -893,6 +1017,7 @@ __all__ = [
     "HUNNU_INSTITUTION_NAME",
     "HUNNU_LIBRARY_HOME",
     "HUNNU_OFFICIAL_PORTAL",
+    "HUNNU_OXFORD_ROUTE_URL_ENV",
     "HUNNUInstitutionalAccessResolver",
     "InstitutionalAccessResolver",
     "InstitutionalResolutionTrigger",

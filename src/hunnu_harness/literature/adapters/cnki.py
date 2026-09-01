@@ -45,10 +45,14 @@ from ..normalization import normalize_doi, normalize_title, stable_paper_id
 from ..security import sanitize_url
 
 
-_DETAIL_PATH_MARKERS = ("/article/abstract", "/detail/detail.aspx", "/kcms/detail/")
+_CNKI_2026_DETAIL_PATH = "/kcms2/article/abstract"
+_LEGACY_DETAIL_PATH_MARKERS = ("/article/abstract", "/detail/detail.aspx", "/kcms/detail/")
+_DETAIL_PATH_MARKERS = (_CNKI_2026_DETAIL_PATH, *_LEGACY_DETAIL_PATH_MARKERS)
 _REJECT_DOWNLOAD_LABELS = ("批量下载", "多篇下载", "相关推荐", "参考文献下载", "整本下载")
 _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "download pdf", "download caj")
 _CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
+_CNKI_2026_RESULT_CLASSES = frozenset({"fz14", "inline"})
+_CNKI_2026_DOWNLOAD_CONTROL_IDS = frozenset({"pdfdown", "cajdown"})
 _SEARCH_SETTLE_DELAY_SECONDS = 10.0
 _SEARCH_SETTLE_MAX_OBSERVATIONS = 3
 _CNKI_CLICK_RETRY_DELAY_SECONDS = 1.0
@@ -170,6 +174,29 @@ def _is_cnki_host(hostname: str | None) -> bool:
     return host == "cnki.net" or host.endswith(".cnki.net")
 
 
+def _is_cnki_detail_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    path = parsed.path.casefold()
+    return _is_cnki_host(parsed.hostname) and any(marker in path for marker in _DETAIL_PATH_MARKERS)
+
+
+def _cnki_search_result_layout_priority(anchor: _Anchor, absolute_url: str) -> int | None:
+    """Prefer the 2026 SPA result-row anchor, then retain legacy fallbacks."""
+
+    if not _is_cnki_detail_url(absolute_url):
+        return None
+    path = urlsplit(absolute_url).path.casefold()
+    classes = frozenset(anchor.attributes.get("class", "").casefold().split())
+    if path.startswith(_CNKI_2026_DETAIL_PATH) and _CNKI_2026_RESULT_CLASSES.issubset(classes):
+        return 0
+    if path.startswith(_CNKI_2026_DETAIL_PATH):
+        return 1
+    return 2
+
+
 def _is_cnki_resource_order_url(value: str) -> bool:
     """Recognize CNKI's current-article order action without treating it as a file URL."""
 
@@ -181,6 +208,18 @@ def _is_cnki_resource_order_url(value: str) -> bool:
         and parsed.path.casefold().rstrip("/") == _CNKI_RESOURCE_ORDER_PATH
         and bool(parse_qs(parsed.query).get("id"))
     )
+
+
+def _cnki_download_layout_priority(anchor: _Anchor, absolute_url: str) -> int:
+    """Prefer current ``pdfDown``/``cajDown`` controls within one format."""
+
+    identities = {
+        anchor.attributes.get("id", "").casefold(),
+        anchor.attributes.get("name", "").casefold(),
+    }
+    if identities & _CNKI_2026_DOWNLOAD_CONTROL_IDS and _is_cnki_resource_order_url(absolute_url):
+        return 0
+    return 1
 
 
 def _cnki_full_text_format(label: str, href: str) -> FullTextFormat:
@@ -424,6 +463,7 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         self.visible_text_parts: list[str] = []
         self.overlay_text_parts: list[str] = []
         self.document_title_parts: list[str] = []
+        self.current_article_markers: set[str] = set()
         self._document_title_depth = 0
         self._capture_stack: list[tuple[str, str, list[str]]] = []
         # Subtree state is tracked by position in the open-element stack rather
@@ -470,14 +510,20 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         key = ""
         if lowered == "h1":
             key = "title"
+            self.current_article_markers.add("title")
         elif lowered == "h3" and attributes.get("id", "").casefold() == "authorpart":
             key = "authors"
+            self.current_article_markers.add("authors")
         elif attributes.get("id", "").casefold() == "chdivsummary":
             key = "abstract"
+            self.current_article_markers.add("abstract")
         elif "keywords" in classes:
             key = "keywords"
         elif "top-tip" in classes:
             key = "source"
+            self.current_article_markers.add("source")
+        if attributes.get("id", "").casefold() in _CNKI_2026_DOWNLOAD_CONTROL_IDS:
+            self.current_article_markers.add("download")
         if key:
             self._capture_stack.append((lowered, key, []))
 
@@ -555,6 +601,12 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         """
 
         return " ".join(part for part in self.document_title_parts if part)
+
+    @property
+    def uses_2026_article_layout(self) -> bool:
+        return len(
+            self.current_article_markers & {"authors", "abstract", "source", "download"}
+        ) >= 2
 
 
 class CNKIAdapter(LiteratureSourceAdapter):
@@ -779,11 +831,14 @@ class CNKIAdapter(LiteratureSourceAdapter):
         parser = cls._parser(html)
         records: list[LiteratureRecord] = []
         seen: set[str] = set()
-        for anchor in parser.anchors:
+        ranked_anchors: list[tuple[int, int, _Anchor, str]] = []
+        for index, anchor in enumerate(parser.anchors):
             absolute = urljoin(source_url, anchor.href)
-            parsed = urlsplit(absolute)
-            if not _is_cnki_host(parsed.hostname) or not any(marker in parsed.path.casefold() for marker in _DETAIL_PATH_MARKERS):
+            layout_priority = _cnki_search_result_layout_priority(anchor, absolute)
+            if layout_priority is None:
                 continue
+            ranked_anchors.append((layout_priority, index, anchor, absolute))
+        for _layout_priority, _index, anchor, absolute in sorted(ranked_anchors):
             title = _normalize_cnki_observed_title_spacing(anchor.text)
             if not title or any(label in title for label in _REJECT_DOWNLOAD_LABELS):
                 continue
@@ -898,13 +953,29 @@ class CNKIAdapter(LiteratureSourceAdapter):
         cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
         parser = cls._parser(html)
         body = re.sub(r"\s+", " ", parser.body_text).strip()
-        title = _meta_first(parser, "citation_title", "dc.title", "og:title")
+        title_candidates = [
+            value
+            for value in parser.blocks.get("title", [])
+            if value not in {"自动登录", "找回密码"}
+        ]
+        semantic_title = title_candidates[-1] if title_candidates else UNKNOWN
+        meta_title = _meta_first(parser, "citation_title", "dc.title", "og:title")
+        title = (
+            semantic_title
+            if parser.uses_2026_article_layout and semantic_title != UNKNOWN
+            else meta_title
+        )
         if title == UNKNOWN:
-            title_candidates = [value for value in parser.blocks.get("title", []) if value not in {"自动登录", "找回密码"}]
-            title = title_candidates[-1] if title_candidates else UNKNOWN
-        authors = _meta_all(parser, "citation_author", "dc.creator")
-        if not authors and parser.author_links:
-            authors = tuple(dict.fromkeys(parser.author_links))
+            title = semantic_title
+        meta_authors = _meta_all(parser, "citation_author", "dc.creator")
+        semantic_authors = tuple(dict.fromkeys(parser.author_links))
+        authors = (
+            semantic_authors
+            if parser.uses_2026_article_layout and semantic_authors
+            else meta_authors
+        )
+        if not authors:
+            authors = semantic_authors
         if not authors:
             raw_authors = parser.first_block("authors")
             numbered = tuple(item for item in re.split(r"\d+", raw_authors) if item)
@@ -924,9 +995,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
         if source_match:
             journal = source_match.group(1).strip() or journal
-            if date == UNKNOWN:
+            if parser.uses_2026_article_layout or date == UNKNOWN:
                 date = source_match.group(2)
-            if year == UNKNOWN:
+            if parser.uses_2026_article_layout or year == UNKNOWN:
                 year = source_match.group(2)
         doi = normalize_doi(_meta_first(parser, "citation_doi", "dc.identifier", "prism.doi"))
         if doi == UNKNOWN:
@@ -941,19 +1012,33 @@ class CNKIAdapter(LiteratureSourceAdapter):
         last_page = _meta_first(parser, "citation_lastpage", "prism.endingpage")
         pages = f"{first_page}-{last_page}" if first_page != UNKNOWN and last_page not in (UNKNOWN, first_page) else first_page
         if source_match:
-            if issue == UNKNOWN:
+            if parser.uses_2026_article_layout or issue == UNKNOWN:
                 issue = source_match.group(3).strip()
-            if pages == UNKNOWN:
+            if parser.uses_2026_article_layout or pages == UNKNOWN:
                 pages = re.sub(r"\s+", "", source_match.group(4)).replace("–", "-").replace("—", "-")
         if pages == UNKNOWN:
             pages = _text_field(body, "页码", "页")
-        abstract = _meta_first(parser, "citation_abstract", "description", "dc.description")
+        meta_abstract = _meta_first(parser, "citation_abstract", "description", "dc.description")
+        semantic_abstract = parser.first_block("abstract")
+        abstract = (
+            semantic_abstract
+            if parser.uses_2026_article_layout and semantic_abstract != UNKNOWN
+            else meta_abstract
+        )
         if abstract == UNKNOWN:
-            abstract = parser.first_block("abstract")
+            abstract = semantic_abstract
         if abstract == UNKNOWN:
             abstract = _text_field(body, "摘要")
         keyword_values = _meta_all(parser, "citation_keywords", "keywords", "dc.subject")
-        keywords = _split_keywords(";".join(keyword_values)) if keyword_values else _split_keywords(parser.first_block("keywords"))
+        meta_keywords = _split_keywords(";".join(keyword_values)) if keyword_values else ()
+        semantic_keywords = _split_keywords(parser.first_block("keywords"))
+        keywords = (
+            semantic_keywords
+            if parser.uses_2026_article_layout and semantic_keywords
+            else meta_keywords
+        )
+        if not keywords:
+            keywords = semantic_keywords
         if not keywords:
             keywords = _split_keywords(_text_field(body, "关键词"))
         issn = _meta_first(parser, "citation_issn", "prism.issn")
@@ -1159,8 +1244,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
     ) -> AccessDecision:
         cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
         parser = cls._parser(html)
-        candidates: list[tuple[int, _Anchor, str, FullTextFormat]] = []
-        for anchor in parser.anchors:
+        candidates: list[tuple[int, int, int, _Anchor, str, FullTextFormat]] = []
+        for index, anchor in enumerate(parser.anchors):
             label = re.sub(
                 r"\s+",
                 "",
@@ -1183,6 +1268,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
             candidates.append(
                 (
                     _cnki_full_text_preference(candidate_format),
+                    _cnki_download_layout_priority(anchor, absolute),
+                    index,
                     anchor,
                     absolute,
                     candidate_format,
@@ -1197,9 +1284,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 reason="No enabled, official single-paper CNKI full-text control was present",
                 full_text_format=FullTextFormat.UNKNOWN,
             )
-        _preference, candidate, candidate_url, candidate_format = sorted(
+        _preference, _layout_priority, _index, candidate, candidate_url, candidate_format = sorted(
             candidates,
-            key=lambda item: item[0],
+            key=lambda item: item[:3],
         )[0]
         body = parser.visible_body_text.casefold()
         explicit_access_block = any(marker.casefold() in body for marker in _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS)
@@ -1484,8 +1571,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
 
     async def open_result(self, record: LiteratureRecord) -> None:
         target_url = record.navigation_url if record.navigation_url != UNKNOWN else record.source_page
-        parsed = urlsplit(target_url)
-        if not _is_cnki_host(parsed.hostname) or not any(marker in parsed.path.casefold() for marker in _DETAIL_PATH_MARKERS):
+        if not _is_cnki_detail_url(target_url):
             raise SourceLayoutChanged("Result URL is not a stable official CNKI detail page")
         self._expected_record = record
         self._detail_record = None
@@ -1548,11 +1634,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
                     # the detail-page parser and target identity lock remain
                     # authoritative before any download.
                     clicked_url = getattr(click_result, "url", "")
-                    if not any(
-                        marker in urlsplit(str(clicked_url)).path.casefold()
-                        for marker in _DETAIL_PATH_MARKERS
-                    ):
-                        await self.browser.execute(NavigateCommand(fresh_record.navigation_url))
+                    if not _is_cnki_detail_url(str(clicked_url)):
+                        navigation_result = await self.browser.execute(
+                            NavigateCommand(fresh_record.navigation_url)
+                        )
+                        final_url = str(getattr(navigation_result, "url", ""))
+                        if not _is_cnki_detail_url(final_url):
+                            raise SourceLayoutChanged(
+                                "CNKI result navigation remained outside an official detail page "
+                                "after the fresh-link fallback"
+                            )
                     return
                 except BrowserCommandError as exc:
                     if "browser_find returned no executable snapshot ref" not in str(exc):
