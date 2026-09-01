@@ -22,6 +22,7 @@ from ..exit_codes import (
     EXIT_RUN_FAILED,
 )
 from .fetch_ledger import STATUS_ATTEMPT_LIMIT_REACHED, STATUS_BUDGET_EXHAUSTED
+from .adapters.base import LiteratureSourceError
 from .adapters.cnki import CNKIAdapter
 from .adapters.oxfordacademic import OxfordAcademicAdapter
 from .adapters.sciencedirect import ScienceDirectAdapter
@@ -281,6 +282,19 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.put("Reason", str(exc))
         report.flush()
         return EXIT_CAPABILITY_MISSING
+    except LiteratureSourceError as exc:
+        # Setup-phase source errors (an unresolved institutional route, a
+        # source-side stop before the workflow loop) must honor the same
+        # contract as everything else: one JSON document, a graded exit --
+        # never a naked traceback.  Found live: Oxford's unresolved route
+        # escaped as a raw SourceLayoutChanged.
+        status = getattr(exc, "status", RunStatus.SOURCE_UNAVAILABLE)
+        report.put("Status", status.value)
+        report.put("Reason", str(exc))
+        report.flush()
+        if status in {RunStatus.ACTION_REQUIRED_USER_LOGIN, RunStatus.ACTION_REQUIRED_USER_DOWNLOAD}:
+            return EXIT_HUMAN_ACTION_REQUIRED
+        return EXIT_ENV_NOT_READY
     finally:
         # Read the browser's own account of what it did before tearing it down.
         # An Agent that has to infer this from missing output gets it wrong:

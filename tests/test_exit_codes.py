@@ -128,6 +128,50 @@ class LiveCliBudgetExitTests(unittest.TestCase):
         self.assertEqual(payload["Downloads"], 0)
 
 
+class SetupPhaseSourceErrorTests(unittest.TestCase):
+    """This failing means a source error escapes as a traceback again.
+
+    Found live during acceptance: Oxford's unresolved institutional route
+    raised SourceLayoutChanged during setup, before the workflow loop, and
+    the CLI printed a naked traceback with exit 1 -- no JSON, no graded
+    exit.  Every source-side stop must keep the one-document contract.
+    """
+
+    def test_a_setup_source_error_reports_json_and_exits_five(self) -> None:
+        from hunnu_harness.literature.adapters.base import SourceLayoutChanged
+
+        class _QuietBrowser:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def start(self) -> None:
+                return None
+
+            async def lifecycle(self) -> dict:
+                return {}
+
+            async def close(self) -> None:
+                return None
+
+        class _LayoutChangedWorkflow:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            async def run(self, _request: object) -> None:
+                raise SourceLayoutChanged("institutional route is not resolved")
+
+        out = io.StringIO()
+        with patch.object(literature_cli, "PlaywrightBrowser", _QuietBrowser), patch.object(
+            literature_cli, "LiteratureAcquisitionWorkflow", _LayoutChangedWorkflow
+        ):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = literature_cli.main(["live-cnki", "--title", "x", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, EXIT_ENV_NOT_READY)
+        self.assertEqual(payload["Status"], "SOURCE_LAYOUT_CHANGED")
+        self.assertIn("institutional route", payload["Reason"])
+
+
 class ExceptionLadderTests(unittest.TestCase):
     def test_missing_playwright_is_a_missing_capability(self) -> None:
         class _Unavailable:
