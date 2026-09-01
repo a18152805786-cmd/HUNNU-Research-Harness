@@ -595,9 +595,15 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         return urlunsplit((gateway.scheme, gateway.netloc, path, urlencode(parameters), ""))
 
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
+        gateway_navigation_available = (
+            self._gateway_trusted()
+            and self._institutional_route is not None
+            and _host(self._institutional_route.publisher_navigation_url)
+            == self.hunnu_gateway_host
+        )
         search_url = (
             self._gateway_navigation("search-results", query={"q": query})
-            if self._gateway_trusted()
+            if gateway_navigation_available
             else f"{self.search_origin}/search-results?q={quote_plus(query)}"
         )
         if self.browser is None:
