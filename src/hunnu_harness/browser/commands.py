@@ -314,6 +314,7 @@ class DownloadCommand(BrowserCommand):
     suggested_filename: str
     timeout_ms: int = 45_000
     capture: DownloadCaptureSpec | None = None
+    identity_labels: tuple[str, ...] = ()
     kind = "Download"
 
     def __post_init__(self) -> None:

@@ -10,20 +10,22 @@ Rather than wait for an event that does not come, this tells the browser where
 to put the file and then watches the browser's own account of it.  The
 browser-level protocol is what makes that safe: ``Browser.downloadWillBegin``
 names both the URL the bytes actually come from and the browser's suggested
-filename.  Identity must match either the URL's recognised paper identifier or
-the exact stem of a suggested ``.pdf``/``.caj`` filename; a file merely
-appearing in a directory remains insufficient.
+filename.  Identity must match the URL's recognised paper identifier, the exact
+stem of a suggested ``.pdf``/``.caj`` filename, or a sufficiently long
+bibliographic label explicitly declared by the adapter; a file merely appearing
+in a directory remains insufficient.
 
 A publisher may redirect its PDF to a delivery URL that no longer carries the
 article identifier.  The delivery host therefore remains an explicit
 allowlist, and host, completion-state, and landed-file checks still run after
-the download has been claimed by either identity source.
+the download has been claimed by one of these identity sources.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 import weakref
 from dataclasses import dataclass, field
 from enum import Enum
@@ -155,17 +157,57 @@ def _suggested_filename_identity(suggested_filename: str) -> str:
     return path.stem
 
 
-def _pending_names_locked_identity(pending: _Pending, locked_pii: str) -> bool:
-    """Whether either bounded event identity source exactly names the target."""
+def _normalize_declared_identity(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"\s+", "", normalized)
+
+
+def _matching_declared_label(
+    pending: _Pending, locked_labels: tuple[str, ...]
+) -> str:
+    if not locked_labels:
+        return ""
+    filename_identity = _suggested_filename_identity(pending.suggested_filename)
+    if not filename_identity:
+        return ""
+    normalized_stem = _normalize_declared_identity(filename_identity)
+    for label in locked_labels:
+        normalized_label = _normalize_declared_identity(label)
+        if (
+            normalized_label
+            and len(normalized_label) >= 6
+            and normalized_label in normalized_stem
+        ):
+            return label
+    return ""
+
+
+def _pending_claimed_identity(
+    pending: _Pending,
+    locked_pii: str,
+    locked_labels: tuple[str, ...] = (),
+) -> str:
+    """Return the first bounded event identity source naming the target."""
 
     locked = locked_pii.casefold()
-    if not locked:
-        return False
-    return (
-        pii_from_url(pending.url).casefold() == locked
-        or _suggested_filename_identity(pending.suggested_filename).casefold()
-        == locked
-    )
+    if locked:
+        url_pii = pii_from_url(pending.url)
+        if url_pii.casefold() == locked:
+            return url_pii
+        filename_identity = _suggested_filename_identity(
+            pending.suggested_filename
+        )
+        if filename_identity.casefold() == locked:
+            return filename_identity
+    return _matching_declared_label(pending, locked_labels)
+
+
+def _pending_names_locked_identity(
+    pending: _Pending,
+    locked_pii: str,
+    locked_labels: tuple[str, ...] = (),
+) -> bool:
+    return bool(_pending_claimed_identity(pending, locked_pii, locked_labels))
 
 
 class _DownloadLease:
@@ -228,6 +270,7 @@ class BrowserDirectedDownload:
     session: Any
     download_dir: Path
     locked_pii: str
+    locked_labels: tuple[str, ...] = ()
     allowed_hosts: frozenset[str] = DIRECTED_DOWNLOAD_DEFAULT_HOSTS
     will_begin_timeout: float = DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS
     completion_timeout: float = DEFAULT_COMPLETION_TIMEOUT_SECONDS
@@ -308,7 +351,9 @@ class BrowserDirectedDownload:
         self._pending[guid] = pending
         if self._target is None or self._target.done():
             return
-        if _pending_names_locked_identity(pending, self.locked_pii):
+        if _pending_names_locked_identity(
+            pending, self.locked_pii, self.locked_labels
+        ):
             self._target.set_result(pending)
 
     def _on_progress(self, event: dict) -> None:
@@ -337,7 +382,8 @@ class BrowserDirectedDownload:
             )
             raise DirectedDownloadFailure(
                 f"{DirectedDownloadOutcome.DOWNLOAD_EVENT_TIMEOUT.value}: the authorized "
-                f"control started no download naming PII {self.locked_pii}{detail}"
+                f"control started no download naming PII {self.locked_pii}; "
+                f"declared labels: {len(self.locked_labels)}{detail}"
             ) from exc
 
         host = host_of(pending.url)
@@ -348,17 +394,16 @@ class BrowserDirectedDownload:
             )
         url_pii = pii_from_url(pending.url)
         suggested_name = Path(pending.suggested_filename).name
-        if not _pending_names_locked_identity(pending, self.locked_pii):
+        source_pii = _pending_claimed_identity(
+            pending, self.locked_pii, self.locked_labels
+        )
+        if not source_pii:
             raise DirectedDownloadFailure(
                 f"{DirectedDownloadOutcome.DOWNLOAD_SOURCE_IDENTITY_MISMATCH.value}: "
                 f"download URL names {url_pii or 'no PII'} and suggested filename "
-                f"is {suggested_name!r}; locked target is {self.locked_pii}"
+                f"is {suggested_name!r}; declared labels: {len(self.locked_labels)}; "
+                f"locked target is {self.locked_pii}"
             )
-        source_pii = (
-            url_pii
-            if url_pii.casefold() == self.locked_pii.casefold()
-            else _suggested_filename_identity(pending.suggested_filename)
-        )
 
         state = await self._await_completion(pending)
         if state != "completed":

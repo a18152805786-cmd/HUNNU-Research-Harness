@@ -727,6 +727,7 @@ class LocalPlaywrightExecutor:
             session=session,
             download_dir=self.downloads_dir,
             locked_pii=locked_pii,
+            locked_labels=command.identity_labels,
             allowed_hosts=allowed_hosts,
             lease=lease_for(backend),
             # Read from the module rather than taken as dataclass defaults, so

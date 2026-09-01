@@ -1847,12 +1847,19 @@ class CNKIAdapter(LiteratureSourceAdapter):
                         exact_text=True,
                     ),
                     suggested_filename=f"{record.paper_id}{suffix}",
+                    identity_labels=(record.title,)
+                    if record.title not in ("", UNKNOWN) and record.title.strip()
+                    else (),
                 )
             )
         except Exception as exc:
             ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
+            exception_detail = str(exc)
+            if len(exception_detail) > 500:
+                exception_detail = f"{exception_detail[:497]}..."
             raise SourceUnavailable(
-                f"Authorized CNKI control did not produce a browser download: {type(exc).__name__}"
+                f"Authorized CNKI control did not produce a browser download: "
+                f"{type(exc).__name__}: {exception_detail}"
             ) from exc
         ticket.record_outcome(ok=True, detail="browser download completed")
         return artifact.local_path
