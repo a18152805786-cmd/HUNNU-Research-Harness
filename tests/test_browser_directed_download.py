@@ -6,10 +6,11 @@ staged while the run reported that no download had happened, because the
 browser's own account of the download removes that dependency.
 
 What these pin is that removing it costs nothing in rigour.  The paper's
-identifier has to appear in the URL the bytes actually came from; the delivery
-host has to be one this Harness recognises; only the GUID of *this* download
-counts, and only after the browser says it completed.  A file that merely turns
-up in the directory proves nothing and is never enough.
+identifier has to match either the recognised URL identity or the exact stem of
+a suggested ``.pdf``/``.caj`` filename; the delivery host still has to be one
+this Harness recognises; only the GUID of *this* download counts, and only after
+the browser says it completed.  A file that merely turns up in the directory
+proves nothing and is never enough.
 """
 
 from __future__ import annotations
@@ -40,6 +41,13 @@ REAL_URL = (
 OUP_PDF_URL = (
     "https://academic.oup.com/rfs/article-pdf/36/9/3603/51141974/hhad021.pdf"
 )
+OUP_PII = "hhad021"
+OUP_CDN_HOST = "oup.silverchair-cdn.com"
+OUP_CDN_URL = (
+    f"https://{OUP_CDN_HOST}/oup/backfile/Content_public/Journal/rfs/"
+    "36/9/10.1093_rfs_hhad021/1/download.pdf?Expires=1788211200"
+)
+OUP_FILENAME = f"{OUP_PII}.pdf"
 CNKI_ORDER_ID = "CNKI_ORDER_20260901_ABC123"
 CNKI_ORDER_URL = (
     f"https://bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}&filename=paper.pdf"
@@ -94,13 +102,20 @@ def progress(guid: str = "g1", state: str = "completed") -> dict:
 
 
 class _Fixture:
-    def __init__(self, root: Path, *, locked: str = PII) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        locked: str = PII,
+        allowed_hosts: frozenset[str] = DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
+    ) -> None:
         self.session = _Session()
         self.dir = root / "staging"
         self.directed = BrowserDirectedDownload(
             session=self.session,
             download_dir=self.dir,
             locked_pii=locked,
+            allowed_hosts=allowed_hosts,
             will_begin_timeout=0.6,
             completion_timeout=1.2,
             settle_seconds=0.0,
@@ -190,6 +205,30 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(result.path.name, FILENAME)
             self.assertTrue(result.path.is_file())
 
+    def test_a_cdn_url_can_be_claimed_by_the_locked_safe_suggested_filename(self) -> None:
+        self.assertEqual(pii_from_url(OUP_CDN_URL), "")
+        with temp_root("bdd-cdn-filename-") as tmp:
+            fixture = _Fixture(
+                Path(tmp),
+                locked=OUP_PII,
+                allowed_hosts=frozenset({OUP_CDN_HOST}),
+            )
+
+            async def script(f):
+                f.session.emit(
+                    "Browser.downloadWillBegin",
+                    begin(url=OUP_CDN_URL, filename=OUP_FILENAME),
+                )
+                f.land(OUP_FILENAME)
+                f.session.emit("Browser.downloadProgress", progress())
+
+            result = run(fixture, script)
+
+            self.assertEqual(result.source_pii, OUP_PII)
+            self.assertEqual(result.as_dict()["DownloadSourcePII"], OUP_PII)
+            self.assertEqual(result.source_url_host, OUP_CDN_HOST)
+            self.assertEqual(result.path.name, OUP_FILENAME)
+
     def test_the_browser_is_pointed_at_this_run(self) -> None:
         with temp_root("bdd-dir-") as tmp:
             fixture = _Fixture(Path(tmp))
@@ -219,9 +258,18 @@ class AcceptanceTests(unittest.TestCase):
 
 
 class RejectionTests(unittest.TestCase):
-    def _expect_failure(self, prefix: str, script, *, locked: str = PII) -> str:
+    def _expect_failure(
+        self,
+        prefix: str,
+        script,
+        *,
+        locked: str = PII,
+        allowed_hosts: frozenset[str] = DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
+    ) -> str:
         with temp_root("bdd-reject-") as tmp:
-            fixture = _Fixture(Path(tmp), locked=locked)
+            fixture = _Fixture(
+                Path(tmp), locked=locked, allowed_hosts=allowed_hosts
+            )
             with self.assertRaises(DirectedDownloadFailure) as caught:
                 run(fixture, script)
             message = str(caught.exception)
@@ -242,8 +290,8 @@ class RejectionTests(unittest.TestCase):
 
         self._expect_failure("DOWNLOAD_EVENT_TIMEOUT", script)
 
-    def test_a_correct_filename_cannot_rescue_a_foreign_url(self) -> None:
-        """The filename is corroboration, never the authority."""
+    def test_a_filename_that_only_contains_the_locked_pii_is_not_an_exact_match(self) -> None:
+        """The second source is an exact safe-extension stem, not a substring."""
 
         foreign = "https://pdf.sciencedirectassets.com/x/main.pdf?pii=S9999999999999999"
 
@@ -255,6 +303,37 @@ class RejectionTests(unittest.TestCase):
             f.session.emit("Browser.downloadProgress", progress())
 
         self._expect_failure("DOWNLOAD_EVENT_TIMEOUT", script)
+
+    def test_a_cdn_url_with_another_suggested_filename_is_not_claimed(self) -> None:
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(url=OUP_CDN_URL, filename="other.pdf"),
+            )
+            f.land("other.pdf")
+            f.session.emit("Browser.downloadProgress", progress())
+
+        self._expect_failure(
+            "DOWNLOAD_EVENT_TIMEOUT",
+            script,
+            locked=OUP_PII,
+            allowed_hosts=frozenset({OUP_CDN_HOST}),
+        )
+
+    def test_a_locked_suggested_filename_does_not_bypass_the_host_allowlist(self) -> None:
+        untrusted = "https://evil.example/cdn/download?token=opaque"
+
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(url=untrusted, filename=OUP_FILENAME),
+            )
+            f.land(OUP_FILENAME)
+            f.session.emit("Browser.downloadProgress", progress())
+
+        self._expect_failure(
+            "DOWNLOAD_SOURCE_HOST_REJECTED", script, locked=OUP_PII
+        )
 
     def test_an_unrecognised_delivery_host_is_refused(self) -> None:
         evil = f"https://evil.example/main.pdf?pii={PII}"

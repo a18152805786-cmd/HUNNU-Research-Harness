@@ -71,6 +71,8 @@ _CNKI_GENERIC_LOGIN_LABELS = frozenset(
 )
 _SEARCH_SETTLE_DELAY_SECONDS = 10.0
 _SEARCH_SETTLE_MAX_OBSERVATIONS = 3
+_ACCESS_SETTLE_DELAY_SECONDS = 2.0
+_ACCESS_SETTLE_MAX_OBSERVATIONS = 4
 _CNKI_CLICK_RETRY_DELAY_SECONDS = 1.0
 _CNKI_CLICK_RETRIES = 1
 _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS = (
@@ -105,6 +107,19 @@ _CNKI_CJK_JOIN_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff]
 _CNKI_ENUMERATION_SPACE_RE = re.compile(r"\s*([、])\s*")
 _CNKI_MARKUP_PUNCT_SPACE_RE = re.compile(r'\s*([?!:：“”‘’「」『』《》〈〉【】〔〕（）])\s*')
 _CNKI_SUBTITLE_SEPARATOR_RE = re.compile(r"[:：](?=(?:基于|来自|关于|对))")
+
+
+def _access_decision_is_settling(decision: AccessDecision) -> bool:
+    """Return whether a bounded re-observation may clarify CNKI access."""
+
+    if decision.status == RunStatus.SUCCESS or decision.full_text_accessible:
+        return False
+    if decision.access_type == AccessType.UNKNOWN:
+        return True
+    return (
+        decision.download_url in ("", UNKNOWN)
+        and decision.download_locator in ("", UNKNOWN)
+    )
 
 
 def _decode_cnki_form_query_value(value: str) -> str:
@@ -1774,24 +1789,30 @@ class CNKIAdapter(LiteratureSourceAdapter):
         ).abstract
 
     async def check_fulltext_access(self) -> AccessDecision:
-        content_kind, content, current_url = await self._content()
-        article_parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
-        if self._expected_record is not None:
-            detail = article_parser(
+        for observation_number in range(_ACCESS_SETTLE_MAX_OBSERVATIONS):
+            content_kind, content, current_url = await self._content()
+            article_parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
+            if self._expected_record is not None:
+                detail = article_parser(
+                    content,
+                    source_url=current_url,
+                    search_query=self._expected_record.search_query,
+                    challenge_state=self._runtime_challenge_state(),
+                )
+                matches, reason = self.identity_matches(self._expected_record, detail)
+                if not matches:
+                    raise SourceLayoutChanged(f"CNKI target identity lock failed before access check: {reason}")
+            access_parser = self.check_fulltext_access_html if content_kind == "html" else self.check_fulltext_access_snapshot
+            decision = access_parser(
                 content,
                 source_url=current_url,
-                search_query=self._expected_record.search_query,
                 challenge_state=self._runtime_challenge_state(),
             )
-            matches, reason = self.identity_matches(self._expected_record, detail)
-            if not matches:
-                raise SourceLayoutChanged(f"CNKI target identity lock failed before access check: {reason}")
-        access_parser = self.check_fulltext_access_html if content_kind == "html" else self.check_fulltext_access_snapshot
-        return access_parser(
-            content,
-            source_url=current_url,
-            challenge_state=self._runtime_challenge_state(),
-        )
+            if not _access_decision_is_settling(decision):
+                return decision
+            if observation_number + 1 < _ACCESS_SETTLE_MAX_OBSERVATIONS:
+                await asyncio.sleep(_ACCESS_SETTLE_DELAY_SECONDS)
+        return decision
 
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
         if not access.full_text_accessible or not access.authorized_access:

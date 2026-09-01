@@ -9,14 +9,15 @@ that no download had happened at all.
 Rather than wait for an event that does not come, this tells the browser where
 to put the file and then watches the browser's own account of it.  The
 browser-level protocol is what makes that safe: ``Browser.downloadWillBegin``
-names the URL the bytes actually come from, so nothing here is accepted on the
-strength of a filename or a file merely appearing in a directory.
+names both the URL the bytes actually come from and the browser's suggested
+filename.  Identity must match either the URL's recognised paper identifier or
+the exact stem of a suggested ``.pdf``/``.caj`` filename; a file merely
+appearing in a directory remains insufficient.
 
-Identity is checked against the URL and nothing else.  A publisher serves its
-PDFs from a delivery host that is not the article host -- ScienceDirect uses
-``pdf.sciencedirectassets.com`` -- so the host check is an explicit allowlist
-rather than "same host as the article", and the paper's identifier must appear
-in the URL of the very download being accepted.
+A publisher may redirect its PDF to a delivery URL that no longer carries the
+article identifier.  The delivery host therefore remains an explicit
+allowlist, and host, completion-state, and landed-file checks still run after
+the download has been claimed by either identity source.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ _OUP_ARTICLE_PDF_PATH = re.compile(
 )
 _CNKI_ORDER_HOST = "bar.cnki.net"
 _CNKI_ORDER_PATH = "/bar/download/order"
+_DIRECTED_DOWNLOAD_IDENTITY_SUFFIXES = frozenset({".pdf", ".caj"})
 
 DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS = 45.0
 DEFAULT_COMPLETION_TIMEOUT_SECONDS = 120.0
@@ -141,6 +143,29 @@ class _Pending:
     url: str
     suggested_filename: str
     state: str = "begin"
+
+
+def _suggested_filename_identity(suggested_filename: str) -> str:
+    name = Path(suggested_filename).name
+    if not name:
+        return ""
+    path = Path(name)
+    if path.suffix.casefold() not in _DIRECTED_DOWNLOAD_IDENTITY_SUFFIXES:
+        return ""
+    return path.stem
+
+
+def _pending_names_locked_identity(pending: _Pending, locked_pii: str) -> bool:
+    """Whether either bounded event identity source exactly names the target."""
+
+    locked = locked_pii.casefold()
+    if not locked:
+        return False
+    return (
+        pii_from_url(pending.url).casefold() == locked
+        or _suggested_filename_identity(pending.suggested_filename).casefold()
+        == locked
+    )
 
 
 class _DownloadLease:
@@ -276,13 +301,14 @@ class BrowserDirectedDownload:
             url=str(event.get("url", "")),
             suggested_filename=str(event.get("suggestedFilename", "")),
         )
-        # Every download is recorded, and only the one naming this paper is
-        # adopted.  A second, unrelated download starting in the same browser
-        # must not be mistaken for the one being waited on.
+        # Every download is recorded, and only the one naming this paper in a
+        # bounded event identity source is adopted.  A second, unrelated
+        # download starting in the same browser must not be mistaken for the
+        # one being waited on.
         self._pending[guid] = pending
         if self._target is None or self._target.done():
             return
-        if pii_from_url(pending.url).casefold() == self.locked_pii.casefold():
+        if _pending_names_locked_identity(pending, self.locked_pii):
             self._target.set_result(pending)
 
     def _on_progress(self, event: dict) -> None:
@@ -320,12 +346,19 @@ class BrowserDirectedDownload:
                 f"{DirectedDownloadOutcome.DOWNLOAD_SOURCE_HOST_REJECTED.value}: "
                 f"{host or 'unknown host'} is not a recognised publisher PDF origin"
             )
-        source_pii = pii_from_url(pending.url)
-        if source_pii.casefold() != self.locked_pii.casefold():
+        url_pii = pii_from_url(pending.url)
+        suggested_name = Path(pending.suggested_filename).name
+        if not _pending_names_locked_identity(pending, self.locked_pii):
             raise DirectedDownloadFailure(
                 f"{DirectedDownloadOutcome.DOWNLOAD_SOURCE_IDENTITY_MISMATCH.value}: "
-                f"download names {source_pii or 'no PII'}, locked target is {self.locked_pii}"
+                f"download URL names {url_pii or 'no PII'} and suggested filename "
+                f"is {suggested_name!r}; locked target is {self.locked_pii}"
             )
+        source_pii = (
+            url_pii
+            if url_pii.casefold() == self.locked_pii.casefold()
+            else _suggested_filename_identity(pending.suggested_filename)
+        )
 
         state = await self._await_completion(pending)
         if state != "completed":

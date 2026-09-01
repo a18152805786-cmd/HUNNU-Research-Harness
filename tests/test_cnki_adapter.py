@@ -24,6 +24,7 @@ from hunnu_harness.browser.commands import (
 from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceUnavailable
 from hunnu_harness.literature.adapters.cnki import (
     CNKIAdapter,
+    _ACCESS_SETTLE_MAX_OBSERVATIONS,
     _canonicalize_cnki_title_identity,
     _decode_cnki_form_query_value,
 )
@@ -624,6 +625,107 @@ class CNKIAuthenticationClassificationTests(unittest.TestCase):
                 fixture("cnki_security_challenge.html"),
                 url="https://kns.cnki.net/security-check",
             )
+
+
+class CNKIAccessSettlingTests(unittest.IsolatedAsyncioTestCase):
+    class _HTMLBrowser:
+        navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+        def __init__(self, observations: list[str]) -> None:
+            self.observations = observations
+            self.observe_count = 0
+            self.commands = []
+            self.session = SessionHandle("html-access-settling-test")
+            self.page_handle = PageHandle("main", session=self.session)
+
+        async def execute(self, command):
+            self.commands.append(command)
+            if not isinstance(command, ObserveCommand):
+                raise AssertionError(type(command).__name__)
+            index = min(self.observe_count, len(self.observations) - 1)
+            self.observe_count += 1
+            return BrowserObservation(
+                session=self.session,
+                page=self.page_handle,
+                generation=self.observe_count,
+                url=ARTICLE_URL,
+                title="CNKI article",
+                html=self.observations[index],
+            )
+
+    @staticmethod
+    def _settling_html() -> str:
+        return """
+        <html><body>
+          <article><h1>企业数字化转型与资本市场表现——来自股票流动性的经验证据</h1></article>
+          <a id="pdfDown" href="javascript:void(0)">PDF下载</a>
+        </body></html>
+        """
+
+    async def test_access_reobserves_ambiguous_control_until_authenticated_order_action_appears(self) -> None:
+        settling_html = self._settling_html()
+        initial = CNKIAdapter.check_fulltext_access_html(
+            settling_html,
+            source_url=ARTICLE_URL,
+        )
+        self.assertEqual(initial.access_type, AccessType.UNKNOWN)
+        self.assertEqual(initial.download_url, UNKNOWN)
+        self.assertEqual(initial.download_locator, "PDF下载")
+        self.assertIn("FULLTEXT_ACCESS_UNKNOWN", initial.reason)
+
+        browser = self._HTMLBrowser(
+            [settling_html, fixture("cnki_abstract_2026.html")]
+        )
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._ACCESS_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            decision = await CNKIAdapter(browser).check_fulltext_access()
+
+        self.assertTrue(decision.full_text_accessible)
+        self.assertTrue(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.INSTITUTIONAL_AUTHENTICATED)
+        self.assertEqual(decision.status, RunStatus.SUCCESS)
+        self.assertEqual(browser.observe_count, 2)
+
+    async def test_access_does_not_retry_explicit_authorization_block(self) -> None:
+        explicit_block = """
+        <html><body>
+          <article><h1>企业数字化转型与资本市场表现——来自股票流动性的经验证据</h1>
+            <p>当前机构未获得全文访问权限</p>
+          </article>
+          <a id="pdfDown" href="https://bar.cnki.net/bar/download/order?id=denied">PDF下载</a>
+        </body></html>
+        """
+        browser = self._HTMLBrowser(
+            [explicit_block, fixture("cnki_abstract_2026.html")]
+        )
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._ACCESS_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            decision = await CNKIAdapter(browser).check_fulltext_access()
+
+        self.assertFalse(decision.full_text_accessible)
+        self.assertFalse(decision.authorized_access)
+        self.assertEqual(decision.access_type, AccessType.METADATA_ONLY)
+        self.assertEqual(decision.status, RunStatus.FULLTEXT_NOT_AUTHORIZED)
+        self.assertNotEqual(decision.download_url, UNKNOWN)
+        self.assertIn("explicit full-text authorization block", decision.reason)
+        self.assertEqual(browser.observe_count, 1)
+
+    async def test_access_returns_ambiguous_decision_after_bounded_observations(self) -> None:
+        browser = self._HTMLBrowser([self._settling_html()])
+        with patch(
+            "hunnu_harness.literature.adapters.cnki._ACCESS_SETTLE_DELAY_SECONDS",
+            0,
+        ):
+            decision = await CNKIAdapter(browser).check_fulltext_access()
+
+        self.assertFalse(decision.full_text_accessible)
+        self.assertEqual(decision.access_type, AccessType.UNKNOWN)
+        self.assertIn("FULLTEXT_ACCESS_UNKNOWN", decision.reason)
+        self.assertEqual(browser.observe_count, _ACCESS_SETTLE_MAX_OBSERVATIONS)
 
 
 class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
