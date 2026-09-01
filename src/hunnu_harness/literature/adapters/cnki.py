@@ -197,6 +197,18 @@ def _cnki_search_result_layout_priority(anchor: _Anchor, absolute_url: str) -> i
     return 2
 
 
+def _cnki_result_opens_new_tab(anchor: _Anchor, absolute_url: str) -> bool:
+    """Identify the current SPA result link that must be followed in-page."""
+
+    classes = frozenset(anchor.attributes.get("class", "").casefold().split())
+    return (
+        _is_cnki_detail_url(absolute_url)
+        and urlsplit(absolute_url).path.casefold().startswith(_CNKI_2026_DETAIL_PATH)
+        and "fz14" in classes
+        and anchor.attributes.get("target", "").casefold() == "_blank"
+    )
+
+
 def _is_cnki_resource_order_url(value: str) -> bool:
     """Recognize CNKI's current-article order action without treating it as a file URL."""
 
@@ -1508,7 +1520,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
         *,
         query: str,
         max_results: int,
-    ) -> tuple[list[LiteratureRecord], str]:
+    ) -> tuple[list[LiteratureRecord], str, frozenset[str]]:
         """Observe a bounded CNKI result window until it reaches a terminal state."""
 
         current_url = self.search_origin
@@ -1523,7 +1535,13 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 challenge_state=self._runtime_challenge_state(),
             )
             if records or self._search_outcome_is_stable(content_kind, content):
-                return records, current_url
+                same_page_navigation_urls: set[str] = set()
+                if content_kind == "html":
+                    for anchor in self._parser(content).anchors:
+                        absolute = urljoin(current_url, anchor.href)
+                        if _cnki_result_opens_new_tab(anchor, absolute):
+                            same_page_navigation_urls.add(absolute)
+                return records, current_url, frozenset(same_page_navigation_urls)
             if observation_number + 1 < _SEARCH_SETTLE_MAX_OBSERVATIONS:
                 await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
         if not _is_cnki_host(urlsplit(current_url).hostname):
@@ -1543,7 +1561,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             if mode == "exact_title"
             else result_limit
         )
-        results, current_url = await self._settled_search_records(
+        results, current_url, _same_page_navigation_urls = await self._settled_search_records(
             query=query,
             max_results=parse_limit,
         )
@@ -1579,11 +1597,11 @@ class CNKIAdapter(LiteratureSourceAdapter):
             raise SourceUnavailable("Browser command port is unavailable")
         # CNKI result-detail URLs carry short-lived signed query parameters.
         # Reusing one after screening can return a genuine CNKI 404 even though
-        # the record still exists.  Refresh the exact-title result page and
-        # click its newly observed link instead of replaying the stale URL.
+        # the record still exists.  Refresh the exact-title result page and use
+        # only the newly observed link instead of replaying the stale URL.
         exact_title_query = _canonicalize_cnki_exact_query(record.title)
         await self.browser.execute(NavigateCommand(self.build_search_url(exact_title_query, mode="exact_title")))
-        fresh_records, _current_url = await self._settled_search_records(
+        fresh_records, _current_url, same_page_navigation_urls = await self._settled_search_records(
             query=record.search_query if record.search_query != UNKNOWN else record.title,
             max_results=30,
         )
@@ -1593,6 +1611,20 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
         if fresh_record is None:
             raise SourceLayoutChanged("CNKI exact-title refresh could not relock the requested result")
+        if fresh_record.navigation_url in same_page_navigation_urls:
+            # The current result table deliberately opens article links in a
+            # new tab.  Follow the freshly parsed absolute href on the bound
+            # page instead, then require an official CNKI detail-page landing.
+            navigation_result = await self.browser.execute(
+                NavigateCommand(fresh_record.navigation_url)
+            )
+            final_url = str(getattr(navigation_result, "url", ""))
+            if not _is_cnki_detail_url(final_url):
+                raise SourceLayoutChanged(
+                    "CNKI result navigation remained outside an official detail page "
+                    "after same-page navigation"
+                )
+            return
         # CNKI's HTML result parser can preserve nonsemantic whitespace beside
         # a dash while the accessibility label exposes the same title without
         # it.  Use the restricted exact-query canonical form for the click
@@ -1627,12 +1659,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
                             close_origin_when_sole_page=True,
                         )
                     )
-                    # Some CNKI result rows acknowledge the click but keep the
-                    # active page on the search result document.  The result
-                    # URL was freshly relocked above, so a single typed
-                    # navigation is a bounded, identity-preserving fallback;
-                    # the detail-page parser and target identity lock remain
-                    # authoritative before any download.
+                    # Retain the bounded navigation fallback for legacy result
+                    # layouts.  The current new-tab result table has already
+                    # taken the explicit same-page path above.
                     clicked_url = getattr(click_result, "url", "")
                     if not _is_cnki_detail_url(str(clicked_url)):
                         navigation_result = await self.browser.execute(

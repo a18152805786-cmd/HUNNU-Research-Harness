@@ -4,6 +4,7 @@ import os
 import re
 import unittest
 from pathlib import Path
+from urllib.parse import quote_plus
 from unittest.mock import patch
 
 from hunnu_harness.browser.commands import (
@@ -17,13 +18,19 @@ from hunnu_harness.browser.commands import (
 )
 from hunnu_harness.literature.adapters.base import SourceLayoutChanged
 from hunnu_harness.literature.adapters.cnki import CNKIAdapter
+from hunnu_harness.literature.adapters.oxfordacademic import OxfordAcademicAdapter
 from hunnu_harness.literature.cnki_challenge import ChallengeState, classify_static_challenge
 from hunnu_harness.literature.institutional import (
     HUNNU_OXFORD_ROUTE_URL_ENV,
     HUNNUInstitutionalAccessResolver,
     InstitutionalResolutionTrigger,
+    InstitutionalRouteResult,
 )
-from hunnu_harness.literature.models import FullTextFormat, LiteratureRecord
+from hunnu_harness.literature.models import (
+    FullTextFormat,
+    LiteratureRecord,
+    LiteratureSearchRequest,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "literature"
@@ -43,6 +50,8 @@ OXFORD_GATEWAY = (
     "https://yclib.hunnu.edu.cn/vpn/983/https/OPAQUE-OXFORD-ROUTE/"
     "?opaque=REDACTED_TEST_VALUE"
 )
+OXFORD_DIRECT_ROUTE = "https://academic.oup.com/journals"
+OXFORD_SEARCH_QUERY = "Double/debiased machine learning for treatment and structural parameters"
 
 
 def fixture(name: str) -> str:
@@ -192,20 +201,105 @@ class CNKI2026OpenResultTests(unittest.IsolatedAsyncioTestCase):
             source_url=CNKI_SEARCH_URL,
         )[0]
 
-    async def test_new_tab_click_falls_back_to_fresh_detail_url_and_confirms_the_landing(self) -> None:
+    async def test_new_tab_layout_navigates_fresh_href_on_same_page_without_click(self) -> None:
         browser = _CNKI2026Browser()
-        with patch("hunnu_harness.literature.adapters.cnki._CNKI_CLICK_RETRY_DELAY_SECONDS", 0):
-            await CNKIAdapter(browser).open_result(self.target_record())
-        click = next(command for command in browser.commands if isinstance(command, ClickCommand))
-        self.assertTrue(click.follow_new_page)
-        self.assertTrue(click.close_origin_when_sole_page)
+        await CNKIAdapter(browser).open_result(self.target_record())
+        navigations = [
+            command.url for command in browser.commands if isinstance(command, NavigateCommand)
+        ]
+        self.assertEqual(len(navigations), 2)
+        self.assertIn("/kns8s/", navigations[0])
+        self.assertIn("/kcms2/article/abstract", navigations[1])
+        self.assertFalse(any(isinstance(command, ClickCommand) for command in browser.commands))
         self.assertIn("/kcms2/article/abstract", browser.current_url)
 
-    async def test_result_page_that_survives_fresh_navigation_fails_closed(self) -> None:
+    async def test_same_page_navigation_that_remains_on_result_page_fails_closed(self) -> None:
         browser = _CNKI2026Browser(detail_navigation_sticks=True)
-        with patch("hunnu_harness.literature.adapters.cnki._CNKI_CLICK_RETRY_DELAY_SECONDS", 0):
-            with self.assertRaisesRegex(SourceLayoutChanged, "remained outside an official detail page"):
-                await CNKIAdapter(browser).open_result(self.target_record())
+        with self.assertRaisesRegex(SourceLayoutChanged, "after same-page navigation"):
+            await CNKIAdapter(browser).open_result(self.target_record())
+        self.assertFalse(any(isinstance(command, ClickCommand) for command in browser.commands))
+        self.assertIn("/kns8s/", browser.current_url)
+
+
+class _OxfordSearchBrowser:
+    def __init__(self) -> None:
+        self.current_url = "about:blank"
+        self.current_html = "<html><title>blank</title></html>"
+        self.commands = []
+        self.session = SessionHandle("oxford-2026-search")
+        self.page_handle = PageHandle("main", session=self.session)
+
+    def observation(self) -> BrowserObservation:
+        return BrowserObservation(
+            session=self.session,
+            page=self.page_handle,
+            generation=len(self.commands),
+            url=self.current_url,
+            title="Search Results | Oxford Academic",
+            html=self.current_html,
+        )
+
+    async def execute(self, command):
+        self.commands.append(command)
+        if isinstance(command, NavigateCommand):
+            self.current_url = command.url
+            self.current_html = fixture("oxfordacademic_search.html")
+            return self.observation()
+        if isinstance(command, ObserveCommand):
+            return self.observation()
+        raise AssertionError(type(command).__name__)
+
+
+def oxford_route(publisher_navigation_url: str) -> InstitutionalRouteResult:
+    return InstitutionalRouteResult(
+        requested_source="OxfordAcademic",
+        resolution_trigger=InstitutionalResolutionTrigger.ACCESS_ROUTE_UNKNOWN,
+        institutional_route_resolved=True,
+        institutional_target_database_match=True,
+        publisher_navigation_url=publisher_navigation_url,
+    )
+
+
+class Oxford2026SearchRoutingTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def request() -> LiteratureSearchRequest:
+        return LiteratureSearchRequest(
+            original_research_request="Oxford 2026 route search regression",
+            max_downloads=0,
+            max_downloads_per_run=0,
+        )
+
+    async def test_resolved_official_route_uses_direct_oxford_search(self) -> None:
+        browser = _OxfordSearchBrowser()
+        adapter = OxfordAcademicAdapter(browser)
+        adapter.bind_institutional_route(oxford_route(OXFORD_DIRECT_ROUTE))
+
+        records = await adapter.search(OXFORD_SEARCH_QUERY, self.request())
+
+        expected = (
+            "https://academic.oup.com/search-results?q="
+            f"{quote_plus(OXFORD_SEARCH_QUERY)}"
+        )
+        navigations = [
+            command.url for command in browser.commands if isinstance(command, NavigateCommand)
+        ]
+        self.assertEqual(navigations, [expected])
+        self.assertEqual(len(records), 1)
+
+    async def test_resolved_yclib_route_retains_gateway_search_rewrite(self) -> None:
+        browser = _OxfordSearchBrowser()
+        adapter = OxfordAcademicAdapter(browser)
+        adapter.bind_institutional_route(oxford_route(OXFORD_GATEWAY))
+
+        records = await adapter.search(OXFORD_SEARCH_QUERY, self.request())
+
+        expected = OXFORD_GATEWAY.replace("/?opaque=", "/search-results?opaque=", 1)
+        expected += f"&q={quote_plus(OXFORD_SEARCH_QUERY)}"
+        navigations = [
+            command.url for command in browser.commands if isinstance(command, NavigateCommand)
+        ]
+        self.assertEqual(navigations, [expected])
+        self.assertEqual(len(records), 1)
 
 
 class _RoutePage:
