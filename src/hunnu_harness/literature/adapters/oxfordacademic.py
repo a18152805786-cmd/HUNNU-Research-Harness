@@ -858,9 +858,14 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
                                 self.official_host,
                                 self.hunnu_gateway_host,
                                 "oup.silverchair-cdn.com",
+                                ".silverchair.com",
                             )
                             if self._gateway_trusted()
-                            else (self.official_host, "oup.silverchair-cdn.com")
+                            else (
+                                self.official_host,
+                                "oup.silverchair-cdn.com",
+                                ".silverchair.com",
+                            )
                         ),
                         provenance_host=provenance_host,
                         source_route=source_route,

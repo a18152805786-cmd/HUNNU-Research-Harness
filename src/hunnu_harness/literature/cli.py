@@ -295,6 +295,12 @@ async def _run_live(args: argparse.Namespace) -> int:
         if status in {RunStatus.ACTION_REQUIRED_USER_LOGIN, RunStatus.ACTION_REQUIRED_USER_DOWNLOAD}:
             return EXIT_HUMAN_ACTION_REQUIRED
         return EXIT_ENV_NOT_READY
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:300]
+        report.put("Status", "SOURCE_UNAVAILABLE")
+        report.put("Reason", reason)
+        report.flush()
+        return EXIT_ENV_NOT_READY
     finally:
         # Read the browser's own account of what it did before tearing it down.
         # An Agent that has to infer this from missing output gets it wrong:

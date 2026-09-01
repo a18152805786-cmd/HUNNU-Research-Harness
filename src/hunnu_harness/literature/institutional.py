@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import unicodedata
@@ -11,7 +12,7 @@ from html.parser import HTMLParser
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
 
-from ..browser.commands import NavigateCommand, ObserveCommand
+from ..browser.commands import NavigateCommand, ObservationUnavailable, ObserveCommand
 from ..browser.port import ensure_browser_command_port
 from .adapters.base import (
     LiteratureSourceAdapter,
@@ -28,6 +29,8 @@ HUNNU_INSTITUTION_NAME = "湖南师范大学"
 HUNNU_OFFICIAL_PORTAL = "https://www.hunnu.edu.cn/"
 HUNNU_LIBRARY_HOME = "https://lib.hunnu.edu.cn/"
 HUNNU_OXFORD_ROUTE_URL_ENV = "HUNNU_OXFORD_ROUTE_URL"
+_SNAPSHOT_SETTLE_DELAY_SECONDS = 2.0
+_SNAPSHOT_SETTLE_MAX_ATTEMPTS = 3
 
 
 class InstitutionalResolutionTrigger(str, Enum):
@@ -725,14 +728,21 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
 
     async def _snapshot_after_goto(self, url: str) -> tuple[str, str, str]:
         await self.browser.execute(NavigateCommand(url))
-        observation = await self.browser.execute(
-            ObserveCommand(include_html=True, include_visible_text=False)
-        )
-        html = observation.require_html()
-        current_url = observation.url
-        title = observation.title or self._parse(html).title
-        self.detect_manual_authentication(html, url=current_url)
-        return html, current_url, title
+        for attempt in range(_SNAPSHOT_SETTLE_MAX_ATTEMPTS):
+            try:
+                observation = await self.browser.execute(
+                    ObserveCommand(include_html=True, include_visible_text=False)
+                )
+                html = observation.require_html()
+                current_url = observation.url
+                title = observation.title or self._parse(html).title
+                self.detect_manual_authentication(html, url=current_url)
+                return html, current_url, title
+            except ObservationUnavailable:
+                if attempt + 1 == _SNAPSHOT_SETTLE_MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(_SNAPSHOT_SETTLE_DELAY_SECONDS)
+        raise AssertionError("unreachable snapshot retry state")
 
     @staticmethod
     def _step(

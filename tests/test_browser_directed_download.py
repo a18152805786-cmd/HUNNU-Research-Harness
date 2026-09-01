@@ -26,6 +26,7 @@ from hunnu_harness.browser.browser_directed_download import (
     ELSEVIER_PDF_HOSTS,
     BrowserDirectedDownload,
     DirectedDownloadFailure,
+    _host_is_allowed,
     host_of,
     lease_for,
     pii_from_url,
@@ -49,6 +50,8 @@ OUP_CDN_URL = (
     "36/9/10.1093_rfs_hhad021/1/download.pdf?Expires=1788211200"
 )
 OUP_FILENAME = f"{OUP_PII}.pdf"
+OUP_WATERMARK_HOST = "watermark02.silverchair.com"
+OUP_WATERMARK_URL = f"https://{OUP_WATERMARK_HOST}/watermarked/{OUP_FILENAME}"
 CNKI_ORDER_ID = "CNKI_ORDER_20260901_ABC123"
 CNKI_ORDER_URL = (
     f"https://bar.cnki.net/bar/download/order?id={CNKI_ORDER_ID}&filename=paper.pdf"
@@ -191,7 +194,20 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(ELSEVIER_PDF_HOSTS.issubset(DIRECTED_DOWNLOAD_DEFAULT_HOSTS))
         self.assertIn("bar.cnki.net", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
         self.assertIn("download.cnki.net", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
+        self.assertIn("docdown.cnki.net", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
         self.assertNotIn("example.invalid", DIRECTED_DOWNLOAD_DEFAULT_HOSTS)
+
+    def test_declared_suffix_allows_a_silverchair_watermark_delivery_host(self) -> None:
+        self.assertTrue(
+            _host_is_allowed("watermark02.silverchair.com", frozenset({".silverchair.com"}))
+        )
+
+    def test_declared_suffix_does_not_allow_the_bare_domain(self) -> None:
+        self.assertFalse(_host_is_allowed("silverchair.com", frozenset({".silverchair.com"})))
+
+    def test_default_hosts_remain_exact_entries_only(self) -> None:
+        self.assertFalse(any(host.startswith(".") for host in DIRECTED_DOWNLOAD_DEFAULT_HOSTS))
+        self.assertFalse(_host_is_allowed("watermark02.silverchair.com", DIRECTED_DOWNLOAD_DEFAULT_HOSTS))
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -234,6 +250,27 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(result.source_pii, OUP_PII)
             self.assertEqual(result.as_dict()["DownloadSourcePII"], OUP_PII)
             self.assertEqual(result.source_url_host, OUP_CDN_HOST)
+            self.assertEqual(result.path.name, OUP_FILENAME)
+
+    def test_a_declared_suffix_allows_a_watermarked_silverchair_delivery(self) -> None:
+        with temp_root("bdd-watermark-suffix-") as tmp:
+            fixture = _Fixture(
+                Path(tmp),
+                locked=OUP_PII,
+                allowed_hosts=frozenset({".silverchair.com"}),
+            )
+
+            async def script(f):
+                f.session.emit(
+                    "Browser.downloadWillBegin",
+                    begin(url=OUP_WATERMARK_URL, filename=OUP_FILENAME),
+                )
+                f.land(OUP_FILENAME)
+                f.session.emit("Browser.downloadProgress", progress())
+
+            result = run(fixture, script)
+
+            self.assertEqual(result.source_url_host, OUP_WATERMARK_HOST)
             self.assertEqual(result.path.name, OUP_FILENAME)
 
     def test_declared_title_label_claims_filename_with_author_suffix(self) -> None:
