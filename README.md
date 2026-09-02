@@ -1,4 +1,4 @@
-# HUNNU Research Harness v0.3.3
+# HUNNU Research Harness v0.3.4
 
 ## 给安装 Agent 的指引（拿到 zip 后先读这一节）
 
@@ -224,13 +224,15 @@ codex mcp list
 - Agent 文献 live execution 的 Python `BrowserTransport` → Codex Playwright MCP bridge 尚未实现；必须先经 `AdapterExecutionBroker`，不能用裸 MCP 浏览器操作替代 adapter。
 - FDM 接管下载的兼容性尚未启用；建议专用 profile 使用浏览器原生下载，以便 Harness 可靠识别下载链路。
 
-`browser-start` 当前是一次安全的 profile 启动/状态检查命令，会在输出状态后关闭浏览器；长期运行和 Codex 操作优先由已登记的 Playwright MCP 进程负责。Python API 仍提供 `research_browser.start()`、`status()`、`stop()`，供后续服务化封装使用。
+`browser-start` 启动专用 Research Chrome profile 并让它一直运行到 `browser-stop`，机构登录状态因此能跨多次运行保留；已在运行时它原样返回而不重启。`browser-status` 只报告是否在运行，不会启动浏览器。它在运行时，后续 `acquire` 运行会附着到它而不是再启动一个。Python API 仍提供 `research_browser.start()`、`status()`、`stop()`，供后续服务化封装使用。
 
 ## 测试
 
 ```powershell
-python -m unittest discover -s tests -v
+.venv\Scripts\python.exe -m pytest -q
 ```
+
+必须经由 pytest 运行（不要用 `python -m unittest discover`）：`tests/conftest.py` 的 autouse fixture 把真实的 fetch 台账重定向到护栏目录并在每个测试前后快照比对，unittest 不会加载它，直接跑就可能污染真实台账。
 
 ## 版本控制
 
