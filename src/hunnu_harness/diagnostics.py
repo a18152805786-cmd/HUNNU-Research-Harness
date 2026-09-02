@@ -2,7 +2,7 @@
 
 ``capabilities`` is static: it introspects the build (sources, knobs, exit
 ladder) and never touches the environment.  ``doctor`` is dynamic: it probes
-this machine -- Python floor, Playwright import, Chrome discovery, Output Root
+this machine -- Python floor, Playwright and pypdf imports, Chrome discovery, Output Root
 writability, ledger readability, vocabulary state -- and grades the first
 blocking finding on the shared exit ladder (see exit_codes).  Neither ever
 performs network activity; an agent runs them before spending anything.
@@ -116,6 +116,18 @@ def build_doctor() -> tuple[dict[str, Any], int]:
         'not installed; run: pip install -e ".[browser]"',
     )
 
+    # pypdf is a hard dependency, so this only fails under a foreign
+    # interpreter -- exactly the case that once turned a `paper-index
+    # rebuild` into an empty index.  The build now refuses on its own; the
+    # doctor names the cause before anyone gets that far.
+    pypdf_present = importlib.util.find_spec("pypdf") is not None
+    checks["pypdf"] = _check(
+        pypdf_present,
+        "importable" if pypdf_present else
+        "not importable in this interpreter; paper-index build/rebuild would "
+        'refuse to commit -- run: pip install -e "." or use the project .venv',
+    )
+
     chrome = discover_chrome_executable()
     checks["chrome"] = _check(
         chrome is not None,
@@ -160,7 +172,7 @@ def build_doctor() -> tuple[dict[str, Any], int]:
     # unwritable.
     if not checks["python"]["ok"] or not checks["output_root"]["ok"] or not checks["fetch_budget"]["ok"]:
         verdict, exit_code = "ENV_NOT_READY", EXIT_ENV_NOT_READY
-    elif not checks["playwright"]["ok"]:
+    elif not checks["playwright"]["ok"] or not checks["pypdf"]["ok"]:
         verdict, exit_code = "CAPABILITY_MISSING", EXIT_CAPABILITY_MISSING
     else:
         verdict, exit_code = "READY", EXIT_OK

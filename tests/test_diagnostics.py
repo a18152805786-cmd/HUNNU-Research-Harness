@@ -8,6 +8,7 @@ network, and grades its first blocking finding on the shared exit ladder.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import tempfile
@@ -52,7 +53,15 @@ class DoctorTests(unittest.TestCase):
         code, payload = _run(["doctor"])
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(payload["Verdict"], "READY")
-        for name in ("python", "playwright", "chrome", "output_root", "fetch_budget", "vocabulary"):
+        for name in (
+            "python",
+            "playwright",
+            "pypdf",
+            "chrome",
+            "output_root",
+            "fetch_budget",
+            "vocabulary",
+        ):
             self.assertIn(name, payload["Checks"])
         self.assertTrue(payload["Checks"]["output_root"]["ok"])
 
@@ -62,6 +71,22 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, EXIT_CAPABILITY_MISSING)
         self.assertEqual(payload["Verdict"], "CAPABILITY_MISSING")
         self.assertIn("pip install", payload["Checks"]["playwright"]["detail"])
+
+    def test_missing_pypdf_grades_capability_missing(self) -> None:
+        """A foreign interpreter without pypdf is named before a rebuild is tried."""
+
+        real_find_spec = importlib.util.find_spec
+
+        def only_pypdf_missing(name, *args, **kwargs):
+            return None if name == "pypdf" else real_find_spec(name, *args, **kwargs)
+
+        with patch("importlib.util.find_spec", side_effect=only_pypdf_missing):
+            payload, code = diagnostics.build_doctor()
+        self.assertEqual(code, EXIT_CAPABILITY_MISSING)
+        self.assertEqual(payload["Verdict"], "CAPABILITY_MISSING")
+        self.assertTrue(payload["Checks"]["playwright"]["ok"])
+        self.assertFalse(payload["Checks"]["pypdf"]["ok"])
+        self.assertIn("paper-index", payload["Checks"]["pypdf"]["detail"])
 
     def test_unwritable_output_root_grades_env_not_ready(self) -> None:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)

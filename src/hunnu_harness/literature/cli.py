@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 from ..browser.playwright_backend import (
@@ -310,7 +311,16 @@ async def _run_live(args: argparse.Namespace) -> int:
             lifecycle = await browser.lifecycle()
         except Exception:
             lifecycle = {}
-        await browser.close()
+        # Teardown is best-effort for the same reason: a driver that fails
+        # to stop after the run has finished must not replace the graded
+        # JSON report with a traceback and exit 1.
+        try:
+            await browser.close()
+        except Exception as exc:
+            print(
+                f"warning: browser teardown failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     for key in ("BrowserLaunched", "BrowserHeadless", "FinalURL", "FinalPageTitle"):
         if key in lifecycle:

@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser(
         "doctor",
-        help="Is this machine ready: Python, Playwright, Chrome, Output Root, budget (JSON, no network)",
+        help="Is this machine ready: Python, Playwright, pypdf, Chrome, Output Root, budget (JSON, no network)",
     )
 
     acquire = sub.add_parser(

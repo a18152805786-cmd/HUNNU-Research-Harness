@@ -204,6 +204,55 @@ class SetupPhaseSourceErrorTests(unittest.TestCase):
         self.assertIn("RuntimeError", payload["Reason"])
 
 
+class TeardownFailureTests(unittest.TestCase):
+    """This failing means a browser teardown error replaces the report again.
+
+    The run had finished and its graded verdict was decided; a driver that
+    then fails to stop (a CDP connection already gone, say) must not turn
+    that into a naked traceback with exit 1 and no JSON.
+    """
+
+    def test_a_failing_browser_close_keeps_the_report_and_exit_code(self) -> None:
+        class _StubbornBrowser:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def start(self) -> None:
+                return None
+
+            async def lifecycle(self) -> dict:
+                return {"BrowserLaunched": True}
+
+            async def close(self) -> None:
+                raise RuntimeError("CDP connection already gone")
+
+        class _FinishedWorkflow:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            async def run(self, _request: object) -> object:
+                return SimpleNamespace(
+                    status=RunStatus.NO_RESULTS,
+                    records=[],
+                    downloads=[],
+                    action_required_reason=None,
+                )
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with patch.object(literature_cli, "PlaywrightBrowser", _StubbornBrowser), patch.object(
+            literature_cli, "LiteratureAcquisitionWorkflow", _FinishedWorkflow
+        ):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = literature_cli.main(["live-cnki", "--title", "x", "--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(payload["Status"], RunStatus.NO_RESULTS.value)
+        self.assertTrue(payload["BrowserLaunched"])
+        self.assertIn("teardown", err.getvalue())
+        self.assertIn("RuntimeError", err.getvalue())
+
+
 class ExceptionLadderTests(unittest.TestCase):
     def test_missing_playwright_is_a_missing_capability(self) -> None:
         class _Unavailable:
