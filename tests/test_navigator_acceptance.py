@@ -28,6 +28,16 @@ from hunnu_harness.paths import (
 
 # The sealed audit numbers this corpus is frozen at.
 #
+# Resealed at 187/200/349 on 2026-09-05, from 185/198/345.  Two papers were
+# acquired through the full chain for the Fable5 Round 2 citation audit --
+# Hummels, Ishii and Yi (2001) and Koopman, Wang and Wei (2012), both located
+# by DOI on ScienceDirect, downloaded by the harness itself, identity-checked
+# against the printed article front matter, and archived.  Both were filed
+# under topics the classifier had already proposed, so the topic count moves by
+# the four new assignments and no new topic is created.
+#
+# The 2026-09-01 reseal, 185/198/345 from 181/194/339, is preserved below.
+#
 # Resealed at 185/198/345 on 2026-09-01, from 181/194/339.  Four papers were
 # acquired through the full chain during the four-site live acceptance --
 # ScienceDirect, SpringerLink, CNKI, and Oxford Academic; each searched,
@@ -40,9 +50,9 @@ from hunnu_harness.paths import (
 #
 # Unique topics stays 39 on purpose: every acquisition was filed under a topic
 # that already existed, and nothing here may create a fortieth.
-EXPECTED_WORKS = 185
-EXPECTED_VERSIONS = 198
-EXPECTED_TOPIC_ASSIGNMENTS = 345
+EXPECTED_WORKS = 187
+EXPECTED_VERSIONS = 200
+EXPECTED_TOPIC_ASSIGNMENTS = 349
 EXPECTED_UNIQUE_TOPICS = 39
 
 # Known fixtures in the real corpus, verified during discovery.

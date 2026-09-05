@@ -57,6 +57,17 @@ class ScreeningDecision(str, Enum):
     UNSCREENED = "UNSCREENED"
 
 
+def _checked_flag(value: bool | None) -> Any:
+    """Report a verification flag that an adapter may never have computed.
+
+    ``False`` must mean "checked, and it did not match". Adapters that do not
+    perform the check leave the flag ``None``, which reports as ``UNKNOWN`` so a
+    manifest reader cannot mistake an unperformed check for a failed one.
+    """
+
+    return UNKNOWN if value is None else value
+
+
 def _canonical_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
 
@@ -367,8 +378,8 @@ class LiteratureRecord:
     institution: str = UNKNOWN
     download_event_emitted: bool = False
     authorized_pdf_response_captured: bool = False
-    target_title_matched: bool = False
-    target_doi_matched: bool = False
+    target_title_matched: bool | None = None
+    target_doi_matched: bool | None = None
     official_pdf_action_confirmed: bool = False
     source_access_status: str = UNKNOWN
     manual_download_required: bool = False
@@ -447,8 +458,8 @@ class LiteratureRecord:
             "Institution": self.institution,
             "DownloadEventEmitted": self.download_event_emitted,
             "AuthorizedPdfResponseCaptured": self.authorized_pdf_response_captured,
-            "TargetTitleMatched": self.target_title_matched,
-            "TargetDOIMatched": self.target_doi_matched,
+            "TargetTitleMatched": _checked_flag(self.target_title_matched),
+            "TargetDOIMatched": _checked_flag(self.target_doi_matched),
             "OfficialPdfActionConfirmed": self.official_pdf_action_confirmed,
             "SourceAccessStatus": self.source_access_status,
             "ManualDownloadRequired": self.manual_download_required,
@@ -564,8 +575,8 @@ class DownloadManifestEntry:
     query_string_persisted: bool = False
     authorization_header_persisted: bool = False
     cookie_persisted: bool = False
-    target_title_matched: bool = False
-    target_doi_matched: bool = False
+    target_title_matched: bool | None = None
+    target_doi_matched: bool | None = None
     official_pdf_action_confirmed: bool = False
     source_access_status: str = UNKNOWN
     manual_download_required: bool = False
@@ -632,8 +643,8 @@ class DownloadManifestEntry:
             "QueryStringPersisted": self.query_string_persisted,
             "AuthorizationHeaderPersisted": self.authorization_header_persisted,
             "CookiePersisted": self.cookie_persisted,
-            "TargetTitleMatched": self.target_title_matched,
-            "TargetDOIMatched": self.target_doi_matched,
+            "TargetTitleMatched": _checked_flag(self.target_title_matched),
+            "TargetDOIMatched": _checked_flag(self.target_doi_matched),
             "OfficialPdfActionConfirmed": self.official_pdf_action_confirmed,
             "SourceAccessStatus": self.source_access_status,
             "ManualDownloadRequired": self.manual_download_required,
