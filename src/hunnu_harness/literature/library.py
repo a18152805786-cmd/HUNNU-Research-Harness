@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -66,6 +66,26 @@ class LibraryDisposition(str, Enum):
     EXTERNAL_IDENTITY_UNVERIFIED = "EXTERNAL_IDENTITY_UNVERIFIED"
 
 
+# The dispositions after which a catalog record exists for the WORK, and so the
+# only ones topic filing can act on.
+MANAGED_DISPOSITIONS: frozenset[LibraryDisposition] = frozenset(
+    {
+        LibraryDisposition.NEW_PAPER,
+        LibraryDisposition.EXACT_DUPLICATE,
+        LibraryDisposition.SAME_WORK_DIFFERENT_VERSION,
+    }
+)
+
+# Topic filing on the import path reports itself in the download manifest's
+# vocabulary (``ClassificationStatus`` and friends).  ``NOT_ATTEMPTED`` is the
+# one value that vocabulary lacks: it is what an importer with no classifier
+# attached says, so that "nothing was filed" is a statement on the result
+# rather than an absence from it.  An import that stays silent about topics
+# produced a MANAGED WORK with no topic and nothing that said so.
+TOPIC_FILING_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+TOPIC_FILING_NO_CLASSIFIER = "NO_TOPIC_CLASSIFIER_ATTACHED"
+
+
 class LibraryCatalogError(RuntimeError):
     """Raised when the JSONL source of truth cannot be trusted or committed."""
 
@@ -86,6 +106,22 @@ class LibraryIngestResult:
     status: str = "REJECTED"
     reason: str = UNKNOWN
     source_unchanged: bool = True
+    # Topic filing, in the same field set the download manifest reports
+    # (``DownloadManifestEntry``), so an Agent reads one vocabulary whichever
+    # way a paper entered the Library.  Defaults describe a rejected import:
+    # no WORK, nothing to file.
+    classification_status: str = UNKNOWN
+    assigned_topics: tuple[str, ...] = ()
+    assigned_primary_topic: str = UNKNOWN
+    assigned_secondary_topics: tuple[str, ...] = ()
+    proposed_topics: tuple[str, ...] = ()
+    topic_review_required: bool = False
+    topic_metadata_updated: bool = False
+    topic_view_updated: bool = False
+    classification_reason: str = UNKNOWN
+    navigator_metadata_ready: bool = False
+    navigator_topic_ready: bool = False
+    navigator_fulltext_index_status: str = UNKNOWN
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +137,18 @@ class LibraryIngestResult:
             "Status": self.status,
             "Reason": self.reason,
             "SourceUnchanged": self.source_unchanged,
+            "ClassificationStatus": self.classification_status,
+            "AssignedTopics": list(self.assigned_topics),
+            "AssignedPrimaryTopic": self.assigned_primary_topic,
+            "AssignedSecondaryTopics": list(self.assigned_secondary_topics),
+            "ProposedTopics": list(self.proposed_topics),
+            "TopicReviewRequired": self.topic_review_required,
+            "TopicMetadataUpdated": self.topic_metadata_updated,
+            "TopicViewUpdated": self.topic_view_updated,
+            "ClassificationReason": self.classification_reason,
+            "NavigatorMetadataReady": self.navigator_metadata_ready,
+            "NavigatorTopicReady": self.navigator_topic_ready,
+            "NavigatorFulltextIndexStatus": self.navigator_fulltext_index_status,
         }
 
 
@@ -988,13 +1036,63 @@ class GlobalPaperLibrary:
         )
 
 
-class ExternalPaperImporter:
-    """Controlled single-file staging/import API; intentionally no scanner."""
+_ATTACH_DEFAULT_CLASSIFIER = object()
 
-    def __init__(self, library: GlobalPaperLibrary | None = None) -> None:
+
+class ExternalPaperImporter:
+    """Controlled single-file staging/import API; intentionally no scanner.
+
+    Topic filing is part of the import, as it is part of an acquisition
+    (AGENTS.md 69): once a staged PDF has become a managed WORK, the same
+    post-ingest classification the download path runs decides whether the
+    WORK is filed or lands in ``REVIEW_REQUIRED`` with its proposals, and the
+    result reports which.  An import that ran no classification produced a
+    MANAGED WORK carrying no topic, with nothing on its result saying so.
+
+    The classifier is attached by default only when this importer targets the
+    real Library.  An isolated library -- a test tree, a rehearsal -- gets
+    none, and then says so on the result rather than staying silent.
+    """
+
+    def __init__(
+        self,
+        library: GlobalPaperLibrary | None = None,
+        *,
+        topic_classifier: Any = _ATTACH_DEFAULT_CLASSIFIER,
+    ) -> None:
         self.library = library or GlobalPaperLibrary()
         self.candidates_dir = self.library.import_staging_dir / "candidates"
         _windows_io_path(self.candidates_dir).mkdir(parents=True, exist_ok=True)
+        self._topic_classifier = topic_classifier
+
+    @staticmethod
+    def classifies_by_default(library_root: Path) -> bool:
+        """Whether an importer for this library attaches the real classifier.
+
+        Only the real Library does.  Any other root is an isolated copy and
+        must never reach the frozen taxonomy or the shared topic store through
+        a default, exactly as the acquisition path keeps an isolated test run
+        away from them.
+        """
+
+        return _logical_path(library_root) == _logical_path(LIBRARY_ROOT)
+
+    @property
+    def topic_classifier(self) -> Any:
+        """The post-ingest classifier, resolved once and only when needed.
+
+        Resolved lazily so that ``library-stage`` -- a COPY into staging --
+        never constructs one, and so that an explicit ``None`` stays ``None``.
+        """
+
+        if self._topic_classifier is _ATTACH_DEFAULT_CLASSIFIER:
+            if self.classifies_by_default(self.library.library_root):
+                from .auto_classification import PostAcquisitionClassifier
+
+                self._topic_classifier = PostAcquisitionClassifier()
+            else:
+                self._topic_classifier = None
+        return self._topic_classifier
 
     def stage_pdf(self, source: Path) -> StagedPaperCandidate:
         source = _logical_path(source)
@@ -1140,13 +1238,80 @@ class ExternalPaperImporter:
         original_paths = _unique_strings(
             [*payload.get("OriginalSourcePaths", []), staged_pdf, *supplied_original_paths]
         )
-        return self.library.ingest_external_pdf(
+        ingested = self.library.ingest_external_pdf(
             staged_pdf,
             claimed_record,
             source_locator=claimed_record.stable_identifier,
             original_paths=original_paths,
             version_role=str(
                 self._metadata_value(metadata, "version_role", "VersionRole", default=UNKNOWN)
+            ),
+        )
+        return self._file_topics(ingested)
+
+    def _file_topics(self, result: LibraryIngestResult) -> LibraryIngestResult:
+        """Run post-ingest topic filing for a managed WORK and report it.
+
+        Mirrors ``LiteratureDownloadManager._classify_archived_work``: a
+        classification failure is a metadata outcome, never an import outcome.
+        The managed file and the catalog record are already committed and stay
+        exactly as they are; what changes is that the result now states
+        whether the WORK was filed, needs a person, or was not classified at
+        all.  ``TopicReviewRequired`` is true exactly when the WORK still
+        carries no topic after this step, so a caller never has to infer that
+        from the absence of a field.
+        """
+
+        if result.disposition not in MANAGED_DISPOSITIONS:
+            return result
+        classifier = self.topic_classifier
+        if classifier is None:
+            return replace(
+                result,
+                classification_status=TOPIC_FILING_NOT_ATTEMPTED,
+                topic_review_required=True,
+                classification_reason=TOPIC_FILING_NO_CLASSIFIER,
+            )
+
+        from .classification import ClassificationStatus
+
+        try:
+            outcome, applied = classifier.classify_after_ingest(
+                result.paper_id,
+                disposition=result.disposition.value,
+            )
+        except Exception as exc:
+            return replace(
+                result,
+                classification_status=ClassificationStatus.FAILED_SAFE.value,
+                topic_review_required=True,
+                classification_reason=f"Topic classification failed: {type(exc).__name__}",
+            )
+
+        if outcome.status is ClassificationStatus.SKIPPED_EXISTING:
+            assigned = tuple(outcome.existing_topics)
+        else:
+            assigned = tuple(outcome.assigned_labels)
+        readiness = None
+        try:
+            readiness = classifier.navigator_readiness(result.paper_id)
+        except Exception:
+            readiness = None
+        return replace(
+            result,
+            classification_status=outcome.status.value,
+            assigned_topics=assigned,
+            assigned_primary_topic=assigned[0] if assigned else UNKNOWN,
+            assigned_secondary_topics=assigned[1:],
+            proposed_topics=tuple(outcome.proposed_labels),
+            topic_review_required=bool(outcome.review_required) or not assigned,
+            topic_metadata_updated=bool(applied.topic_metadata_updated),
+            topic_view_updated=bool(applied.topic_view_updated),
+            classification_reason=str(applied.reason),
+            navigator_metadata_ready=bool(readiness and readiness.metadata_ready),
+            navigator_topic_ready=bool(readiness and readiness.topic_ready),
+            navigator_fulltext_index_status=(
+                readiness.fulltext_index_status if readiness is not None else UNKNOWN
             ),
         )
 
@@ -1168,6 +1333,9 @@ class ExternalPaperImporter:
 __all__ = [
     "CATALOG_SCHEMA_VERSION",
     "COMPATIBLE_CATALOG_SCHEMA_VERSIONS",
+    "MANAGED_DISPOSITIONS",
+    "TOPIC_FILING_NOT_ATTEMPTED",
+    "TOPIC_FILING_NO_CLASSIFIER",
     "ExternalPaperImporter",
     "GlobalPaperLibrary",
     "LibraryCatalogError",

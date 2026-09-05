@@ -197,3 +197,26 @@ classification.
 `ClassificationReason`. `CLASSIFIED` means filing is done. `REVIEW_REQUIRED`
 means the paper is safely archived and its topics need a human — never a reason
 to download it again.
+
+## The import path files too
+
+`library-import` runs the same `classify_after_ingest` step once the staged
+PDF is a managed WORK (`NEW_PAPER`, `SAME_WORK_DIFFERENT_VERSION`, or
+`EXACT_DUPLICATE`), and `LibraryIngestResult` reports it in the manifest's
+field set above. A manually imported paper is an acquisition like any other
+(AGENTS.md 69): it is filed, or it lands in `REVIEW_REQUIRED` with its
+proposals for `library-confirm-topics`. An importer with no classifier
+attached — only an isolated library ever has none — reports
+`ClassificationStatus: NOT_ATTEMPTED` with `TopicReviewRequired: true`, so
+"nothing was filed" is a statement on the result rather than an absence from it.
+A classification failure is reported as `FAILED_SAFE`, `TopicReviewRequired:
+true`, and never fails the import.
+
+Before this, the import ran no classification and said nothing: a WORK came
+out `MANAGED` with no topic, and because confirmation gated on the classifier's
+*regenerated* verdict rather than on the WORK's state, a paper the classifier
+was confident about was refused as `NOT_REVIEW_REQUIRED` — "classified", with
+nothing filed and no sanctioned way to file it. Confirmation now gates on
+whether the WORK carries a topic; what it can confirm without the override is
+everything classification raised for the WORK — its proposals, and for an
+unfiled WORK also what it would have assigned.

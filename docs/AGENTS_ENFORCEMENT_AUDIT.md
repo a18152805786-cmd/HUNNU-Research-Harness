@@ -76,8 +76,8 @@
 | 66 | Navigator 只读不采集 | 设计缺失 | 无写库代码路径（index 只写 `paper_retrieval` 派生区） |
 | 67 | 索引可重建、缺失即降级 | 代码强制 | `index_status` 全命令一致（P1 回归测试族）；3.7 后缺库另有解释文本 |
 | 68 | paper-gaps 只谈本地覆盖 | 代码强制（本轮升级） | `SCOPE_STATEMENT`＋`interpretation_guard`；3.7 起 <30 拒答、30–100 带警告（测试钉住阈值两端） |
-| 69 | 话题归档由 Harness 做、冻结分类法 | 代码强制 | 自动分类＋分类法校验＋WORK 级复用（大测试族） |
-| 70 | `library-confirm-topics` 唯一人工确认路径 | 代码强制 | 提案约束＋`HUMAN_CONFIRMED` 溯源＋改判拒绝（测试钉住） |
+| 69 | 话题归档由 Harness 做、冻结分类法 | 代码强制 | 自动分类＋分类法校验＋WORK 级复用（大测试族）；`library-import` 与下载路径走同一 `classify_after_ingest`，结果同一字段集（`test_library_import_topic_filing.py`） |
+| 70 | `library-confirm-topics` 唯一人工确认路径 | 代码强制 | 提案约束＋`HUMAN_CONFIRMED` 溯源＋改判拒绝（测试钉住）；门槛是 WORK 自身是否已有话题而非分类器重算结论，无话题 WORK 永不失联（`UnfiledWorkTests`） |
 | 71 | 写前记账、预算、`--allow-refetch` 范围 | 代码强制 | `fetch_ledger.py`（写前 attempt、15/天默认旋钮、2/篇不可调、pacing）；2.2 起 `--allow-refetch` 只豁免重复检查；conftest 结构性护栏使真实台账对测试不可达。本次审计已同步修正第 71 条散文（路径控制字符损坏、"25/天"过时、flag 范围过时） |
 
 ## 统计

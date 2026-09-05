@@ -13,9 +13,13 @@ in step.  What it adds is provenance, because a topic a human settled and a
 topic a classifier inferred should not look identical in the catalog.
 
 Confirmation is deliberately narrow.  Only topics this work's own classification
-proposed may be confirmed, so a lower-tier Agent cannot invent a label; the
-frozen taxonomy is re-checked regardless; and confirming a second, different set
-fails closed rather than quietly editing what was already settled.
+raised may be confirmed -- what it proposed, and for a WORK that was archived
+without ever being filed, what it would have assigned -- so a lower-tier Agent
+cannot invent a label; the frozen taxonomy is re-checked regardless; and
+confirming a second, different set fails closed rather than quietly editing what
+was already settled.  The gate is the WORK's own state (does it carry a topic?),
+never the classifier's regenerated verdict: a WORK that carries nothing is
+awaiting a filing whatever the classifier now thinks of it.
 """
 
 from __future__ import annotations

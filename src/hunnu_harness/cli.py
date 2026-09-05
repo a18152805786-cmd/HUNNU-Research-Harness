@@ -71,8 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     confirm_topics = sub.add_parser(
         "library-confirm-topics",
         help=(
-            "Confirm the topics a person chose for one WORK after classification "
-            "returned REVIEW_REQUIRED"
+            "Confirm the topics a person chose for one WORK that carries none yet: "
+            "after classification returned REVIEW_REQUIRED, or for a WORK that was "
+            "archived without being filed"
         ),
     )
     confirm_topics.add_argument("--paper-id", required=True)
@@ -81,7 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         metavar="DOMAIN" + chr(92) + "SUBTOPIC",
-        help="A proposed topic to confirm; repeat the flag to confirm several",
+        help=(
+            "A topic classification raised for this WORK, to confirm; repeat the "
+            "flag to confirm several"
+        ),
     )
     confirm_topics.add_argument(
         "--allow-taxonomy-override",
