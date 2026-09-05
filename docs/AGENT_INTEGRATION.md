@@ -1,4 +1,4 @@
-# Agent Integration and Global Routing (Harness v0.3.4; routing schema v0.2.9)
+# Agent Integration and Global Routing (Harness v0.3.5; routing schema v0.2.9)
 
 ## Purpose
 
