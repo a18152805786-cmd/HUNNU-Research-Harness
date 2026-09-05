@@ -139,6 +139,19 @@ class PostAcquisitionClassifier:
             self._taxonomy = self.store.taxonomy
         return self._taxonomy
 
+    @property
+    def output_root(self) -> Path:
+        """The Output Root that owns this classifier's catalog.
+
+        ``library/catalog/papers.jsonl`` sits three levels below it.  Derived
+        from the catalog for the same reason provenance is derived from the
+        store: redirecting the catalog to an isolated tree must redirect
+        everything that hangs off it, or the isolation is only partial and a
+        managed path resolves against the real corpus instead.
+        """
+
+        return _output_root_of(self.catalog_path)
+
     # -- reading ----------------------------------------------------------
 
     def _row_for(self, paper_id: str, rows: Mapping[str, WorkTopicRow]) -> WorkTopicRow | None:
@@ -156,7 +169,7 @@ class PostAcquisitionClassifier:
             title=str(catalog.get("title", UNKNOWN)),
             human_readable_name=str(catalog.get("human_readable_name", ""))
             or _readable_name(catalog, paper_id, managed),
-            canonical_path=_absolute_managed(managed),
+            canonical_path=_absolute_managed(managed, output_root=self.output_root),
             canonical_sha256=str(catalog.get("sha256", "")),
         )
 
@@ -302,18 +315,27 @@ class PostAcquisitionClassifier:
         *,
         allow_taxonomy_override: bool = False,
     ) -> ConfirmationResult:
-        """Record the topics a person chose after REVIEW_REQUIRED.
+        """Record the topics a person chose for a WORK that carries none.
 
-        This decides nothing.  It checks that the work is genuinely awaiting
-        review, that every chosen topic was actually proposed for *this* work,
-        and that the frozen taxonomy still recognises it -- then writes through
-        the same path automatic classification uses, and records who settled it.
+        This decides nothing.  It checks that the work is genuinely unfiled,
+        that every chosen topic was actually raised by classification for
+        *this* work, and that the frozen taxonomy still recognises it -- then
+        writes through the same path automatic classification uses, and
+        records who settled it.
 
         Proposals are regenerated rather than read back: classification is a
         pure function of the work's own text, so re-running it yields the same
-        candidates, and it doubles as the check that the work is still in
-        review.  Confirming a different set later fails closed; changing a
-        settled assignment is a reclassification, not a confirmation.
+        candidates.  What it raised is the confirmable set, whatever status it
+        attaches -- the proposals of a ``REVIEW_REQUIRED`` result, and equally
+        the assigned and proposed topics of a ``CLASSIFIED`` result that was
+        never applied.  The second case is real: a WORK archived through a
+        path that ran no classification carries nothing, and the classifier's
+        confidence about it is not a filing.  Gating on the regenerated status
+        instead of on the WORK's own state refused exactly those works as "not
+        awaiting review", which left them with no sanctioned way to be filed.
+
+        Confirming a different set later fails closed; changing a settled
+        assignment is a reclassification, not a confirmation.
         """
 
         selected = _labels_from(topics)
@@ -331,28 +353,21 @@ class PostAcquisitionClassifier:
             return self._already_settled(paper_id, existing, selected)
 
         outcome = self.classifier.classify(self._build_input(row))
-        if outcome.status is not ClassificationStatus.REVIEW_REQUIRED:
-            return ConfirmationResult(
-                paper_id=paper_id,
-                status=ConfirmationStatus.NOT_REVIEW_REQUIRED,
-                original_classification_status=outcome.status.value,
-                reason="Classification does not currently ask for review of this WORK",
-            )
-
-        proposed = outcome.proposed_labels
-        if not proposed:
+        original_status = outcome.status.value
+        raised = _unique_labels((*outcome.assigned_labels, *outcome.proposed_labels))
+        if not raised:
             return ConfirmationResult(
                 paper_id=paper_id,
                 status=ConfirmationStatus.NO_CONFIRMABLE_PROPOSALS,
-                original_classification_status=outcome.status.value,
+                original_classification_status=original_status,
                 reason="Nothing was proposed for this WORK; it needs taxonomy review, not confirmation",
             )
         if not selected:
             return ConfirmationResult(
                 paper_id=paper_id,
                 status=ConfirmationStatus.EMPTY_SELECTION,
-                proposed_topics=proposed,
-                original_classification_status=outcome.status.value,
+                proposed_topics=raised,
+                original_classification_status=original_status,
                 reason="No topic was selected",
             )
 
@@ -362,24 +377,25 @@ class PostAcquisitionClassifier:
             return ConfirmationResult(
                 paper_id=paper_id,
                 status=ConfirmationStatus.UNKNOWN_TOPIC,
-                proposed_topics=proposed,
-                original_classification_status=outcome.status.value,
+                proposed_topics=raised,
+                original_classification_status=original_status,
                 reason=str(exc),
             )
 
-        unproposed = [label.label for label in selected if label.label not in set(proposed)]
+        unproposed = [label.label for label in selected if label.label not in set(raised)]
         if unproposed and not allow_taxonomy_override:
             return ConfirmationResult(
                 paper_id=paper_id,
                 status=ConfirmationStatus.SELECTED_TOPIC_NOT_PROPOSED,
-                proposed_topics=proposed,
-                original_classification_status=outcome.status.value,
+                proposed_topics=raised,
+                original_classification_status=original_status,
                 reason=(
                     "Not proposed for this WORK: "
                     + ", ".join(sorted(unproposed))
                     + ". Pass the override flag to confirm a taxonomy topic that was not proposed."
                 ),
             )
+        proposed = raised
 
         # Provenance is part of the confirmation, not a footnote to it, so prove
         # it can be written before the canonical write happens.  Failing the
@@ -393,7 +409,7 @@ class PostAcquisitionClassifier:
                 paper_id=paper_id,
                 status=ConfirmationStatus.FAILED_SAFE,
                 proposed_topics=proposed,
-                original_classification_status=outcome.status.value,
+                original_classification_status=original_status,
                 reason=f"Provenance is not writable, nothing was changed: {exc}",
             )
 
@@ -401,7 +417,7 @@ class PostAcquisitionClassifier:
             paper_id,
             selected,
             proposed=proposed,
-            original_status=outcome.status.value,
+            original_status=original_status,
         )
         applied, apply_outcome = self.apply_classification(paper_id, result=confirmed)
         written = tuple(label.label for label in self.store.topics_for(paper_id))
@@ -411,7 +427,7 @@ class PostAcquisitionClassifier:
                 status=ConfirmationStatus.FAILED_SAFE,
                 confirmed_topics=written,
                 proposed_topics=proposed,
-                original_classification_status=outcome.status.value,
+                original_classification_status=original_status,
                 reason=f"Canonical apply did not complete cleanly: {apply_outcome.reason}",
             )
 
@@ -419,7 +435,7 @@ class PostAcquisitionClassifier:
             paper_id=paper_id,
             topics=written,
             source=AssignmentSource.HUMAN_CONFIRMED,
-            classification_status_before=outcome.status.value,
+            classification_status_before=original_status,
             proposed_topics=proposed,
             human_override=bool(unproposed),
         )
@@ -429,7 +445,7 @@ class PostAcquisitionClassifier:
             confirmed_topics=written,
             proposed_topics=proposed,
             assignment_source=AssignmentSource.HUMAN_CONFIRMED.value,
-            original_classification_status=outcome.status.value,
+            original_classification_status=original_status,
             topic_metadata_updated=apply_outcome.topic_metadata_updated,
             topic_view_updated=apply_outcome.topic_view_updated,
             pdf_copies_created=apply_outcome.pdf_copies_created,
@@ -505,7 +521,12 @@ class PostAcquisitionClassifier:
         status = IndexStatus.ABSENT.value
         detail = UNKNOWN
         try:
-            snapshot = CatalogReader().load()
+            # The catalog this classifier is bound to, not the default one:
+            # an isolated library must report its own readiness, and the real
+            # one resolves to the same files either way.
+            snapshot = CatalogReader(
+                catalog_path=self.catalog_path, topics_path=self.store.jsonl_path
+            ).load()
             metadata_ready = any(work.paper_id == paper_id for work in snapshot.works)
             topic_ready = bool(self.store.topics_for(paper_id))
         except Exception as exc:
@@ -606,8 +627,17 @@ def _provenance_beside(store: TopicStore) -> Path:
     return catalog.parent.parent / Path(TOPIC_PROVENANCE_PATH).name
 
 
-def _absolute_managed(value: str) -> str:
-    """Resolve a catalog managed path against the Output Root.
+def _output_root_of(catalog_path: Path) -> Path:
+    """The Output Root a ``library/catalog/papers.jsonl`` path belongs to."""
+
+    parents = Path(catalog_path).parents
+    if len(parents) > 2:
+        return _logical_path(parents[2])
+    return _logical_path(OUTPUT_ROOT)
+
+
+def _absolute_managed(value: str, *, output_root: Path) -> str:
+    """Resolve a catalog managed path against the Output Root that owns it.
 
     The catalog stores managed paths Output-Root-relative (AGENTS.md 54).
     Treating one as absolute leaves a path that does not exist, and the view
@@ -620,7 +650,13 @@ def _absolute_managed(value: str) -> str:
     candidate = Path(value)
     if candidate.is_absolute():
         return str(candidate)
-    return str(_logical_path(OUTPUT_ROOT / candidate))
+    return str(_logical_path(output_root / candidate))
+
+
+def _unique_labels(values: Sequence[str]) -> tuple[str, ...]:
+    """Topic labels in first-seen order, each once."""
+
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def _readable_name(catalog: Mapping[str, Any], paper_id: str, managed: str) -> str:

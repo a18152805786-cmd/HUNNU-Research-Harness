@@ -247,6 +247,118 @@ class RejectionTests(unittest.TestCase):
             )
 
 
+def _unfiled_confident_work(fixture: _Fixture, paper_id: str = "PU") -> tuple[str, ...]:
+    """A WORK the classifier would file, that nobody ever filed.
+
+    This is the state a manual import used to leave behind: a catalog record,
+    no topic row, and a regenerated verdict of CLASSIFIED.  Returns what the
+    classifier raises for it -- assigned first, then proposed.
+    """
+
+    fixture.add_work(paper_id, "AI漂洗与企业信息披露", keywords="AI漂洗")
+    result = fixture.service().classify_work(paper_id)
+    assert result.is_classified, result.status
+    assert fixture.store.topics_for(paper_id) == ()
+    return tuple(dict.fromkeys((*result.assigned_labels, *result.proposed_labels)))
+
+
+class UnfiledWorkTests(unittest.TestCase):
+    """A WORK carrying no topic is reachable whatever the classifier now says.
+
+    The concrete case: a paper imported by hand through ``library-import``,
+    never classified, then refused by confirmation as ``NOT_REVIEW_REQUIRED``
+    because the *regenerated* verdict was ``CLASSIFIED`` -- "classified", with
+    nothing filed and no sanctioned command able to file it.  The gate is the
+    WORK's state, not the classifier's opinion of it.
+    """
+
+    def setUp(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    def test_a_confident_unfiled_work_is_no_longer_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cfm-unfiled-", dir=TEMP_DIR) as tmp:
+            fixture = _Fixture(Path(tmp))
+            raised = _unfiled_confident_work(fixture)
+            self.assertIn(AI_WASHING, raised)
+
+            result = fixture.service().confirm_topics("PU", [AI_WASHING])
+
+            self.assertEqual(result.status, ConfirmationStatus.CONFIRMED)
+            self.assertEqual(result.original_classification_status, "CLASSIFIED")
+            self.assertEqual(
+                [label.label for label in fixture.store.topics_for("PU")], [AI_WASHING]
+            )
+
+    def test_the_record_says_a_person_settled_what_the_classifier_had_assigned(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cfm-unfiled-prov-", dir=TEMP_DIR) as tmp:
+            fixture = _Fixture(Path(tmp))
+            raised = _unfiled_confident_work(fixture)
+            fixture.service().confirm_topics("PU", [AI_WASHING])
+
+            entry = fixture.provenance.latest_for("PU")
+            self.assertEqual(entry["assignment_source"], AssignmentSource.HUMAN_CONFIRMED.value)
+            self.assertEqual(entry["classification_status_before"], "CLASSIFIED")
+            self.assertEqual(set(entry["proposed_topics"]), set(raised))
+            self.assertFalse(entry["human_override"])
+
+    def test_everything_the_classifier_raised_is_confirmable_without_override(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cfm-unfiled-all-", dir=TEMP_DIR) as tmp:
+            fixture = _Fixture(Path(tmp))
+            raised = _unfiled_confident_work(fixture)
+            self.assertGreaterEqual(len(raised), 2, raised)
+
+            result = fixture.service().confirm_topics("PU", list(raised))
+
+            self.assertEqual(result.status, ConfirmationStatus.CONFIRMED)
+            self.assertFalse(result.human_override)
+            self.assertEqual(set(result.confirmed_topics), set(raised))
+
+    def test_a_refusal_lists_what_was_raised_instead_of_an_empty_proposal_list(self) -> None:
+        """The old refusal came back with ``ProposedTopics: []`` for a WORK the
+        classifier had in fact placed -- the operator was told nothing was
+        proposed for a paper that had a confident primary."""
+
+        with tempfile.TemporaryDirectory(prefix="cfm-unfiled-list-", dir=TEMP_DIR) as tmp:
+            fixture = _Fixture(Path(tmp))
+            raised = _unfiled_confident_work(fixture)
+            self.assertNotIn(GREEN, raised)
+
+            result = fixture.service().confirm_topics("PU", [GREEN])
+
+            self.assertEqual(result.status, ConfirmationStatus.SELECTED_TOPIC_NOT_PROPOSED)
+            self.assertEqual(set(result.proposed_topics), set(raised))
+            self.assertEqual(result.original_classification_status, "CLASSIFIED")
+            self.assertEqual(fixture.store.topics_for("PU"), ())
+
+    def test_a_topic_the_classifier_did_not_raise_still_needs_the_override(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cfm-unfiled-ovr-", dir=TEMP_DIR) as tmp:
+            fixture = _Fixture(Path(tmp))
+            _unfiled_confident_work(fixture)
+
+            result = fixture.service().confirm_topics(
+                "PU", [GREEN], allow_taxonomy_override=True
+            )
+
+            self.assertEqual(result.status, ConfirmationStatus.CONFIRMED)
+            self.assertTrue(result.human_override)
+            self.assertEqual(
+                [label.label for label in fixture.store.topics_for("PU")], [GREEN]
+            )
+
+    def test_not_review_required_now_means_only_that_the_work_carries_topics(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cfm-unfiled-settled-", dir=TEMP_DIR) as tmp:
+            fixture = _Fixture(Path(tmp))
+            _unfiled_confident_work(fixture)
+            service = fixture.service()
+            auto, _ = service.classify_after_ingest("PU", disposition="NEW_PAPER")
+            self.assertTrue(auto.applied)
+
+            result = service.confirm_topics("PU", [AI_WASHING])
+
+            self.assertEqual(result.status, ConfirmationStatus.NOT_REVIEW_REQUIRED)
+            self.assertEqual(result.assignment_source, AssignmentSource.AUTO_CLASSIFIED.value)
+
+
 class IdempotencyAndConflictTests(unittest.TestCase):
     def setUp(self) -> None:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)

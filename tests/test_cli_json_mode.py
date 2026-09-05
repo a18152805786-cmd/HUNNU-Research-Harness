@@ -71,10 +71,14 @@ class JsonStdoutTests(unittest.TestCase):
 
     def test_browser_status_json_is_one_parseable_document(self) -> None:
         fake_status = SimpleNamespace(as_dict=lambda: {"Running": False, "Endpoint": ""})
-        with patch("hunnu_harness.browser.persistent_browser.probe", return_value=fake_status):
+        with patch("hunnu_harness.browser.persistent_browser.probe", return_value=fake_status), patch(
+            "hunnu_harness.browser.persistent_browser.profile_in_use", return_value=False
+        ):
             code, out, _err = self._run(["browser-status", "--json"])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out)["Running"], False)
+        payload = json.loads(out)
+        self.assertEqual(payload["Running"], False)
+        self.assertIs(payload["ProfileInUse"], False)
 
 
 class LiveJsonModeTests(unittest.TestCase):

@@ -26,7 +26,10 @@ from hunnu_harness.browser.browser_directed_download import (
     ELSEVIER_PDF_HOSTS,
     BrowserDirectedDownload,
     DirectedDownloadFailure,
+    _Pending,
     _host_is_allowed,
+    _matching_declared_label,
+    _normalize_declared_identity,
     host_of,
     lease_for,
     pii_from_url,
@@ -60,6 +63,14 @@ CNKI_TITLE = "数字化转型与企业分工：专业化还是纵向一体化"
 CNKI_AUTHOR = "袁淳"
 CNKI_DECLARED_FILENAME = f"{CNKI_TITLE}_{CNKI_AUTHOR}.pdf"
 CNKI_OPAQUE_DELIVERY_URL = "https://download.cnki.net/final/paper?token=opaque"
+# Verified live on 2026-09-05: the CNKI record title, and the filename Chrome
+# actually wrote for it.  They differ in exactly one character -- the subtitle
+# colon, which Windows forbids in a filename and Chrome rewrote as "_".  The
+# file was complete and valid; the run reported DOWNLOAD_EVENT_TIMEOUT, and the
+# operator, believing it, spent a second fetch on the same paper.
+CNKI_COLON_TITLE = "总贸易核算法:官方贸易统计与全球价值链的度量"
+CNKI_COLON_FILENAME = "总贸易核算法_官方贸易统计与全球价值链的度量_王直.pdf"
+CNKI_DOCDOWN_URL = "https://docdown.cnki.net/downloadfile?token=opaque"
 PDF_BYTES = b"%PDF-1.7\n" + b"x" * 4096 + b"\n%%EOF\n"
 
 
@@ -322,6 +333,61 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(result.source_pii, label)
             self.assertEqual(result.path.name, filename)
 
+    def test_declared_title_survives_chromes_windows_filename_sanitization(self) -> None:
+        """The live 2026-09-05 case: ':' in the title, '_' on disk, same paper.
+
+        This failing means a subtitle colon -- routine in Chinese academic
+        titles -- again turns a completed CNKI download into a reported
+        timeout, and the operator retries a fetch that already succeeded.
+        """
+
+        self.assertEqual(pii_from_url(CNKI_DOCDOWN_URL), "")
+        with temp_root("bdd-colon-title-") as tmp:
+            fixture = _Fixture(
+                Path(tmp),
+                locked=CNKI_ORDER_ID,
+                locked_labels=(CNKI_COLON_TITLE,),
+            )
+
+            async def script(f):
+                f.session.emit(
+                    "Browser.downloadWillBegin",
+                    begin(url=CNKI_DOCDOWN_URL, filename=CNKI_COLON_FILENAME),
+                )
+                f.land(CNKI_COLON_FILENAME)
+                f.session.emit("Browser.downloadProgress", progress())
+
+            result = run(fixture, script)
+
+            self.assertEqual(result.source_pii, CNKI_COLON_TITLE)
+            self.assertEqual(result.source_url_host, "docdown.cnki.net")
+            self.assertEqual(result.path.name, CNKI_COLON_FILENAME)
+
+    def test_a_latin_title_with_forbidden_characters_is_still_claimed(self) -> None:
+        """Chrome rewrites ':' and '?' as '_' and keeps the spaces around them."""
+
+        label = "Trade in Value Added: What Does It Measure?"
+        filename = "Trade in Value Added_ What Does It Measure__Koopman.pdf"
+        with temp_root("bdd-latin-colon-") as tmp:
+            fixture = _Fixture(
+                Path(tmp),
+                locked=CNKI_ORDER_ID,
+                locked_labels=(label,),
+            )
+
+            async def script(f):
+                f.session.emit(
+                    "Browser.downloadWillBegin",
+                    begin(url=CNKI_OPAQUE_DELIVERY_URL, filename=filename),
+                )
+                f.land(filename)
+                f.session.emit("Browser.downloadProgress", progress())
+
+            result = run(fixture, script)
+
+            self.assertEqual(result.source_pii, label)
+            self.assertEqual(result.path.name, filename)
+
     def test_the_browser_is_pointed_at_this_run(self) -> None:
         with temp_root("bdd-dir-") as tmp:
             fixture = _Fixture(Path(tmp))
@@ -348,6 +414,56 @@ class AcceptanceTests(unittest.TestCase):
             run(fixture, script)
             self.assertEqual(fixture.session.behaviours, ["allow", "default"])
             self.assertFalse(fixture.directed.configured)
+
+
+class DeclaredLabelNormalizationTests(unittest.TestCase):
+    """A declared label and the filename Chrome wrote from it must fold together.
+
+    Chrome replaces every character Windows forbids in a filename with "_"
+    before it writes the download; other platforms substitute differently and a
+    publisher may have dropped or replaced punctuation of its own.  The
+    comparison therefore keeps only what survives that trip: letters, marks and
+    digits.
+    """
+
+    # The characters Windows forbids and Chrome rewrites, plus a control char.
+    REWRITTEN = tuple(':/\\?*"<>|') + ("\x1f",)
+
+    def test_every_character_chrome_rewrites_folds_with_its_replacement(self) -> None:
+        for forbidden in self.REWRITTEN:
+            with self.subTest(character=repr(forbidden)):
+                original = _normalize_declared_identity(f"trade{forbidden}value")
+                self.assertEqual(original, _normalize_declared_identity("trade_value"))
+                self.assertEqual(original, _normalize_declared_identity("trade-value"))
+                self.assertEqual(original, _normalize_declared_identity("trade value"))
+                self.assertEqual(original, "tradevalue")
+
+    def test_an_underscore_is_not_a_word_character_here(self) -> None:
+        r"""The trap: to ``\w`` an underscore is a word character, so a strip
+        built on ``\W`` keeps the "_" Chrome wrote while removing the ":" it
+        replaced, and the two strings still differ.  This failing means that
+        strip is back."""
+
+        self.assertEqual(
+            _normalize_declared_identity(CNKI_COLON_TITLE),
+            _normalize_declared_identity("总贸易核算法_官方贸易统计与全球价值链的度量"),
+        )
+        self.assertNotIn("_", _normalize_declared_identity("a_b"))
+
+    def test_letters_marks_and_digits_are_what_is_compared(self) -> None:
+        self.assertEqual(_normalize_declared_identity("Tiếng Việt, 2!"), "tiếngviệt2")
+        self.assertEqual(_normalize_declared_identity("数字化转型：专业化"), "数字化转型专业化")
+        # NFKC still folds a full-width digit or letter with its ASCII form.
+        self.assertEqual(_normalize_declared_identity("ＡＢＣ１２３"), "abc123")
+
+    def test_a_label_of_punctuation_alone_cannot_claim_anything(self) -> None:
+        """Folding punctuation away must not weaken the length floor."""
+
+        pending = _Pending(
+            guid="g", url=CNKI_DOCDOWN_URL, suggested_filename="?!?!?!_author.pdf"
+        )
+        self.assertEqual(_matching_declared_label(pending, ("?!?!?!",)), "")
+        self.assertEqual(_matching_declared_label(pending, ("总贸易:核算",)), "")
 
 
 class RejectionTests(unittest.TestCase):
@@ -473,6 +589,57 @@ class RejectionTests(unittest.TestCase):
             locked_labels=(short_label,),
         )
         self.assertIn("declared labels: 1", message)
+
+    def test_another_paper_sharing_words_with_the_title_is_still_refused(self) -> None:
+        """Folding punctuation must not turn the label check into a word search.
+
+        This failing means the guard now claims any download whose name
+        shares vocabulary with the target -- the ad or the other PDF on the
+        page that the check exists to refuse.
+        """
+
+        other = "全球价值链的度量与官方贸易统计的差异_张三.pdf"
+
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(url=CNKI_DOCDOWN_URL, filename=other),
+            )
+            f.land(other)
+            f.session.emit("Browser.downloadProgress", progress())
+
+        message = self._expect_failure(
+            "DOWNLOAD_EVENT_TIMEOUT",
+            script,
+            locked=CNKI_ORDER_ID,
+            locked_labels=(CNKI_COLON_TITLE,),
+        )
+        self.assertIn("other downloads seen: 1", message)
+
+    def test_the_timeout_names_the_download_it_did_not_claim(self) -> None:
+        """Rule 71: the first fetched file is the evidence, so say it exists.
+
+        The operator today read "started no download" while the PDF sat in the
+        staging directory, and retried.  The message must name what arrived.
+        """
+
+        other = "unrelated_paper_李四.pdf"
+
+        async def script(f):
+            f.session.emit(
+                "Browser.downloadWillBegin",
+                begin(url=CNKI_DOCDOWN_URL, filename=other),
+            )
+            f.land(other)
+            f.session.emit("Browser.downloadProgress", progress())
+
+        message = self._expect_failure(
+            "DOWNLOAD_EVENT_TIMEOUT",
+            script,
+            locked=CNKI_ORDER_ID,
+            locked_labels=(CNKI_COLON_TITLE,),
+        )
+        self.assertIn(other, message)
 
     def test_a_locked_suggested_filename_does_not_bypass_the_host_allowlist(self) -> None:
         untrusted = "https://evil.example/cdn/download?token=opaque"

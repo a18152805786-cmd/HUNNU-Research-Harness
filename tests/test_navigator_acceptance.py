@@ -28,6 +28,37 @@ from hunnu_harness.paths import (
 
 # The sealed audit numbers this corpus is frozen at.
 #
+# Resealed at 188/201/351 on 2026-09-05, from 187/200/349.  Three papers
+# entered the corpus today for the Fable5 Round 2 citation audit: Hummels,
+# Ishii and Yi (2001) and Koopman, Wang and Wei (2012) via ScienceDirect
+# (the 187/200/349 reseal below), and Wang, Wei and Zhu (2015, 中国社会科学)
+# via CNKI -- staged and imported through library-stage / library-import,
+# PA79EA6186D77.  That import left the WORK MANAGED with no topic at all:
+# the import path ran no classification, and library-confirm-topics refused
+# the WORK because its gate was the classifier's regenerated verdict
+# (CLASSIFIED) rather than the WORK's own state.  Both are fixed in this
+# commit; the WORK was then filed through library-confirm-topics under two
+# pre-existing topics (HUMAN_CONFIRMED, no override -- both were raised by
+# classification), so the topic count moves by exactly its two assignments,
+# the work and version counts by the one imported paper, and no new topic is
+# created.  The numbers are read from the library, and moving them here is a
+# deliberate acceptance of that acquisition -- per this file's own
+# instruction that changing them is a decision, not a way to get a green
+# suite.
+#
+# The 2026-09-05 ScienceDirect reseal and the 2026-09-01 reseal are preserved
+# below.
+#
+# Resealed at 187/200/349 on 2026-09-05, from 185/198/345.  Two papers were
+# acquired through the full chain for the Fable5 Round 2 citation audit --
+# Hummels, Ishii and Yi (2001) and Koopman, Wang and Wei (2012), both located
+# by DOI on ScienceDirect, downloaded by the harness itself, identity-checked
+# against the printed article front matter, and archived.  Both were filed
+# under topics the classifier had already proposed, so the topic count moves by
+# the four new assignments and no new topic is created.
+#
+# The 2026-09-01 reseal, 185/198/345 from 181/194/339, is preserved below.
+#
 # Resealed at 185/198/345 on 2026-09-01, from 181/194/339.  Four papers were
 # acquired through the full chain during the four-site live acceptance --
 # ScienceDirect, SpringerLink, CNKI, and Oxford Academic; each searched,
@@ -40,9 +71,9 @@ from hunnu_harness.paths import (
 #
 # Unique topics stays 39 on purpose: every acquisition was filed under a topic
 # that already existed, and nothing here may create a fortieth.
-EXPECTED_WORKS = 185
-EXPECTED_VERSIONS = 198
-EXPECTED_TOPIC_ASSIGNMENTS = 345
+EXPECTED_WORKS = 188
+EXPECTED_VERSIONS = 201
+EXPECTED_TOPIC_ASSIGNMENTS = 351
 EXPECTED_UNIQUE_TOPICS = 39
 
 # Known fixtures in the real corpus, verified during discovery.

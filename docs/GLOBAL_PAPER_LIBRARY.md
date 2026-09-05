@@ -80,7 +80,9 @@ Before PaperID generation, supplied metadata is treated as a claimed identity. T
 
 Expected classifications are `NEW_PAPER`, `EXACT_DUPLICATE`, `SAME_WORK_DIFFERENT_VERSION`, `IDENTITY_CONFLICT`, `INVALID_PDF`, `INSUFFICIENT_IDENTITY`, and `EXTERNAL_IDENTITY_UNVERIFIED`. Rejected/conflicting files remain in staging/review; the source and staged candidate are not removed.
 
-Python callers may use `ExternalPaperImporter.stage_pdf()` and `ExternalPaperImporter.import_staged_pdf()`. They must preserve the single-writer rule for `papers.jsonl`.
+4. Read the topic filing on the same result. Once the candidate is a managed WORK, the import runs the post-acquisition classification the download path runs (AGENTS.md 69) and reports it in the download manifest's field set: `ClassificationStatus`, `AssignedTopics`, `AssignedPrimaryTopic`, `AssignedSecondaryTopics`, `ProposedTopics`, `TopicReviewRequired`, `TopicMetadataUpdated`, `TopicViewUpdated`, `ClassificationReason`, and the split Navigator readiness. `CLASSIFIED` means the WORK is filed; `REVIEW_REQUIRED` means it is safely managed, carries no topic yet, and `ProposedTopics` is what `library-confirm-topics` will accept; `SKIPPED_EXISTING` means a further version reused the WORK's existing topics; `FAILED_SAFE` means classification could not run and the WORK still needs filing — the import itself succeeded. `TopicReviewRequired` is true exactly when the WORK still carries no topic. See [POST_ACQUISITION_CLASSIFICATION.md](POST_ACQUISITION_CLASSIFICATION.md).
+
+Python callers may use `ExternalPaperImporter.stage_pdf()` and `ExternalPaperImporter.import_staged_pdf()`. They must preserve the single-writer rule for `papers.jsonl`. An importer built for the real Library attaches the classifier by default; one built for any other root gets none and reports `ClassificationStatus: NOT_ATTEMPTED`, so an isolated tree never reaches the frozen taxonomy or the shared topic store.
 
 ## Atomicity and recovery
 
