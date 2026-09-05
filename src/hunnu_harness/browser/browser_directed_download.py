@@ -174,8 +174,31 @@ def _suggested_filename_identity(suggested_filename: str) -> str:
 
 
 def _normalize_declared_identity(value: str) -> str:
+    """Reduce a declared label, or a filename stem, to what a filename keeps.
+
+    Chrome names a download after the publisher's suggestion and then rewrites
+    every character Windows forbids in a filename -- ``: / \\ ? * " < > |`` and
+    control characters -- as ``_`` before it writes the file; other platforms
+    substitute differently, and a publisher may have dropped or replaced
+    punctuation of its own before the browser saw the name.  A subtitle colon,
+    routine in Chinese academic titles, is therefore ``:`` in the record and
+    ``_`` on disk, and a comparison that keeps punctuation fails on that one
+    character while every other one agrees.  That is how a complete, valid
+    CNKI PDF came to be reported as no download at all.
+
+    Letters, digits and combining marks are what survive the trip unchanged,
+    so they are all that is compared: NFKC first, so a full-width colon or
+    digit folds with its ASCII form; casefold; then everything outside the
+    Unicode categories L, M and N is dropped from both sides.  The category
+    test is deliberate -- to ``\\w`` an underscore is a word character, so a
+    strip built on ``\\W`` keeps the ``_`` Chrome wrote while removing the
+    ``:`` it replaced, and the two strings still differ.
+    """
+
     normalized = unicodedata.normalize("NFKC", value).casefold()
-    return re.sub(r"\s+", "", normalized)
+    return "".join(
+        char for char in normalized if unicodedata.category(char)[0] in "LMN"
+    )
 
 
 def _matching_declared_label(
@@ -392,10 +415,24 @@ class BrowserDirectedDownload:
                 asyncio.shield(self._target), timeout=self.will_begin_timeout
             )
         except (asyncio.TimeoutError, TimeoutError) as exc:
-            others = [p.url for p in self._pending.values()]
-            detail = (
-                f"; other downloads seen: {len(others)}" if others else ""
-            )
+            # Name what did arrive.  A download this guard declined to claim
+            # is still bytes in the run directory, and an operator reading
+            # "started no download" while the PDF sits there will spend a
+            # second fetch on it -- the very thing the fetch budget exists to
+            # prevent.  Filenames only: a delivery URL can carry a signed
+            # token, which has no business in a report.
+            unclaimed = [
+                Path(p.suggested_filename).name or "<unnamed>"
+                for p in self._pending.values()
+            ]
+            detail = ""
+            if unclaimed:
+                shown = ", ".join(repr(name) for name in unclaimed[:3])
+                more = f", +{len(unclaimed) - 3} more" if len(unclaimed) > 3 else ""
+                detail = (
+                    f"; other downloads seen: {len(unclaimed)}; "
+                    f"not claimed for this target: {shown}{more}"
+                )
             raise DirectedDownloadFailure(
                 f"{DirectedDownloadOutcome.DOWNLOAD_EVENT_TIMEOUT.value}: the authorized "
                 f"control started no download naming PII {self.locked_pii}; "
