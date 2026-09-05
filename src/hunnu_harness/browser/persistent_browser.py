@@ -7,19 +7,34 @@ command is its own process that launched Chrome, worked, and closed it in a
 each later run arrived as an anonymous off-campus visitor, which is what the
 publisher's bot gate was reacting to.
 
-Chrome's own "continue where you left off" preference does not fix this: it was
-measured, and Playwright's ``launch_persistent_context`` does not start Chrome
-through the session-restore path, so the session cookies are still dropped.
+What works while the browser is up is not restarting it at all.  Chrome is
+started here as a detached operating-system process holding a debugging port,
+and later runs attach to it over CDP rather than launching their own.  The
+session stays in that browser's memory, exactly as it does in a browser a
+person leaves open, and nothing resembling a credential is ever written
+anywhere new.
 
-What does work is not restarting the browser at all.  Chrome is started here as
-a detached operating-system process holding a debugging port, and later runs
-attach to it over CDP rather than launching their own.  The session stays in
-that browser's memory, exactly as it does in a browser a person leaves open, and
-nothing resembling a credential is ever written anywhere new.
+Across a stop and a start, the sign-in survives only if Chrome comes back
+through its session-restore path: session cookies are always persisted to the
+profile, but at startup Chrome deletes them unless it is continuing the
+previous session (or recovering from a crash).  Editing the profile's
+``session.restore_on_startup`` preference was measured not to achieve this,
+and the signature of that failure names the cause: the edit verified at once
+and the whole ``session`` object came back empty after one graceful lifecycle,
+while the sibling ``plugins.always_open_pdf_externally`` edit survived.  On
+Windows that key is one of Chrome's tracked preferences, kept in ``Secure
+Preferences`` behind a machine-bound MAC, and at the next start Chrome
+migrates any copy found in ``Preferences`` out of that file.  The Harness
+cannot produce that MAC and must not try.  So the browser is started with
+``--restore-last-session`` instead, Chrome's own switch for "continue where
+you left off": it overrides the preference, needs no edit to the profile, and
+is visible on the process command line.
 
 The port is opened only when someone explicitly starts this browser.  Ordinary
 runs attach if it happens to be there and otherwise launch a private browser as
-before, so the Harness never opens a debugging port on its own initiative.
+before -- with the same switch, so a run on the shared profile does not delete
+the cookies the persistent browser saved -- and the Harness never opens a
+debugging port on its own initiative.
 """
 
 from __future__ import annotations
@@ -43,6 +58,12 @@ from ..paths import _logical_path, _windows_io_path
 DEFAULT_RESEARCH_DEBUG_PORT = 9333
 RESEARCH_DEBUG_PORT_ENV = "HUNNU_RESEARCH_DEBUG_PORT"
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
+# Chrome's own switch for "continue where you left off".  It overrides the
+# session.restore_on_startup preference -- the one the Harness cannot set on
+# Windows, where that key is tracked, MAC-protected and migrated out of the
+# Preferences file at the next start -- and makes Chrome restore the previous
+# session's cookies instead of deleting them at startup.
+SESSION_RESTORE_SWITCH = "--restore-last-session"
 # How long a stop waits for Chrome to leave after being asked.  A graceful
 # exit writes the session and the Preferences file first, and the child
 # processes go a moment after the debugging port does.
@@ -80,6 +101,10 @@ class PersistentBrowserStatus:
     port: int
     browser_version: str = ""
     profile_dir: str = ""
+    # True when this call started the browser with the session-restore
+    # switch, False when it started it without, None when the browser was
+    # already running -- its command line is not this call's to know.
+    session_restore: bool | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -88,6 +113,9 @@ class PersistentBrowserStatus:
             "PersistentBrowserPort": self.port,
             "PersistentBrowserVersion": self.browser_version,
             "PersistentBrowserProfile": self.profile_dir,
+            "PersistentBrowserSessionRestore": (
+                "unknown" if self.session_restore is None else self.session_restore
+            ),
         }
 
 
@@ -133,12 +161,19 @@ def start_persistent_browser(
     port: int | None = None,
     startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS,
     spawn: object = None,
+    restore_last_session: bool = True,
 ) -> PersistentBrowserStatus:
     """Start the dedicated browser, or report the one already running.
 
     Deliberately not idempotent by force: an already-running browser is returned
     untouched rather than restarted, because restarting it would throw away the
     signed-in session this exists to keep.
+
+    ``restore_last_session`` passes Chrome's ``--restore-last-session`` so the
+    previous session's cookies -- the institutional sign-in -- are restored
+    rather than deleted at startup.  On by default because keeping that
+    sign-in is what this browser is for; off only for a deliberately fresh
+    start.
     """
 
     resolved_port = research_debug_port() if port is None else port
@@ -165,8 +200,10 @@ def start_persistent_browser(
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
-        "about:blank",
     ]
+    if restore_last_session:
+        command.append(SESSION_RESTORE_SWITCH)
+    command.append("about:blank")
     (spawn or _spawn_detached)(command)
 
     deadline = time.monotonic() + startup_timeout_seconds
@@ -179,6 +216,7 @@ def start_persistent_browser(
                 port=status.port,
                 browser_version=status.browser_version,
                 profile_dir=str(profile),
+                session_restore=restore_last_session,
             )
         time.sleep(0.25)
     raise PersistentBrowserError(
@@ -398,6 +436,7 @@ __all__ = [
     "PersistentBrowserStatus",
     "PersistentBrowserStopResult",
     "RESEARCH_DEBUG_PORT_ENV",
+    "SESSION_RESTORE_SWITCH",
     "endpoint_for",
     "probe",
     "profile_in_use",

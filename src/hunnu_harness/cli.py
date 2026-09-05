@@ -140,8 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
     session_restore = sub.add_parser(
         "browser-configure-session-restore",
         help=(
-            "Let an institutional sign-in survive closing the dedicated Research "
-            "Chrome profile, so later runs are not anonymous"
+            "Report how an institutional sign-in survives closing the dedicated "
+            "Research Chrome: browser-start passes --restore-last-session, and "
+            "nothing in the profile is edited"
         ),
     )
     session_restore.add_argument(
@@ -350,16 +351,38 @@ def main(argv: list[str] | None = None) -> int:
         _audit_report(args, result.as_dict()).flush()
         return 0 if result.ok else 2
     if args.command == "browser-configure-session-restore":
-        try:
-            audit = ResearchChromePdfPreference(args.profile).configure_session_restore()
-        except ResearchChromePreferenceError as exc:
-            report = CliReport(bool(getattr(args, "json", False)))
-            report.put("SessionRestoreConfigured", False, plain="false")
-            report.put("Reason", str(exc))
-            report.flush()
-            return 2
-        report = _audit_report(args, audit.as_dict())
+        from .browser.persistent_browser import SESSION_RESTORE_SWITCH, probe
+
+        # Nothing to edit.  Session restore is a launch property of the
+        # dedicated browser: browser-start passes Chrome's own switch, which
+        # overrides the restore_on_startup preference.  The Preferences edit
+        # this command used to make was migrated out of the file by Chrome at
+        # the next start (on Windows the key is tracked and MAC-protected),
+        # so it reported "configured" for a setting that never took.  The
+        # command stays so a runbook that calls it gets the truth, not an
+        # unknown-command error.
+        running = probe().running
+        report = CliReport(bool(getattr(args, "json", False)))
         report.put("SessionRestoreConfigured", True, plain="true")
+        report.put("SessionRestoreMechanism", "LAUNCH_SWITCH")
+        report.put("SessionRestoreSwitch", SESSION_RESTORE_SWITCH)
+        report.put("PreferencesEdited", False, plain="false")
+        report.put("ResearchProfile", str(args.profile))
+        report.put("PersistentBrowserRunning", running, plain=_bool_plain(running))
+        report.note(
+            f"browser-start launches the dedicated Research Chrome with {SESSION_RESTORE_SWITCH}, "
+            "Chrome's own 'continue where you left off', so the previous session's cookies are "
+            "restored rather than deleted at startup. Nothing in the profile is edited: the "
+            "restore_on_startup preference is protected by Chrome on Windows and an edit there "
+            "is migrated away at the next start."
+        )
+        if running:
+            report.note(
+                "A persistent Research Chrome is running. If it was started by a Harness "
+                "version without this switch, run browser-stop and then browser-start to "
+                "relaunch it with the switch; a sign-in made in the current browser is "
+                "kept only across a graceful stop."
+            )
         report.flush()
         return 0
     if args.command == "capabilities":

@@ -170,7 +170,7 @@ class PlaywrightBrowser:
         # fresh browser: it is holding the institutional session, and launching
         # a second browser on the same profile would both fail on the lock and
         # start out signed in to nothing.
-        from .persistent_browser import probe
+        from .persistent_browser import SESSION_RESTORE_SWITCH, probe
 
         persistent = probe()
         if persistent.running:
@@ -192,6 +192,13 @@ class PlaywrightBrowser:
             "headless": self.headless,
             "accept_downloads": True,
             "downloads_path": str(self.downloads_dir),
+            # This is the same profile the persistent browser saves its
+            # sign-in into.  Chrome deletes that profile's session cookies at
+            # startup unless it continues the previous session, so a run that
+            # launches its own browser here must ask for the same restore the
+            # persistent one gets, or it wipes the sign-in it was meant to
+            # reuse.
+            "args": [SESSION_RESTORE_SWITCH],
         }
         if self.executable_path:
             launch_args["executable_path"] = str(self.executable_path)

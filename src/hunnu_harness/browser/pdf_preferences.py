@@ -16,9 +16,17 @@ from ..paths import _logical_path, _windows_io_path
 
 PDF_DIRECT_DOWNLOAD_PREFERENCE = "plugins.always_open_pdf_externally"
 SESSION_RESTORE_PREFERENCE = "session.restore_on_startup"
-# Chrome keeps session cookies across a restart only under "continue where
-# you left off".  Under the default it drops them, which is why an
-# authenticated publisher session did not survive a single Harness run.
+# The value Chrome's Settings page writes for "continue where you left off",
+# under which session cookies survive a restart.  Read here for reporting
+# only; deliberately never written.  On Windows this key is one of Chrome's
+# tracked preferences: Chrome keeps it in Secure Preferences behind a
+# machine-bound MAC and, at the next start, migrates any copy found in
+# Preferences out of that file -- an edit here verified at once and the whole
+# "session" object was empty after one graceful lifecycle, while the untracked
+# PDF preference beside it survived.  The Harness cannot produce that MAC and
+# must not try.  The dedicated browser is started with --restore-last-session
+# instead (persistent_browser.SESSION_RESTORE_SWITCH), which overrides this
+# preference and needs no edit to the profile.
 SESSION_RESTORE_LAST_SESSION = 1
 DEFAULT_RESEARCH_CHROME_PROFILE = Path.home() / "ResearchHarness" / "chrome-profile"
 
@@ -168,41 +176,14 @@ class ResearchChromePdfPreference:
             detail = "in use" if in_use else "running-state check unavailable"
             raise ResearchChromeProfileInUse(f"Research Chrome profile is {detail}")
 
-    def configure_session_restore(self) -> PdfPreferenceAudit:
-        """Let an authenticated publisher session survive closing the browser.
-
-        The session cookies a publisher issues after institutional sign-in --
-        ``sd_session_id`` and friends -- have no expiry, so Chrome discards them
-        at startup unless the profile is set to continue where it left off.  The
-        Harness closes the browser at the end of every run, so without this the
-        sign-in cannot outlive one run and every later run arrives anonymous.
-
-        This is an ordinary Chrome setting, the one a person gets from the
-        Settings page.  It changes what the profile remembers, never how it
-        presents itself.
-        """
-
-        self._require_stopped()
-        previous = self.inspect_session_restore()
-        if previous == SESSION_RESTORE_LAST_SESSION:
-            return PdfPreferenceAudit(
-                preference_name=SESSION_RESTORE_PREFERENCE,
-                previous_value=previous,
-                new_value=SESSION_RESTORE_LAST_SESSION,
-            )
-        self._apply(
-            container="session",
-            key="restore_on_startup",
-            value=SESSION_RESTORE_LAST_SESSION,
-            literal=str(SESSION_RESTORE_LAST_SESSION),
-        )
-        if self.inspect_session_restore() != SESSION_RESTORE_LAST_SESSION:
-            raise ResearchChromePreferenceError("Session restore preference verification failed")
-        return PdfPreferenceAudit(
-            preference_name=SESSION_RESTORE_PREFERENCE,
-            previous_value=previous,
-            new_value=SESSION_RESTORE_LAST_SESSION,
-        )
+    # There is deliberately no configure_session_restore() here.  One existed,
+    # writing session.restore_on_startup into Preferences; it verified at once
+    # and Chrome migrated the key out of the file at the next start (see the
+    # note on SESSION_RESTORE_PREFERENCE above), so the command reported a
+    # setting that never took and the sign-in did not survive the lifecycle
+    # it was meant to survive.  Session restore is a launch property of the
+    # dedicated browser now: persistent_browser.start_persistent_browser
+    # passes Chrome's own --restore-last-session switch.
 
     def configure_direct_download(self) -> PdfPreferenceAudit:
         self._require_stopped()
