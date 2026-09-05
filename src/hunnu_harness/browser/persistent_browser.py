@@ -24,6 +24,7 @@ before, so the Harness never opens a debugging port on its own initiative.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -32,8 +33,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-from .pdf_preferences import DEFAULT_RESEARCH_CHROME_PROFILE
+from .pdf_preferences import DEFAULT_RESEARCH_CHROME_PROFILE, _default_profile_process_check
 from ..paths import _logical_path, _windows_io_path
 
 # Not Chrome's conventional 9222: a Harness browser should not silently adopt,
@@ -41,6 +43,11 @@ from ..paths import _logical_path, _windows_io_path
 DEFAULT_RESEARCH_DEBUG_PORT = 9333
 RESEARCH_DEBUG_PORT_ENV = "HUNNU_RESEARCH_DEBUG_PORT"
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
+# How long a stop waits for Chrome to leave after being asked.  A graceful
+# exit writes the session and the Preferences file first, and the child
+# processes go a moment after the debugging port does.
+DEFAULT_EXIT_TIMEOUT_SECONDS = 30.0
+_EXIT_POLL_SECONDS = 0.25
 
 
 class PersistentBrowserError(RuntimeError):
@@ -179,14 +186,222 @@ def start_persistent_browser(
     )
 
 
+def profile_in_use(profile_dir: Path | None = None) -> bool | None:
+    """Whether any Chrome process holds the profile; None when that is unknowable.
+
+    The debugging port answers for the browser this Harness started.  The
+    profile is a separate fact: a Chrome started by hand holds it without any
+    port, and after a stop the child processes let go of it a moment after the
+    port closes.  A preference edit or a fresh start needs the profile, not
+    the port, to be free.
+    """
+
+    profile = _logical_path(Path(profile_dir or DEFAULT_RESEARCH_CHROME_PROFILE).expanduser())
+    return _default_profile_process_check(profile)
+
+
+async def _close_over_cdp(endpoint: str) -> None:
+    """Ask the browser to exit the way its own close button would.
+
+    ``Browser.close`` is the protocol's graceful shutdown: Chrome saves its
+    session and rewrites Preferences with ``exit_type`` Normal on the way out,
+    which a hard kill of the process skips.  Playwright's ``Browser.close()``
+    on a browser it merely connected to is deliberately not that -- it clears
+    the contexts it created and disconnects -- and calling it here is how the
+    old command left Chrome running while reporting it stopped.
+    """
+
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.connect_over_cdp(endpoint)
+        try:
+            session = await browser.new_browser_cdp_session()
+            try:
+                await session.send("Browser.close")
+            except Exception:
+                # The browser leaving drops the connection under the request,
+                # which the driver may surface as an error.  Whether it left
+                # is answered by probing the port afterwards, not by this call.
+                pass
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+def _request_graceful_close(endpoint: str) -> None:
+    asyncio.run(_close_over_cdp(endpoint))
+
+
+@dataclass(frozen=True)
+class PersistentBrowserStopResult:
+    """What a stop can honestly say happened, fact by fact.
+
+    ``stopped`` is claimed only when the browser was asked to leave and then
+    did: the port went quiet and no Chrome process holds the profile any
+    more.  ``ok`` is the end state the operator wanted regardless of who
+    brought it about -- nothing listening and the profile free -- so that a
+    stop finding nothing to do can still say whether the next command can
+    proceed.  An unavailable process check is reported as unknown; it cannot
+    veto, because the port going quiet is real evidence and a missing check
+    is not evidence of anything.
+    """
+
+    endpoint: str
+    port: int
+    was_running: bool
+    close_requested: bool
+    running_after: bool
+    profile_in_use: bool | None
+    waited_seconds: float
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.running_after and self.profile_in_use is not True
+
+    @property
+    def stopped(self) -> bool:
+        return self.close_requested and self.ok
+
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "PersistentBrowserEndpoint": self.endpoint,
+            "PersistentBrowserPort": self.port,
+            "PersistentBrowserWasRunning": self.was_running,
+            "BrowserCloseRequested": self.close_requested,
+            "PersistentBrowserRunning": self.running_after,
+            "PersistentBrowserStopped": self.stopped,
+            "ProfileInUse": "unknown" if self.profile_in_use is None else self.profile_in_use,
+            "ExitWaitSeconds": round(self.waited_seconds, 2),
+        }
+        if self.reason:
+            payload["Reason"] = self.reason
+        return payload
+
+
+def stop_persistent_browser(
+    *,
+    profile_dir: Path | None = None,
+    port: int | None = None,
+    exit_timeout_seconds: float | None = None,
+    request_close: Callable[[str], None] | None = None,
+    profile_in_use_check: Callable[[Path | None], bool | None] | None = None,
+) -> PersistentBrowserStopResult:
+    """Close the dedicated browser gracefully and report only what was confirmed.
+
+    The old command reported ``PersistentBrowserStopped=true`` on the strength
+    of having disconnected from Chrome, while the main process and a dozen
+    children carried on; the documented next step then refused with "profile
+    is in use" and the operator closed Chrome by hand.  Here the browser is
+    asked to exit through the protocol, and "stopped" means the debugging
+    port has gone quiet and the profile is no longer held -- checked, not
+    inferred from the request having been sent.  A browser that does not
+    leave within the wait (it may be holding a dialog over an unfinished
+    download) is reported as still running, so nothing downstream builds on
+    a stop that did not happen.
+    """
+
+    resolved_port = research_debug_port() if port is None else port
+    endpoint = endpoint_for(resolved_port)
+    profile = _logical_path(Path(profile_dir or DEFAULT_RESEARCH_CHROME_PROFILE).expanduser())
+    in_use = profile_in_use_check or profile_in_use
+    # Read from the module at call time rather than bound as a default, so
+    # the wait is one adjustable place instead of a value frozen at import.
+    if exit_timeout_seconds is None:
+        exit_timeout_seconds = DEFAULT_EXIT_TIMEOUT_SECONDS
+
+    if not probe(resolved_port).running:
+        held = in_use(profile)
+        reason = "No persistent Research Chrome is listening"
+        if held is True:
+            reason += (
+                ", but a Chrome without a debugging port still holds the profile; "
+                "close that window by hand before editing the profile or starting the persistent one"
+            )
+        return PersistentBrowserStopResult(
+            endpoint=endpoint,
+            port=resolved_port,
+            was_running=False,
+            close_requested=False,
+            running_after=False,
+            profile_in_use=held,
+            waited_seconds=0.0,
+            reason=reason,
+        )
+
+    try:
+        (request_close or _request_graceful_close)(endpoint)
+    except Exception as exc:
+        # The request could not be made at all (no driver, connection
+        # refused).  That is a different fact from the browser declining to
+        # leave, and it is reported as such rather than as a traceback.
+        return PersistentBrowserStopResult(
+            endpoint=endpoint,
+            port=resolved_port,
+            was_running=True,
+            close_requested=False,
+            running_after=probe(resolved_port).running,
+            profile_in_use=None,
+            waited_seconds=0.0,
+            reason=f"Could not ask Research Chrome to close: {type(exc).__name__}: {exc}",
+        )
+
+    started = time.monotonic()
+    deadline = started + exit_timeout_seconds
+    running = True
+    held: bool | None = None
+    while True:
+        running = probe(resolved_port, timeout_seconds=1.0).running
+        if not running:
+            # Children release the profile a moment after the port closes;
+            # only once the port is quiet is the profile worth asking about.
+            held = in_use(profile)
+            if held is not True:
+                break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_EXIT_POLL_SECONDS)
+    waited = time.monotonic() - started
+
+    reason = ""
+    if running:
+        reason = (
+            f"Research Chrome is still listening {waited:.0f}s after Browser.close was sent; "
+            "it may be holding a dialog (an unfinished download, an unload prompt) -- "
+            "finish or dismiss it in the window, then run browser-stop again"
+        )
+    elif held is True:
+        reason = (
+            f"The debugging port closed but Chrome processes still held the profile "
+            f"{waited:.0f}s later; wait for them to exit before editing the profile"
+        )
+    return PersistentBrowserStopResult(
+        endpoint=endpoint,
+        port=resolved_port,
+        was_running=True,
+        close_requested=True,
+        running_after=running,
+        profile_in_use=held,
+        waited_seconds=waited,
+        reason=reason,
+    )
+
+
 __all__ = [
+    "DEFAULT_EXIT_TIMEOUT_SECONDS",
     "DEFAULT_RESEARCH_DEBUG_PORT",
     "DEFAULT_STARTUP_TIMEOUT_SECONDS",
     "PersistentBrowserError",
     "PersistentBrowserStatus",
+    "PersistentBrowserStopResult",
     "RESEARCH_DEBUG_PORT_ENV",
     "endpoint_for",
     "probe",
+    "profile_in_use",
     "research_debug_port",
     "start_persistent_browser",
+    "stop_persistent_browser",
 ]

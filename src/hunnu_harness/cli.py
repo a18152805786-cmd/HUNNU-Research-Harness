@@ -91,9 +91,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Off by default so a topic can never be invented"
         ),
     )
-    sub.add_parser(
+    status = sub.add_parser(
         "browser-status",
-        help="Report whether a persistent Research Chrome is running, without starting one",
+        help=(
+            "Report whether a persistent Research Chrome is listening and whether any "
+            "Chrome process holds the profile, without starting one"
+        ),
+    )
+    status.add_argument(
+        "--profile",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "HUNNU_RESEARCH_PROFILE",
+                Path.home() / "ResearchHarness" / "chrome-profile",
+            )
+        ),
     )
     # There is deliberately no "browser-auth-status" command.  One existed
     # briefly, reading cookie names and expiry times from the profile's
@@ -106,9 +119,22 @@ def build_parser() -> argparse.ArgumentParser:
     # Sign-in staleness is surfaced where it is actually observable: a live
     # run stops with ACTION_REQUIRED_USER_LOGIN on the page state it sees, and
     # the write-ahead fetch ledger keeps an interrupted run from burning quota.
-    sub.add_parser(
+    stop = sub.add_parser(
         "browser-stop",
-        help="Close the persistent Research Chrome, ending its signed-in session",
+        help=(
+            "Ask the persistent Research Chrome to exit gracefully and report stopped "
+            "only once its port is quiet and no Chrome process holds the profile"
+        ),
+    )
+    stop.add_argument(
+        "--profile",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "HUNNU_RESEARCH_PROFILE",
+                Path.home() / "ResearchHarness" / "chrome-profile",
+            )
+        ),
     )
 
     session_restore = sub.add_parser(
@@ -298,35 +324,31 @@ def main(argv: list[str] | None = None) -> int:
         report.flush()
         return 0
     if args.command == "browser-status":
-        from .browser.persistent_browser import probe
+        from .browser.persistent_browser import probe, profile_in_use
 
-        _audit_report(args, probe().as_dict()).flush()
-        return 0
-    if args.command == "browser-stop":
-        import asyncio as _asyncio
-
-        from .browser.persistent_browser import probe
-
-        report = CliReport(bool(getattr(args, "json", False)))
-        status = probe()
-        if not status.running:
-            report.put("PersistentBrowserRunning", False, plain="false")
-            report.put("Reason", "No persistent Research Chrome is listening")
-            report.flush()
-            return 0
-
-        async def _shutdown() -> None:
-            from playwright.async_api import async_playwright
-
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.connect_over_cdp(status.endpoint)
-                await browser.close()
-
-        _asyncio.run(_shutdown())
-        report.put("PersistentBrowserStopped", True, plain="true")
-        report.put("SessionEnded", True, plain="true")
+        # Two facts, from the same sources browser-stop judges by: the port
+        # says whether the Harness browser is listening; the profile says
+        # whether any Chrome process -- ours, or one opened by hand -- still
+        # holds it, which is what a preference edit or a fresh start needs.
+        report = _audit_report(args, probe().as_dict())
+        held = profile_in_use(args.profile)
+        report.put(
+            "ProfileInUse",
+            "unknown" if held is None else held,
+            plain="unknown" if held is None else _bool_plain(held),
+        )
         report.flush()
         return 0
+    if args.command == "browser-stop":
+        from .browser.persistent_browser import stop_persistent_browser
+
+        # The browser is asked to exit through the protocol and "stopped" is
+        # claimed only after the port has gone quiet and the profile is free.
+        # The old command disconnected and called that stopping; Chrome kept
+        # running and the next command refused on the profile lock.
+        result = stop_persistent_browser(profile_dir=args.profile)
+        _audit_report(args, result.as_dict()).flush()
+        return 0 if result.ok else 2
     if args.command == "browser-configure-session-restore":
         try:
             audit = ResearchChromePdfPreference(args.profile).configure_session_restore()
