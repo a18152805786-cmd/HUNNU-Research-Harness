@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit
 
-from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
+from ...browser.commands import (
+    BrowserTarget,
+    DownloadCommand,
+    NavigateCommand,
+    ObservationUnavailable,
+    ObserveCommand,
+)
 from ...browser.playwright_backend import (
     _INTERSTITIAL_BODY_MARKERS,
     _INTERSTITIAL_TITLE_MARKERS,
@@ -36,7 +42,7 @@ from ..models import (
     UNKNOWN,
 )
 from ..normalization import normalize_doi, stable_paper_id
-from ..security import sanitize_url
+from ..security import sanitize_text, sanitize_url
 
 
 _ARTICLE_PATH = re.compile(r"/science/article/(?:abs/)?pii/([A-Za-z0-9]+)")
@@ -227,6 +233,36 @@ def _article_json_ld(parser: _ScienceDirectHTMLParser) -> dict[str, Any]:
     return {}
 
 
+def _article_title(parser: _ScienceDirectHTMLParser) -> str:
+    """The title an article page gives for itself, or UNKNOWN.
+
+    Extracted so metadata extraction and the wait that precedes it cannot
+    drift apart: the page counts as having said what it is exactly when this
+    finds the title the identity lock will be checked against.
+    """
+
+    title = _meta_first(parser, "citation_title", "dc.title", "og:title")
+    if title == UNKNOWN:
+        article_json = _article_json_ld(parser)
+        title = str(article_json.get("headline", article_json.get("name", UNKNOWN))).strip() or UNKNOWN
+    return title
+
+
+def _interstitial_gate_present(parser: _ScienceDirectHTMLParser) -> bool:
+    """Whether the page reads as the publisher's bot-check interstitial.
+
+    The markers are the browser layer's, borrowed rather than copied.  This
+    only ever classifies: nothing here, or anywhere downstream of it, clicks,
+    types, reloads, or otherwise answers the gate.
+    """
+
+    body = parser.body_text.casefold()
+    return any(
+        marker in body
+        for marker in _INTERSTITIAL_TITLE_MARKERS + _INTERSTITIAL_BODY_MARKERS
+    )
+
+
 def _json_name(value: Any) -> str:
     if isinstance(value, dict):
         return str(value.get("name", "")).strip()
@@ -271,6 +307,29 @@ class SearchPageObservation:
             "ResultContainersObserved": self.result_cards,
             "ArticleLinksObserved": self.article_links,
         }
+
+
+class ArticlePageState(str, Enum):
+    """What an article page is, before anything is extracted from it.
+
+    ``extract_metadata`` used to read the page the instant navigation
+    returned.  A page still held by the publisher's bot-check, or one whose
+    own document was still arriving, then came back with no title -- and that
+    surfaced as "target identity lock failed" for every result in turn, while
+    the loop went on opening further article pages against a publisher that
+    was already challenging.
+    """
+
+    METADATA_PRESENT = "METADATA_PRESENT"
+    # CAPTCHA or login text: ``detect_interruption`` stays the one place that
+    # reports it, so this only says the page has decided.
+    INTERRUPTED = "INTERRUPTED"
+    PAGE_GATE = "PAGE_GATE"
+    PENDING = "PENDING"
+
+    @property
+    def decided(self) -> bool:
+        return self is not ArticlePageState.PENDING
 
 
 class ArticleReadiness(str, Enum):
@@ -477,17 +536,17 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         except LiteratureSourceError:
             return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
         body = parser.body_text.casefold()
-        # A bot-check interstitial is the browser layer's to wait out, but if it
-        # is still on screen when the page is read, this is not a search page and
-        # polling it for twenty seconds would only delay saying so.  The markers
-        # are that layer's, borrowed rather than copied.
-        if any(
-            marker in body
-            for marker in _INTERSTITIAL_TITLE_MARKERS + _INTERSTITIAL_BODY_MARKERS
-        ):
-            return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
+        # The explicit no-results notice is read first.  A search page echoes
+        # the query back, so a query that happens to contain a gate word ("one
+        # moment", "attention required") must not turn a genuinely empty search
+        # into a gate -- which matters now that a gate stops the run.
         if any(marker.casefold() in body for marker in _NO_RESULTS_MARKERS):
             return SearchPageObservation(page_type=SearchPageType.GENUINE_ZERO_RESULTS)
+        # A bot-check interstitial is the browser layer's to wait out, but if it
+        # is still on screen when the page is read, this is not a search page and
+        # polling it for twenty seconds would only delay saying so.
+        if _interstitial_gate_present(parser):
+            return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
         return SearchPageObservation(page_type=SearchPageType.PENDING)
 
     @classmethod
@@ -502,9 +561,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         parser = cls._parser(html)
         article_json = _article_json_ld(parser)
 
-        title = _meta_first(parser, "citation_title", "dc.title", "og:title")
-        if title == UNKNOWN:
-            title = str(article_json.get("headline", article_json.get("name", UNKNOWN))).strip() or UNKNOWN
+        title = _article_title(parser)
         authors = _meta_all(parser, "citation_author", "dc.creator")
         if not authors:
             json_authors = article_json.get("author", [])
@@ -661,6 +718,14 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         await self.browser.execute(NavigateCommand(url))
         html, current_url, observation = await self._settled_search_page(source_url=url)
         self.last_search_observation = observation
+        if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
+            # Challenge first: a page that is not a search page never reaches the
+            # result parser.  CAPTCHA and login text stay ``detect_interruption``'s
+            # to report, unchanged; what is left is the bot-check interstitial,
+            # which has no CAPTCHA words and used to fall through the parser as
+            # an empty -- and apparently successful -- search.
+            self.detect_interruption(html, url=current_url)
+            raise self._interstitial_stop("search")
         results = self.parse_search_results_html(
             html,
             query=query,
@@ -679,7 +744,39 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 f"ArticleLinksObserved={observation.article_links}; "
                 "ParsedResultCount=0; ParserFailureDetected=true"
             )
+        if not results and observation.page_type is SearchPageType.PENDING:
+            # Out of time with neither a results list nor a no-results notice.
+            # Only GENUINE_ZERO_RESULTS may be reported as an empty search;
+            # anything else would be inventing an answer the publisher never gave.
+            raise SourceLayoutChanged(
+                "SEARCH_READINESS_TIMEOUT: the ScienceDirect search page presented "
+                "neither a results list nor a no-results notice within "
+                f"{SEARCH_RENDER_TIMEOUT_SECONDS:g}s; ParsedResultCount=0"
+            )
         return results
+
+    @staticmethod
+    def _interstitial_stop(stage: str) -> SourceActionRequired:
+        """The stop for a bot-check interstitial that did not clear by itself.
+
+        The browser layer has already spent its bounded wait on it.  What is
+        left is the publisher's access control, and that is a person's to pass:
+        the run stops here rather than sending the next query into an active
+        challenge.  Gate text was read from a live page but its visibility was
+        never probed, so this claims no more than CHALLENGE_TEXT_UNVERIFIED.
+        """
+
+        return SourceActionRequired(
+            "ACTION_REQUIRED_USER_LOGIN=true; "
+            f"Reason=Publisher bot-check interstitial still on the ScienceDirect {stage} page "
+            "after the bounded wait; it was not interacted with; "
+            "BrowserReadyForManualAction=false",
+            reason=HumanActionReason.CHALLENGE_TEXT_UNVERIFIED,
+            challenge_observed=True,
+            challenge_visible=False,
+            challenge_blocking=False,
+            browser_ready_for_manual_action=False,
+        )
 
     @classmethod
     def observe_article_readiness(
@@ -740,16 +837,44 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         the part that answers the question, and a page read there looks exactly
         like a page with nothing to give.  A page that has already rendered
         costs one observation, so this never becomes a fixed delay.
+
+        A read that fails because the page is between documents -- the
+        publisher's bot-check reloads itself, and Playwright refuses
+        ``page.content()`` while a navigation is in flight -- is the same
+        "not decided yet", not a reason to abandon the query.  It used to
+        escape as a bare ``ObservationUnavailable``, which the workflow could
+        only log by class name.  Re-reading is all this does: it never
+        navigates, reloads, or touches the page, and it ends at the same
+        deadline either way.
         """
 
         started = time.monotonic()
         deadline = started + timeout
-        html, current_url = await self._content()
-        verdict = classify(html, current_url)
-        while not verdict.decided and time.monotonic() < deadline:
+        html = current_url = verdict = None
+        unreadable: ObservationUnavailable | None = None
+        while True:
+            try:
+                html, current_url = await self._content()
+            except ObservationUnavailable as exc:
+                unreadable = exc
+            else:
+                verdict = classify(html, current_url)
+                if verdict.decided:
+                    break
+            if time.monotonic() >= deadline:
+                break
             await asyncio.sleep(poll)
-            html, current_url = await self._content()
-            verdict = classify(html, current_url)
+        if verdict is None:
+            # Not one readable observation in the whole window.
+            cause = unreadable.__cause__ if unreadable is not None else None
+            detail = " ".join(str(unreadable).split())
+            if cause is not None:
+                detail = f"{detail} ({type(cause).__name__}: {' '.join(str(cause).split())})"
+            raise SourceUnavailable(
+                "PAGE_OBSERVATION_TIMEOUT: the ScienceDirect page could not be read "
+                f"at any point within {timeout:g}s; "
+                f"LastObservationError={sanitize_text(detail)[:300]}"
+            ) from unreadable
         waited_ms = int((time.monotonic() - started) * 1000)
         return html, current_url, verdict, waited_ms
 
@@ -796,8 +921,44 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             return False
         return actual.group(1).casefold() == expected.group(1).casefold()
 
+    @classmethod
+    def observe_article_page(cls, html: str, *, source_url: str) -> ArticlePageState:
+        """Classify an article page without extracting from it.
+
+        Like ``observe_search_page`` this never raises, because it is polled
+        while the page settles.  A title outranks gate words: an article that
+        has said what it is cannot be a gate, whatever its abstract mentions.
+        """
+
+        try:
+            cls.detect_interruption(html, url=source_url)
+        except LiteratureSourceError:
+            return ArticlePageState.INTERRUPTED
+        parser = cls._parser(html)
+        if _article_title(parser) != UNKNOWN:
+            return ArticlePageState.METADATA_PRESENT
+        if _interstitial_gate_present(parser):
+            return ArticlePageState.PAGE_GATE
+        return ArticlePageState.PENDING
+
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
-        html, current_url = await self._content()
+        """Extract metadata, but only once the page has said what it is.
+
+        The extraction itself is untouched: the same HTML yields the same
+        record, and the identity lock downstream is exactly as strict.  What
+        changed is that a gate stops the run as a gate instead of as a failed
+        identity lock, and a document still arriving is given the same bounded
+        window the access check already had.  A page that never presents a
+        title is parsed as before and fails the lock closed, as before.
+        """
+
+        html, current_url, state, _waited = await self._observe_until_decided(
+            lambda body, url: self.observe_article_page(body, source_url=url),
+            timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
+            poll=ARTICLE_RENDER_POLL_SECONDS,
+        )
+        if state is ArticlePageState.PAGE_GATE:
+            raise self._interstitial_stop("article")
         return self.parse_article_html(html, source_url=current_url, search_query=search_query)
 
     async def extract_abstract(self) -> str:
