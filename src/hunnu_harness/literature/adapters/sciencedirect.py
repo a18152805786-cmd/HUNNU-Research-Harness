@@ -77,7 +77,22 @@ _NO_FULLTEXT_MARKERS = (
     "check for this article elsewhere",
     "rent this article",
 )
+# A third-party title hosted under /org/ says it differently.  It has no access
+# box at all, and none of the phrases above occurs anywhere on the page (read
+# from the live page for 10.1108/jfra-03-2025-0162, an Emerald title, on
+# 2026-09-19).  Where "View PDF" would sit there is a link out to the publisher,
+# and the page's link to its own full text is there but disabled.  Both are
+# required.  The hand-off alone is a way out, not a refusal: a hosted title the
+# session is entitled to could carry it while its own PDF control is still
+# rendering.  Both are matched on rendered links and never on the page text,
+# which here includes inline script: the words alone -- in an abstract, in the
+# page's state -- are not the publisher saying anything.
+_PUBLISHER_HANDOFF_LABELS = ("view at publisher",)
+_OWN_FULLTEXT_LINK_LABELS = ("view full text",)
 _PDF_PATH_MARKERS = ("/pdfft", "/pdf", ".pdf")
+_NO_PDF_CONTROL_REASON = (
+    "No enabled, official PDF view/download control was present on the article page"
+)
 
 
 @dataclass(frozen=True)
@@ -664,6 +679,18 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 return anchor, absolute
         return None, UNKNOWN
 
+    @staticmethod
+    def _metadata_only_decision(reason: str) -> AccessDecision:
+        """The one fail-closed refusal, so its two callers cannot drift apart."""
+
+        return AccessDecision(
+            full_text_accessible=False,
+            access_type=AccessType.METADATA_ONLY,
+            authorized_access=False,
+            status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
+            reason=reason,
+        )
+
     @classmethod
     def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
         cls.detect_interruption(html, url=source_url)
@@ -671,13 +698,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         candidate, candidate_url = cls._pdf_control(parser, source_url=source_url)
 
         if candidate is None:
-            return AccessDecision(
-                full_text_accessible=False,
-                access_type=AccessType.METADATA_ONLY,
-                authorized_access=False,
-                status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
-                reason="No enabled, official PDF view/download control was present on the article page",
-            )
+            return cls._metadata_only_decision(_NO_PDF_CONTROL_REASON)
 
         haystack = parser.body_text.casefold()
         open_markers = (
@@ -778,6 +799,35 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             browser_ready_for_manual_action=False,
         )
 
+    @staticmethod
+    def _no_fulltext_notice(
+        parser: _ScienceDirectHTMLParser, *, source_url: str, page_pii: str
+    ) -> bool:
+        """Whether the page says, in so many words, that the full text is not here."""
+
+        body = parser.body_text.casefold()
+        if any(marker in body for marker in _NO_FULLTEXT_MARKERS):
+            return True
+        # The hosted third-party page: a link out to the publisher, and this
+        # article's own full-text link present but disabled.
+        handed_off = own_fulltext_disabled = False
+        for anchor in parser.anchors:
+            label = " ".join(anchor.text.split()).casefold()
+            if any(item in label for item in _PUBLISHER_HANDOFF_LABELS):
+                handed_off = True
+            elif (
+                any(item in label for item in _OWN_FULLTEXT_LINK_LABELS)
+                and anchor.attributes.get("aria-disabled", "").casefold() == "true"
+            ):
+                target = _ARTICLE_PATH.search(urlsplit(urljoin(source_url, anchor.href)).path)
+                if (
+                    target is not None
+                    and page_pii != UNKNOWN
+                    and target.group(1).casefold() == page_pii.casefold()
+                ):
+                    own_fulltext_disabled = True
+        return handed_off and own_fulltext_disabled
+
     @classmethod
     def observe_article_readiness(
         cls, html: str, *, source_url: str
@@ -787,7 +837,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         The authorized landmark is the access decision's own control, found
         through the same predicate, and it must belong to the article being
         read: a PDF control for some other paper is not this paper's full text,
-        so it leaves the page undecided rather than authorising anything.
+        so it never authorises anything.  Nor does it decide anything: with it
+        on the page or without it, only the publisher's own notice refuses, and
+        a page offering neither this article's control nor a notice is undecided.
         """
 
         page_match = _ARTICLE_PATH.search(urlsplit(source_url).path)
@@ -801,32 +853,34 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
 
         parser = cls._parser(html)
         control, control_url = cls._pdf_control(parser, source_url=source_url)
+        control_pii = UNKNOWN
         if control is not None:
             control_match = _ARTICLE_PATH.search(urlsplit(control_url).path)
             control_pii = control_match.group(1) if control_match else UNKNOWN
-            if page_pii != UNKNOWN and control_pii.casefold() != page_pii.casefold():
-                # Someone else's PDF.  Not a refusal and certainly not an
-                # authorisation, so keep waiting for this article's own control.
+            if page_pii == UNKNOWN or control_pii.casefold() == page_pii.casefold():
                 return ArticleReadinessObservation(
-                    readiness=ArticleReadiness.PENDING_RENDER,
+                    readiness=ArticleReadiness.FULLTEXT_AUTHORIZED,
                     pdf_control_url=control_url,
                     pdf_control_pii=control_pii,
                     page_pii=page_pii,
                 )
-            return ArticleReadinessObservation(
-                readiness=ArticleReadiness.FULLTEXT_AUTHORIZED,
-                pdf_control_url=control_url,
-                pdf_control_pii=control_pii,
-                page_pii=page_pii,
-            )
+            # Someone else's PDF -- on the live page, a recommended article's.
+            # Not a refusal and certainly not an authorisation.  It used to end
+            # the reading here as well, so once the recommendations had rendered
+            # the page could no longer be heard refusing, and sat out the whole
+            # window undecided.  It is kept as evidence and the reading goes on.
 
-        body = parser.body_text.casefold()
-        if any(marker in body for marker in _NO_FULLTEXT_MARKERS):
-            return ArticleReadinessObservation(
-                readiness=ArticleReadiness.FULLTEXT_NOT_AUTHORIZED, page_pii=page_pii
-            )
+        # Without this article's own control, only the publisher's own words
+        # decide anything; with neither, keep waiting.
         return ArticleReadinessObservation(
-            readiness=ArticleReadiness.PENDING_RENDER, page_pii=page_pii
+            readiness=(
+                ArticleReadiness.FULLTEXT_NOT_AUTHORIZED
+                if cls._no_fulltext_notice(parser, source_url=source_url, page_pii=page_pii)
+                else ArticleReadiness.PENDING_RENDER
+            ),
+            pdf_control_url=control_url,
+            pdf_control_pii=control_pii,
+            page_pii=page_pii,
         )
 
     async def _observe_until_decided(self, classify, *, timeout: float, poll: float):
@@ -973,6 +1027,11 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         ScienceDirect is still rendering the control the decision looks for --
         a moment at which an entitled, open-access article was indistinguishable
         from one behind a paywall, and was reported as the latter.
+
+        A refusal is returned here rather than asked of that decision.  The
+        HTML decision takes the first PDF-like control it meets, which is right
+        only while readiness vouches that the control is this article's; a page
+        can refuse with another article's PDF control still on it.
         """
 
         html, current_url, observation, waited_ms = await self._observe_until_decided(
@@ -995,6 +1054,18 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                     "either an enabled PDF control for this article or an explicit "
                     f"no-full-text notice within {ARTICLE_RENDER_TIMEOUT_SECONDS:g}s"
                 ),
+            )
+        if observation.readiness is ArticleReadiness.FULLTEXT_NOT_AUTHORIZED:
+            # The page refused, and the refusal is returned as one.  Handed to
+            # the HTML decision, the first PDF-like control on the page would
+            # answer instead -- on a hosted page a recommended article's -- and
+            # the refusal would come back as an authorisation of the wrong paper.
+            if observation.pdf_control_url == UNKNOWN:
+                return self._metadata_only_decision(_NO_PDF_CONTROL_REASON)
+            return self._metadata_only_decision(
+                "The article page gave an explicit no-full-text notice and no PDF "
+                "control for this article; the PDF controls on it belong to other "
+                f"articles (first seen: PII {observation.pdf_control_pii})"
             )
         return self.check_fulltext_access_html(html, source_url=current_url)
 
