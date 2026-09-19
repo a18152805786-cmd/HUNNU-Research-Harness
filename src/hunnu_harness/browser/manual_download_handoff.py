@@ -244,7 +244,10 @@ class ManualDownloadHandoff:
             path_io = _windows_io_path(path)
             if not path_io.is_file():
                 continue
-            stat = path_io.stat()
+            try:
+                stat = path_io.stat()
+            except OSError:
+                continue
             digest = _sha256(path) if hash_existing_pdfs and self._is_pdf(path) else "not_recorded"
             files.append(
                 DownloadFileSnapshot(
@@ -332,11 +335,21 @@ class ManualDownloadHandoff:
                 for path in scan.completed_candidates
             )
             if all_stable and not scan.temporary_candidates:
-                valid = tuple(
-                    path
-                    for path in scan.completed_candidates
-                    if _windows_io_path(path).stat().st_size > 0 and self._has_pdf_header(path)
-                )
+                valid: list[Path] = []
+                validation_unstable = False
+                for path in scan.completed_candidates:
+                    try:
+                        stat = _windows_io_path(path).stat()
+                    except OSError:
+                        signatures.pop(path, None)
+                        counts.pop(path, None)
+                        validation_unstable = True
+                        continue
+                    if stat.st_size > 0 and self._has_pdf_header(path):
+                        valid.append(path)
+                if validation_unstable:
+                    await asyncio.sleep(poll_interval_seconds)
+                    continue
                 if len(valid) > 1:
                     raise ManualDownloadCandidateAmbiguous(
                         f"ManualDownloadCandidateAmbiguous=true; NewDownloadCandidates={len(valid)}"

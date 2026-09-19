@@ -74,7 +74,10 @@ class DownloadManager:
         path_io = _windows_io_path(path)
         if not path_io.exists() or not path_io.is_file() or self.is_partial(path):
             return False
-        first_size = path_io.stat().st_size
+        try:
+            first_size = path_io.stat().st_size
+        except OSError:
+            return False
         if first_size <= 0:
             return False
         time.sleep(stable_seconds)
@@ -84,22 +87,28 @@ class DownloadManager:
             return False
 
     def wait_for_new_download(self, before: set[Path] | None = None, *, timeout_seconds: float = 180, stable_seconds: float = 2) -> Path:
-        baseline = before or set(self._files())
+        baseline = before if before is not None else set(self._files())
         deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
+        while True:
             current = self._files()
             candidates = [p for p in current if p not in baseline]
-            candidates.sort(key=lambda p: _windows_io_path(p).stat().st_mtime_ns, reverse=True)
+            candidates.sort(key=lambda p: current[p][1], reverse=True)
             for candidate in candidates:
                 if self.verify_complete(candidate, stable_seconds=stable_seconds):
                     if self.logger:
+                        try:
+                            size = _windows_io_path(candidate).stat().st_size
+                        except OSError:
+                            size = current[candidate][0]
                         self.logger.log(
                             "wait_for_new_download",
                             status="success",
                             path=str(candidate),
-                            size=_windows_io_path(candidate).stat().st_size,
+                            size=size,
                         )
                     return candidate
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.5)
         if self.logger:
             self.logger.log("wait_for_new_download", status="timeout", watched_dirs=[str(p) for p in self.watch_dirs])

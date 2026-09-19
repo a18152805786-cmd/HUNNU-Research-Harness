@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from hunnu_harness.agent_entrypoint import AgentRequestRouter
@@ -14,6 +15,7 @@ from hunnu_harness.browser.manual_download_handoff import (
     ManualDownloadCandidateRejected,
     ManualDownloadHandoff,
     ManualDownloadHandoffTimeout,
+    ManualDownloadScan,
 )
 from hunnu_harness.literature.adapters.base import SourceLayoutChanged, SourceUnavailable
 from hunnu_harness.literature.adapters.oxfordacademic import OxfordAcademicAdapter
@@ -137,6 +139,109 @@ class ManualDownloadSnapshotTests(unittest.IsolatedAsyncioTestCase):
             changed_ns = time.time_ns() + 1_000_000
             os.utime(existing, ns=(changed_ns, changed_ns))
             self.assertEqual(handoff.scan(state).completed_candidates, (existing,))
+
+    def test_snapshot_skips_a_file_that_vanishes_before_stat(self) -> None:
+        """This failing means a disappearing snapshot entry crashes the handoff."""
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temporary:
+            handoff = self._handoff(Path(temporary))
+            vanished = write_minimal_pdf(handoff.watch_directory / "vanishing.pdf")
+
+            class _DirectoryIO:
+                def iterdir(self):
+                    return (vanished,)
+
+            class _VanishingFileIO:
+                def is_file(self):
+                    return True
+
+                def stat(self):
+                    raise OSError("file vanished")
+
+            def io_path(value):
+                path = Path(value)
+                if path == handoff.watch_directory:
+                    return _DirectoryIO()
+                if path == vanished:
+                    return _VanishingFileIO()
+                return path
+
+            with patch(
+                "hunnu_harness.browser.manual_download_handoff._windows_io_path",
+                side_effect=io_path,
+            ):
+                snapshot = handoff.snapshot()
+
+            self.assertEqual(snapshot.files, ())
+
+    async def test_unreadable_watch_directory_oserror_surfaces_promptly(self) -> None:
+        """This failing means an unreadable watch directory is misreported as a timeout."""
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temporary:
+            handoff = self._handoff(Path(temporary))
+            state = handoff.arm()
+
+            class _UnreadableDirectory:
+                def iterdir(self):
+                    raise OSError("watch directory cannot be listed")
+
+            with (
+                patch(
+                    "hunnu_harness.browser.manual_download_handoff._windows_io_path",
+                    return_value=_UnreadableDirectory(),
+                ),
+                self.assertRaisesRegex(OSError, "watch directory cannot be listed"),
+            ):
+                await handoff.wait_for_completed_download(
+                    state,
+                    timeout_seconds=1,
+                    poll_interval_seconds=1,
+                )
+
+    async def test_validation_stat_race_forgets_stability_and_keeps_polling(self) -> None:
+        """This failing means a vanished validation candidate is rejected or accepted too soon."""
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temporary:
+            handoff = self._handoff(Path(temporary))
+            state = handoff.arm()
+            candidate = handoff.watch_directory / "recovering.pdf"
+            scan = ManualDownloadScan(
+                after=state.before,
+                completed_candidates=(candidate,),
+                temporary_candidates=(),
+            )
+
+            class _CandidateIO:
+                def __init__(self) -> None:
+                    self.stat_calls = 0
+
+                def stat(self):
+                    self.stat_calls += 1
+                    if self.stat_calls == 3:
+                        raise OSError("file vanished")
+                    return SimpleNamespace(st_size=5, st_mtime_ns=7)
+
+            candidate_io = _CandidateIO()
+
+            def has_header(_path: Path) -> bool:
+                return candidate_io.stat_calls >= 6
+
+            async def no_sleep(_delay: float) -> None:
+                return None
+
+            with (
+                patch.object(handoff, "scan", return_value=scan),
+                patch.object(handoff, "_has_pdf_header", side_effect=has_header),
+                patch(
+                    "hunnu_harness.browser.manual_download_handoff._windows_io_path",
+                    return_value=candidate_io,
+                ),
+                patch("hunnu_harness.browser.manual_download_handoff.asyncio.sleep", new=no_sleep),
+            ):
+                detection = await handoff.wait_for_completed_download(
+                    state,
+                    timeout_seconds=0.2,
+                    poll_interval_seconds=0.01,
+                )
+
+            self.assertEqual(detection.source_path, candidate)
 
     async def test_crdownload_is_not_accepted_as_completed(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temporary:
