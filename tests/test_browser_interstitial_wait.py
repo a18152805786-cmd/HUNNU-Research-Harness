@@ -1,6 +1,6 @@
 """Waiting out a bot-check interstitial, and reporting what the browser did.
 
-Two defects are pinned here, both observed on a real ScienceDirect run:
+Three defects are pinned here, all observed on a real ScienceDirect run:
 
   * ``goto`` returned on ``domcontentloaded``, which is precisely while the
     interstitial is still deciding.  The page was read as "Just a moment…",
@@ -9,6 +9,8 @@ Two defects are pinned here, both observed on a real ScienceDirect run:
   * Nothing reported that a browser had launched at all, so an Agent inferred
     "no browser opened" for a run in which Chrome launched, reached the
     article host, and closed five seconds later.
+  * An unreadable page sample was treated as a clear page, so a reload or a
+    closed page could end a wait before the gate had actually gone away.
 
 Waiting is not solving.  These tests also pin that the wait never clicks,
 types, or otherwise touches the page.
@@ -72,6 +74,37 @@ class _FakePage:
     def get_by_label(self, *a, **k):
         self.interactions.append("get_by_label")
         raise AssertionError("the interstitial wait must not touch form controls")
+
+
+class _TitleScriptPage(_FakePage):
+    """A fake page whose title can fail on selected scripted frames."""
+
+    async def title(self):
+        self.title_reads += 1
+        frame = self._frame()
+        if isinstance(frame, BaseException):
+            raise frame
+        return frame[0]
+
+
+class _UnreadablePage:
+    """A page whose title cannot be read, optionally because it is closed."""
+
+    url = "about:blank"
+
+    def __init__(self, *, closed: bool):
+        self.closed = closed
+        self.closed_checks = 0
+        self.interactions: list[str] = []
+        self.title_reads = 0
+
+    def is_closed(self):
+        self.closed_checks += 1
+        return self.closed
+
+    async def title(self):
+        self.title_reads += 1
+        raise RuntimeError("page cannot be read")
 
 
 def _browser(page, **kwargs):
@@ -140,15 +173,45 @@ class InterstitialWaitTests(unittest.TestCase):
         )
         self.assertTrue(asyncio.run(_browser(page).settle_automated_interstitial()))
 
-    def test_an_unreadable_page_is_not_treated_as_a_gate(self) -> None:
-        class _Dead:
-            url = "about:blank"
+    def test_a_closed_page_is_not_waited_on(self) -> None:
+        """This failing means a closed page is still entering the read loop."""
 
-            async def title(self):
-                raise RuntimeError("page is gone")
-
-        settled = asyncio.run(_browser(_Dead()).settle_automated_interstitial())
+        page = _UnreadablePage(closed=True)
+        settled = asyncio.run(
+            _browser(page, interstitial_wait_seconds=60.0).settle_automated_interstitial()
+        )
         self.assertTrue(settled)
+        self.assertEqual(page.title_reads, 0)
+        self.assertEqual(page.interactions, [])
+
+    def test_an_open_unreadable_page_is_not_known_to_be_clear(self) -> None:
+        """This failing means an unreadable sample is being treated as clear."""
+
+        page = _UnreadablePage(closed=False)
+        settled = asyncio.run(
+            _browser(page, interstitial_wait_seconds=0.005).settle_automated_interstitial()
+        )
+        self.assertFalse(settled)
+        self.assertGreater(page.title_reads, 0)
+        self.assertEqual(page.interactions, [])
+
+    def test_a_reload_read_error_does_not_end_the_wait(self) -> None:
+        """This failing means a read error can end a wait during navigation."""
+
+        page = _TitleScriptPage(
+            [
+                RuntimeError("navigation is in flight"),
+                ("Just a moment...", "Checking your browser"),
+                ("ScienceDirect", "AI washing"),
+            ]
+        )
+        # The default budget on purpose: the third read ends this wait whatever
+        # the clock says, so a tight budget buys nothing and fails the test on a
+        # loaded machine (4.8% of runs with the CPUs saturated, at 0.05 s).
+        settled = asyncio.run(_browser(page).settle_automated_interstitial())
+        self.assertTrue(settled)
+        self.assertGreaterEqual(page.title_reads, 3)
+        self.assertEqual(page.interactions, [])
 
     def test_default_budget_is_bounded(self) -> None:
         self.assertGreater(DEFAULT_INTERSTITIAL_WAIT_SECONDS, 0)
@@ -239,6 +302,73 @@ class HumanClearanceTests(unittest.TestCase):
     def test_a_clean_page_is_not_a_gate(self) -> None:
         page = _FakePage([("ScienceDirect", "AI washing")])
         self.assertFalse(asyncio.run(_browser(page)._page_is_gated()))
+
+    def test_an_unreadable_human_wait_sample_resets_the_clear_streak(self) -> None:
+        """This failing means an unreadable sample can advance clearance."""
+
+        page = _TitleScriptPage(
+            [
+                ("Are you a robot?", "captcha challenge"),
+                ("Are you a robot?", "captcha challenge"),
+                ("Are you a robot?", "captcha challenge"),  # announcement
+                ("ScienceDirect", "AI washing"),
+                RuntimeError("navigation is in flight"),
+                ("ScienceDirect", "AI washing"),
+                ("ScienceDirect", "AI washing"),
+                RuntimeError("navigation is in flight"),
+                RuntimeError("navigation is in flight"),
+            ]
+        )
+        browser = _browser(
+            page,
+            human_wait_seconds=0.01,
+            human_wait_poll_seconds=0.0,
+            human_clear_confirmations=2,
+        )
+        self.assertFalse(asyncio.run(browser.await_human_clearance()))
+        self.assertEqual(page.interactions, [])
+
+    def test_a_gate_followed_only_by_unreadable_samples_ends_at_the_deadline(self) -> None:
+        """This failing means unreadable samples can satisfy the clear streak."""
+
+        page = _TitleScriptPage(
+            [
+                ("Are you a robot?", "captcha challenge"),
+                ("Are you a robot?", "captcha challenge"),
+                ("Are you a robot?", "captcha challenge"),  # announcement
+                RuntimeError("navigation is in flight"),
+                RuntimeError("navigation is in flight"),
+            ]
+        )
+        browser = _browser(
+            page,
+            human_wait_seconds=0.005,
+            human_wait_poll_seconds=0.0,
+            human_clear_confirmations=2,
+        )
+        self.assertFalse(asyncio.run(browser.await_human_clearance()))
+        self.assertEqual(page.interactions, [])
+
+    def test_a_closed_page_ends_a_human_wait_at_once(self) -> None:
+        """This failing means a closed page can consume the human budget."""
+
+        page = _UnreadablePage(closed=True)
+        browser = _browser(
+            page,
+            human_wait_seconds=60.0,
+            human_wait_poll_seconds=0.0,
+        )
+        self.assertFalse(asyncio.run(browser.await_human_clearance()))
+        self.assertEqual(page.title_reads, 0)
+        self.assertEqual(page.interactions, [])
+
+    def test_bool_gate_apis_still_return_false_for_an_unreadable_page(self) -> None:
+        """This failing means the compatibility bool API changed its result."""
+
+        page = _UnreadablePage(closed=False)
+        browser = _browser(page)
+        self.assertFalse(asyncio.run(browser._looks_like_interstitial()))
+        self.assertFalse(asyncio.run(browser._page_is_gated()))
 
 
 class RotatingGateTests(unittest.TestCase):
