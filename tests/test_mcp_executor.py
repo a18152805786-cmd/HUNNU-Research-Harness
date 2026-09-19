@@ -5,7 +5,9 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from hunnu_harness.browser import (
     BrowserSessionBroker,
@@ -437,6 +439,51 @@ class MCPExecutorUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(artifact.sha256, hashlib.sha256(payload).hexdigest())
             self.assertTrue(artifact.artifact_id.startswith("artifact-"))
             self.assertEqual(artifact.metadata["CompletionSignal"], "downloaded-event+filesystem")
+
+    async def test_artifact_wait_treats_a_vanishing_file_as_unstable(self) -> None:
+        """This failing means a file that vanishes during stat crashes artifact polling."""
+        with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-vanish-") as temporary:
+            root = Path(temporary)
+            artifact_path = root / "artifact.pdf"
+            executor = MCPExecutor(
+                _FakeMCPClient(root),
+                downloads_dir=root,
+                max_download_wait_seconds=1.0,
+            )
+
+            class _VanishingArtifactIO:
+                def __init__(self) -> None:
+                    self.stat_calls = 0
+
+                def is_file(self) -> bool:
+                    return True
+
+                def stat(self):
+                    self.stat_calls += 1
+                    if self.stat_calls == 2:
+                        raise OSError("file vanished")
+                    size = 5 if self.stat_calls <= 3 else 6
+                    return SimpleNamespace(st_size=size)
+
+            artifact_io = _VanishingArtifactIO()
+
+            async def no_sleep(_delay: float) -> None:
+                return None
+
+            with (
+                patch(
+                    "hunnu_harness.browser.mcp_executor._windows_io_path",
+                    return_value=artifact_io,
+                ),
+                patch("hunnu_harness.browser.mcp_executor.asyncio.sleep", new=no_sleep),
+            ):
+                resolved = await executor._wait_for_artifact(
+                    str(artifact_path),
+                    timeout_ms=1000,
+                )
+
+            self.assertEqual(resolved, artifact_path.resolve())
+            self.assertGreaterEqual(artifact_io.stat_calls, 5)
 
     async def test_download_event_relative_to_mcp_workdir_resolves_inside_exact_output_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hunnu-v021-mcp-relative-") as temporary:

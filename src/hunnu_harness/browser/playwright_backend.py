@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from ..models import AuthStatus, BrowserState
 from ..paths import _logical_path, _windows_io_path
@@ -54,6 +54,7 @@ DEFAULT_HUMAN_WAIT_POLL_SECONDS = 1.0
 # two rotations reads clean.
 DEFAULT_HUMAN_CLEAR_CONFIRMATIONS = 3
 RESEARCH_CHROME_ENV = "HUNNU_RESEARCH_CHROME"
+_PageReading = Literal["clear", "gated", "unreadable"]
 
 
 def discover_chrome_executable(explicit: Path | str | None = None) -> Path | None:
@@ -231,12 +232,17 @@ class PlaywrightBrowser:
 
         Keeping these separate matters: an unattended run must never sit
         waiting on a challenge nobody is there to solve.
+
+        Only a clear page reading skips the human wait.  An unreadable page is
+        treated like a gated page until it can be read or the human wait ends.
         """
 
         settled = await self.settle_automated_interstitial()
         if self.human_wait_seconds <= 0:
             return settled
-        if not await self._page_is_gated():
+        if self._page_is_closed():
+            return False
+        if await self._read_page_gate_state() == "clear":
             return True
         return await self.await_human_clearance()
 
@@ -255,13 +261,17 @@ class PlaywrightBrowser:
         the budget runs out is left exactly as it is, for the source adapter's
         challenge detection to judge.
 
-        Returns True when the page no longer looks like an interstitial.
+        Returns True only when a clear reading shows that the interstitial is
+        gone, or when the page is already closed.  A gated or unreadable page
+        consumes the same bounded wait and returns False if the budget ends.
         """
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.interstitial_wait_seconds
         while True:
-            if not await self._looks_like_interstitial():
+            if self._page_is_closed():
+                return True
+            if await self._read_interstitial_state() == "clear":
                 return True
             if loop.time() >= deadline:
                 break
@@ -279,6 +289,10 @@ class PlaywrightBrowser:
 
         A gate that is still up when the budget expires is left alone and
         reported, exactly as in the unattended path.
+
+        Only a clear reading advances the consecutive-clear streak.  An
+        unreadable reading resets it just like a gated reading, and a closed
+        page ends this wait with False.
         """
 
         loop = asyncio.get_running_loop()
@@ -286,7 +300,10 @@ class PlaywrightBrowser:
         announced = False
         clear_streak = 0
         while True:
-            if await self._page_is_gated():
+            if self._page_is_closed():
+                return False
+            reading = await self._read_page_gate_state()
+            if reading != "clear":
                 clear_streak = 0
             else:
                 # Cloudflare rotates its own challenge page (the __cf_chl_rt_tk
@@ -317,32 +334,74 @@ class PlaywrightBrowser:
             await asyncio.sleep(self.human_wait_poll_seconds)
 
     async def _page_is_gated(self) -> bool:
-        """Interstitial *or* a rendered challenge -- a human can clear either."""
+        """Return the old bool answer for an interstitial or human gate.
 
-        if await self._looks_like_interstitial():
-            return True
+        An unreadable page remains False in this compatibility bool API; the
+        wait loops use ``_read_page_gate_state`` so they can fail closed.
+        """
+
+        return (await self._read_page_gate_state()) == "gated"
+
+    async def _read_page_gate_state(self) -> _PageReading:
+        """Read whether the page is clear, gated, or currently unreadable.
+
+        This keeps the old title/body read order.  If the interstitial check
+        was unreadable, the second title/body check still happens as before,
+        but a clean repeat is not promoted to a clear reading for this poll.
+        """
+
+        interstitial_reading = await self._read_interstitial_state()
+        if interstitial_reading == "gated":
+            return "gated"
         try:
             title = (await self.page.title()) or ""
             body = await self.page.locator("body").inner_text(timeout=1000)
         except Exception:
-            return False
+            return "unreadable"
         haystack = f"{title} {body[:600]}".casefold()
-        return any(marker in haystack for marker in _HUMAN_GATE_MARKERS)
+        if any(marker in haystack for marker in _HUMAN_GATE_MARKERS):
+            return "gated"
+        if interstitial_reading == "unreadable":
+            return "unreadable"
+        return "clear"
 
     async def _looks_like_interstitial(self) -> bool:
+        """Return the old bool answer; unreadable pages remain False."""
+
+        return (await self._read_interstitial_state()) == "gated"
+
+    async def _read_interstitial_state(self) -> _PageReading:
+        """Read whether the page is clear, an interstitial, or unreadable."""
+
         try:
             title = (await self.page.title()) or ""
         except Exception:
-            return False
+            return "unreadable"
         haystack = title.casefold()
         if any(marker in haystack for marker in _INTERSTITIAL_TITLE_MARKERS):
-            return True
+            return "gated"
         try:
             body = await self.page.locator("body").inner_text(timeout=1000)
         except Exception:
-            return False
+            return "unreadable"
         head = body[:400].casefold()
-        return any(marker in head for marker in _INTERSTITIAL_BODY_MARKERS)
+        if any(marker in head for marker in _INTERSTITIAL_BODY_MARKERS):
+            return "gated"
+        return "clear"
+
+    def _page_is_closed(self) -> bool:
+        """Return True only when an optional page close check says so."""
+
+        try:
+            checker = getattr(self.page, "is_closed", None)
+        except Exception:
+            return False
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
 
     async def state(self, *, database: str | None = None, module: str | None = None, table: str | None = None) -> BrowserState:
         if not self.page:

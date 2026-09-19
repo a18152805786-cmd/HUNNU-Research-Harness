@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import html as html_lib
 import json
 import re
@@ -75,6 +76,12 @@ _ACCESS_SETTLE_DELAY_SECONDS = 2.0
 _ACCESS_SETTLE_MAX_OBSERVATIONS = 4
 _CNKI_CLICK_RETRY_DELAY_SECONDS = 1.0
 _CNKI_CLICK_RETRIES = 1
+
+
+class _CNKIObservationUnreadable(SourceUnavailable):
+    """The current observation could not be read, so a settle loop may re-read it."""
+
+
 _CNKI_EXPLICIT_FULLTEXT_BLOCK_MARKERS = (
     "当前机构未获得全文访问权限",
     "机构未获得全文访问权限",
@@ -1561,18 +1568,27 @@ class CNKIAdapter(LiteratureSourceAdapter):
                     text_probes=probes,
                 )
             )
-        except ObservationUnavailable:
-            observation = await self.browser.execute(
-                ObserveCommand(
-                    include_html=False,
-                    include_visible_text=False,
-                    text_probes=probes,
+        except ObservationUnavailable as html_error:
+            try:
+                observation = await self.browser.execute(
+                    ObserveCommand(
+                        include_html=False,
+                        include_visible_text=False,
+                        text_probes=probes,
+                    )
                 )
-            )
+            except ObservationUnavailable:
+                raise _CNKIObservationUnreadable(
+                    "CNKI HTML observation was unavailable and the fallback structured "
+                    "browser snapshot observation was also unavailable"
+                ) from html_error
             await self._inspect_live_challenge(observation)
             snapshot = observation.structured_content
             if not isinstance(snapshot, str) or not snapshot.strip():
-                raise SourceUnavailable("CNKI structured browser snapshot is unavailable")
+                raise _CNKIObservationUnreadable(
+                    "CNKI HTML observation was unavailable and the fallback structured "
+                    "browser snapshot contained no usable content"
+                ) from html_error
             return "snapshot", snapshot, observation.url
         await self._inspect_live_challenge(observation)
         return "html", observation.require_html(), observation.url
@@ -1601,26 +1617,35 @@ class CNKIAdapter(LiteratureSourceAdapter):
         """Observe a bounded CNKI result window until it reaches a terminal state."""
 
         current_url = self.search_origin
+        last_unreadable: _CNKIObservationUnreadable | None = None
+        readable_observation_seen = False
         for observation_number in range(_SEARCH_SETTLE_MAX_OBSERVATIONS):
-            content_kind, content, current_url = await self._content()
-            parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
-            records = parser(
-                content,
-                query=query,
-                source_url=current_url,
-                max_results=max_results,
-                challenge_state=self._runtime_challenge_state(),
-            )
-            if records or self._search_outcome_is_stable(content_kind, content):
-                same_page_navigation_urls: set[str] = set()
-                if content_kind == "html":
-                    for anchor in self._parser(content).anchors:
-                        absolute = urljoin(current_url, anchor.href)
-                        if _cnki_result_opens_new_tab(anchor, absolute):
-                            same_page_navigation_urls.add(absolute)
-                return records, current_url, frozenset(same_page_navigation_urls)
+            try:
+                content_kind, content, current_url = await self._content()
+            except _CNKIObservationUnreadable as exc:
+                last_unreadable = exc
+            else:
+                readable_observation_seen = True
+                parser = self.parse_search_results_html if content_kind == "html" else self.parse_search_results_snapshot
+                records = parser(
+                    content,
+                    query=query,
+                    source_url=current_url,
+                    max_results=max_results,
+                    challenge_state=self._runtime_challenge_state(),
+                )
+                if records or self._search_outcome_is_stable(content_kind, content):
+                    same_page_navigation_urls: set[str] = set()
+                    if content_kind == "html":
+                        for anchor in self._parser(content).anchors:
+                            absolute = urljoin(current_url, anchor.href)
+                            if _cnki_result_opens_new_tab(anchor, absolute):
+                                same_page_navigation_urls.add(absolute)
+                    return records, current_url, frozenset(same_page_navigation_urls)
             if observation_number + 1 < _SEARCH_SETTLE_MAX_OBSERVATIONS:
                 await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
+        if not readable_observation_seen and last_unreadable is not None:
+            raise last_unreadable
         if not _is_cnki_host(urlsplit(current_url).hostname):
             raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
         raise SourceUnavailable(
@@ -1789,29 +1814,50 @@ class CNKIAdapter(LiteratureSourceAdapter):
         ).abstract
 
     async def check_fulltext_access(self) -> AccessDecision:
+        last_unreadable: _CNKIObservationUnreadable | None = None
+        readable_observation_seen = False
+        decision: AccessDecision | None = None
         for observation_number in range(_ACCESS_SETTLE_MAX_OBSERVATIONS):
-            content_kind, content, current_url = await self._content()
-            article_parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
-            if self._expected_record is not None:
-                detail = article_parser(
+            try:
+                content_kind, content, current_url = await self._content()
+            except _CNKIObservationUnreadable as exc:
+                last_unreadable = exc
+            else:
+                readable_observation_seen = True
+                article_parser = self.parse_article_html if content_kind == "html" else self.parse_article_snapshot
+                if self._expected_record is not None:
+                    detail = article_parser(
+                        content,
+                        source_url=current_url,
+                        search_query=self._expected_record.search_query,
+                        challenge_state=self._runtime_challenge_state(),
+                    )
+                    matches, reason = self.identity_matches(self._expected_record, detail)
+                    if not matches:
+                        raise SourceLayoutChanged(f"CNKI target identity lock failed before access check: {reason}")
+                access_parser = self.check_fulltext_access_html if content_kind == "html" else self.check_fulltext_access_snapshot
+                decision = access_parser(
                     content,
                     source_url=current_url,
-                    search_query=self._expected_record.search_query,
                     challenge_state=self._runtime_challenge_state(),
                 )
-                matches, reason = self.identity_matches(self._expected_record, detail)
-                if not matches:
-                    raise SourceLayoutChanged(f"CNKI target identity lock failed before access check: {reason}")
-            access_parser = self.check_fulltext_access_html if content_kind == "html" else self.check_fulltext_access_snapshot
-            decision = access_parser(
-                content,
-                source_url=current_url,
-                challenge_state=self._runtime_challenge_state(),
-            )
-            if not _access_decision_is_settling(decision):
-                return decision
+                if not _access_decision_is_settling(decision):
+                    return decision
             if observation_number + 1 < _ACCESS_SETTLE_MAX_OBSERVATIONS:
                 await asyncio.sleep(_ACCESS_SETTLE_DELAY_SECONDS)
+        if not readable_observation_seen and last_unreadable is not None:
+            raise last_unreadable
+        assert decision is not None
+        if (
+            decision.access_type is AccessType.UNKNOWN
+            and not decision.full_text_accessible
+            and not decision.authorized_access
+        ):
+            return dataclasses.replace(
+                decision,
+                status=RunStatus.SOURCE_LAYOUT_CHANGED,
+                reason=f"ACCESS_READINESS_TIMEOUT: {decision.reason}",
+            )
         return decision
 
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:

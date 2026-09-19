@@ -180,10 +180,19 @@ class BoundedWaitTests(unittest.TestCase):
     """No fixed sleep: a ready page costs one read, a slow one costs a few."""
 
     def test_an_already_rendered_page_is_read_once(self) -> None:
+        from hunnu_harness.literature.adapters import sciencedirect as module
+
         decision, adapter = run_access([AUTHORIZED])
         self.assertTrue(decision.authorized_access)
         self.assertEqual(adapter.browser.observations, 1)
-        self.assertEqual(adapter.last_article_readiness_wait_ms, 0)
+        # Never slept.  Exact zero is not assertable: where time.monotonic() ticks
+        # every 15.6 ms (GetTickCount64 on Windows) a tick landing inside this
+        # sub-millisecond read reports 14-16, in about 0.6% of runs.  The loop's
+        # only sleep is one poll interval, so less than that is "did not sleep".
+        self.assertLess(
+            adapter.last_article_readiness_wait_ms,
+            module.ARTICLE_RENDER_POLL_SECONDS * 1000,
+        )
 
     def test_a_late_control_is_waited_for_then_authorized(self) -> None:
         decision, adapter = run_access(

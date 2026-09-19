@@ -1051,7 +1051,12 @@ class MCPExecutor:
         while time.monotonic() <= deadline:
             path_io = _windows_io_path(path)
             if path_io.is_file():
-                size = path_io.stat().st_size
+                try:
+                    size = path_io.stat().st_size
+                except OSError:
+                    previous_size = None
+                    await asyncio.sleep(0.1)
+                    continue
                 if previous_size == size:
                     return path
                 previous_size = size
