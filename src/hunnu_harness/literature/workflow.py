@@ -457,14 +457,27 @@ class LiteratureAcquisitionWorkflow:
                             full_text_accessible=route.full_text_accessible,
                         )
                     if not access.full_text_accessible or not access.authorized_access:
-                        record.error_status = RunStatus.FULLTEXT_NOT_AUTHORIZED.value
-                        record.error_reason = access.reason
-                        self.logger.log(
-                            "fulltext_not_authorized",
-                            status=RunStatus.FULLTEXT_NOT_AUTHORIZED.value,
-                            paper_id=record.paper_id,
-                            reason=access.reason,
-                        )
+                        if access.status in (RunStatus.FULLTEXT_NOT_AUTHORIZED, RunStatus.SUCCESS):
+                            record.error_status = RunStatus.FULLTEXT_NOT_AUTHORIZED.value
+                            record.error_reason = access.reason
+                            self.logger.log(
+                                "fulltext_not_authorized",
+                                status=RunStatus.FULLTEXT_NOT_AUTHORIZED.value,
+                                paper_id=record.paper_id,
+                                reason=access.reason,
+                            )
+                        else:
+                            record.error_status = access.status.value
+                            record.error_reason = access.reason
+                            errors.append(access.reason)
+                            status = RunStatus.PARTIAL_SUCCESS
+                            self.logger.log(
+                                "fulltext_access_undetermined",
+                                status=access.status.value,
+                                paper_id=record.paper_id,
+                                access_type=access.access_type.value,
+                                reason=access.reason,
+                            )
                         continue
                     source = await self.adapter.download_fulltext(record, access)
                     entry = self.download_manager.archive_authorized_fulltext(source, record, access)
