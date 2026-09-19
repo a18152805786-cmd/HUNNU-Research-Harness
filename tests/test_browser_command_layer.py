@@ -214,7 +214,15 @@ class _RecordingPort:
                 title=self.title,
             )
         if isinstance(command, ObserveCommand):
-            body = "未找到相关结果" if "cnki.net" in self.current_url else "中文文献"
+            if "cnki.net" in self.current_url:
+                body = "未找到相关结果"
+            elif "sciencedirect.com" in self.current_url:
+                # An explicit terminal state, as for CNKI.  ScienceDirect no longer
+                # reports a page that never decided as an empty search, so the
+                # stub has to be a page a real search can end on.
+                body = "No results found"
+            else:
+                body = "中文文献"
             return BrowserObservation(
                 session=SessionHandle(),
                 page=PageHandle(),

@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urljoin, urlsplit
 
-from ...browser.commands import BrowserTarget, DownloadCommand, NavigateCommand, ObserveCommand
+from ...browser.commands import (
+    BrowserTarget,
+    DownloadCommand,
+    NavigateCommand,
+    ObservationUnavailable,
+    ObserveCommand,
+)
 from ...browser.playwright_backend import (
     _INTERSTITIAL_BODY_MARKERS,
     _INTERSTITIAL_TITLE_MARKERS,
@@ -36,7 +42,7 @@ from ..models import (
     UNKNOWN,
 )
 from ..normalization import normalize_doi, stable_paper_id
-from ..security import sanitize_url
+from ..security import sanitize_text, sanitize_url
 
 
 _ARTICLE_PATH = re.compile(r"/science/article/(?:abs/)?pii/([A-Za-z0-9]+)")
@@ -71,7 +77,22 @@ _NO_FULLTEXT_MARKERS = (
     "check for this article elsewhere",
     "rent this article",
 )
+# A third-party title hosted under /org/ says it differently.  It has no access
+# box at all, and none of the phrases above occurs anywhere on the page (read
+# from the live page for 10.1108/jfra-03-2025-0162, an Emerald title, on
+# 2026-09-19).  Where "View PDF" would sit there is a link out to the publisher,
+# and the page's link to its own full text is there but disabled.  Both are
+# required.  The hand-off alone is a way out, not a refusal: a hosted title the
+# session is entitled to could carry it while its own PDF control is still
+# rendering.  Both are matched on rendered links and never on the page text,
+# which here includes inline script: the words alone -- in an abstract, in the
+# page's state -- are not the publisher saying anything.
+_PUBLISHER_HANDOFF_LABELS = ("view at publisher",)
+_OWN_FULLTEXT_LINK_LABELS = ("view full text",)
 _PDF_PATH_MARKERS = ("/pdfft", "/pdf", ".pdf")
+_NO_PDF_CONTROL_REASON = (
+    "No enabled, official PDF view/download control was present on the article page"
+)
 
 
 @dataclass(frozen=True)
@@ -227,6 +248,36 @@ def _article_json_ld(parser: _ScienceDirectHTMLParser) -> dict[str, Any]:
     return {}
 
 
+def _article_title(parser: _ScienceDirectHTMLParser) -> str:
+    """The title an article page gives for itself, or UNKNOWN.
+
+    Extracted so metadata extraction and the wait that precedes it cannot
+    drift apart: the page counts as having said what it is exactly when this
+    finds the title the identity lock will be checked against.
+    """
+
+    title = _meta_first(parser, "citation_title", "dc.title", "og:title")
+    if title == UNKNOWN:
+        article_json = _article_json_ld(parser)
+        title = str(article_json.get("headline", article_json.get("name", UNKNOWN))).strip() or UNKNOWN
+    return title
+
+
+def _interstitial_gate_present(parser: _ScienceDirectHTMLParser) -> bool:
+    """Whether the page reads as the publisher's bot-check interstitial.
+
+    The markers are the browser layer's, borrowed rather than copied.  This
+    only ever classifies: nothing here, or anywhere downstream of it, clicks,
+    types, reloads, or otherwise answers the gate.
+    """
+
+    body = parser.body_text.casefold()
+    return any(
+        marker in body
+        for marker in _INTERSTITIAL_TITLE_MARKERS + _INTERSTITIAL_BODY_MARKERS
+    )
+
+
 def _json_name(value: Any) -> str:
     if isinstance(value, dict):
         return str(value.get("name", "")).strip()
@@ -271,6 +322,29 @@ class SearchPageObservation:
             "ResultContainersObserved": self.result_cards,
             "ArticleLinksObserved": self.article_links,
         }
+
+
+class ArticlePageState(str, Enum):
+    """What an article page is, before anything is extracted from it.
+
+    ``extract_metadata`` used to read the page the instant navigation
+    returned.  A page still held by the publisher's bot-check, or one whose
+    own document was still arriving, then came back with no title -- and that
+    surfaced as "target identity lock failed" for every result in turn, while
+    the loop went on opening further article pages against a publisher that
+    was already challenging.
+    """
+
+    METADATA_PRESENT = "METADATA_PRESENT"
+    # CAPTCHA or login text: ``detect_interruption`` stays the one place that
+    # reports it, so this only says the page has decided.
+    INTERRUPTED = "INTERRUPTED"
+    PAGE_GATE = "PAGE_GATE"
+    PENDING = "PENDING"
+
+    @property
+    def decided(self) -> bool:
+        return self is not ArticlePageState.PENDING
 
 
 class ArticleReadiness(str, Enum):
@@ -477,17 +551,17 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         except LiteratureSourceError:
             return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
         body = parser.body_text.casefold()
-        # A bot-check interstitial is the browser layer's to wait out, but if it
-        # is still on screen when the page is read, this is not a search page and
-        # polling it for twenty seconds would only delay saying so.  The markers
-        # are that layer's, borrowed rather than copied.
-        if any(
-            marker in body
-            for marker in _INTERSTITIAL_TITLE_MARKERS + _INTERSTITIAL_BODY_MARKERS
-        ):
-            return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
+        # The explicit no-results notice is read first.  A search page echoes
+        # the query back, so a query that happens to contain a gate word ("one
+        # moment", "attention required") must not turn a genuinely empty search
+        # into a gate -- which matters now that a gate stops the run.
         if any(marker.casefold() in body for marker in _NO_RESULTS_MARKERS):
             return SearchPageObservation(page_type=SearchPageType.GENUINE_ZERO_RESULTS)
+        # A bot-check interstitial is the browser layer's to wait out, but if it
+        # is still on screen when the page is read, this is not a search page and
+        # polling it for twenty seconds would only delay saying so.
+        if _interstitial_gate_present(parser):
+            return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
         return SearchPageObservation(page_type=SearchPageType.PENDING)
 
     @classmethod
@@ -502,9 +576,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         parser = cls._parser(html)
         article_json = _article_json_ld(parser)
 
-        title = _meta_first(parser, "citation_title", "dc.title", "og:title")
-        if title == UNKNOWN:
-            title = str(article_json.get("headline", article_json.get("name", UNKNOWN))).strip() or UNKNOWN
+        title = _article_title(parser)
         authors = _meta_all(parser, "citation_author", "dc.creator")
         if not authors:
             json_authors = article_json.get("author", [])
@@ -607,6 +679,18 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 return anchor, absolute
         return None, UNKNOWN
 
+    @staticmethod
+    def _metadata_only_decision(reason: str) -> AccessDecision:
+        """The one fail-closed refusal, so its two callers cannot drift apart."""
+
+        return AccessDecision(
+            full_text_accessible=False,
+            access_type=AccessType.METADATA_ONLY,
+            authorized_access=False,
+            status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
+            reason=reason,
+        )
+
     @classmethod
     def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
         cls.detect_interruption(html, url=source_url)
@@ -614,13 +698,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         candidate, candidate_url = cls._pdf_control(parser, source_url=source_url)
 
         if candidate is None:
-            return AccessDecision(
-                full_text_accessible=False,
-                access_type=AccessType.METADATA_ONLY,
-                authorized_access=False,
-                status=RunStatus.FULLTEXT_NOT_AUTHORIZED,
-                reason="No enabled, official PDF view/download control was present on the article page",
-            )
+            return cls._metadata_only_decision(_NO_PDF_CONTROL_REASON)
 
         haystack = parser.body_text.casefold()
         open_markers = (
@@ -661,6 +739,14 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         await self.browser.execute(NavigateCommand(url))
         html, current_url, observation = await self._settled_search_page(source_url=url)
         self.last_search_observation = observation
+        if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
+            # Challenge first: a page that is not a search page never reaches the
+            # result parser.  CAPTCHA and login text stay ``detect_interruption``'s
+            # to report, unchanged; what is left is the bot-check interstitial,
+            # which has no CAPTCHA words and used to fall through the parser as
+            # an empty -- and apparently successful -- search.
+            self.detect_interruption(html, url=current_url)
+            raise self._interstitial_stop("search")
         results = self.parse_search_results_html(
             html,
             query=query,
@@ -679,7 +765,68 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 f"ArticleLinksObserved={observation.article_links}; "
                 "ParsedResultCount=0; ParserFailureDetected=true"
             )
+        if not results and observation.page_type is SearchPageType.PENDING:
+            # Out of time with neither a results list nor a no-results notice.
+            # Only GENUINE_ZERO_RESULTS may be reported as an empty search;
+            # anything else would be inventing an answer the publisher never gave.
+            raise SourceLayoutChanged(
+                "SEARCH_READINESS_TIMEOUT: the ScienceDirect search page presented "
+                "neither a results list nor a no-results notice within "
+                f"{SEARCH_RENDER_TIMEOUT_SECONDS:g}s; ParsedResultCount=0"
+            )
         return results
+
+    @staticmethod
+    def _interstitial_stop(stage: str) -> SourceActionRequired:
+        """The stop for a bot-check interstitial that did not clear by itself.
+
+        The browser layer has already spent its bounded wait on it.  What is
+        left is the publisher's access control, and that is a person's to pass:
+        the run stops here rather than sending the next query into an active
+        challenge.  Gate text was read from a live page but its visibility was
+        never probed, so this claims no more than CHALLENGE_TEXT_UNVERIFIED.
+        """
+
+        return SourceActionRequired(
+            "ACTION_REQUIRED_USER_LOGIN=true; "
+            f"Reason=Publisher bot-check interstitial still on the ScienceDirect {stage} page "
+            "after the bounded wait; it was not interacted with; "
+            "BrowserReadyForManualAction=false",
+            reason=HumanActionReason.CHALLENGE_TEXT_UNVERIFIED,
+            challenge_observed=True,
+            challenge_visible=False,
+            challenge_blocking=False,
+            browser_ready_for_manual_action=False,
+        )
+
+    @staticmethod
+    def _no_fulltext_notice(
+        parser: _ScienceDirectHTMLParser, *, source_url: str, page_pii: str
+    ) -> bool:
+        """Whether the page says, in so many words, that the full text is not here."""
+
+        body = parser.body_text.casefold()
+        if any(marker in body for marker in _NO_FULLTEXT_MARKERS):
+            return True
+        # The hosted third-party page: a link out to the publisher, and this
+        # article's own full-text link present but disabled.
+        handed_off = own_fulltext_disabled = False
+        for anchor in parser.anchors:
+            label = " ".join(anchor.text.split()).casefold()
+            if any(item in label for item in _PUBLISHER_HANDOFF_LABELS):
+                handed_off = True
+            elif (
+                any(item in label for item in _OWN_FULLTEXT_LINK_LABELS)
+                and anchor.attributes.get("aria-disabled", "").casefold() == "true"
+            ):
+                target = _ARTICLE_PATH.search(urlsplit(urljoin(source_url, anchor.href)).path)
+                if (
+                    target is not None
+                    and page_pii != UNKNOWN
+                    and target.group(1).casefold() == page_pii.casefold()
+                ):
+                    own_fulltext_disabled = True
+        return handed_off and own_fulltext_disabled
 
     @classmethod
     def observe_article_readiness(
@@ -690,7 +837,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         The authorized landmark is the access decision's own control, found
         through the same predicate, and it must belong to the article being
         read: a PDF control for some other paper is not this paper's full text,
-        so it leaves the page undecided rather than authorising anything.
+        so it never authorises anything.  Nor does it decide anything: with it
+        on the page or without it, only the publisher's own notice refuses, and
+        a page offering neither this article's control nor a notice is undecided.
         """
 
         page_match = _ARTICLE_PATH.search(urlsplit(source_url).path)
@@ -704,32 +853,34 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
 
         parser = cls._parser(html)
         control, control_url = cls._pdf_control(parser, source_url=source_url)
+        control_pii = UNKNOWN
         if control is not None:
             control_match = _ARTICLE_PATH.search(urlsplit(control_url).path)
             control_pii = control_match.group(1) if control_match else UNKNOWN
-            if page_pii != UNKNOWN and control_pii.casefold() != page_pii.casefold():
-                # Someone else's PDF.  Not a refusal and certainly not an
-                # authorisation, so keep waiting for this article's own control.
+            if page_pii == UNKNOWN or control_pii.casefold() == page_pii.casefold():
                 return ArticleReadinessObservation(
-                    readiness=ArticleReadiness.PENDING_RENDER,
+                    readiness=ArticleReadiness.FULLTEXT_AUTHORIZED,
                     pdf_control_url=control_url,
                     pdf_control_pii=control_pii,
                     page_pii=page_pii,
                 )
-            return ArticleReadinessObservation(
-                readiness=ArticleReadiness.FULLTEXT_AUTHORIZED,
-                pdf_control_url=control_url,
-                pdf_control_pii=control_pii,
-                page_pii=page_pii,
-            )
+            # Someone else's PDF -- on the live page, a recommended article's.
+            # Not a refusal and certainly not an authorisation.  It used to end
+            # the reading here as well, so once the recommendations had rendered
+            # the page could no longer be heard refusing, and sat out the whole
+            # window undecided.  It is kept as evidence and the reading goes on.
 
-        body = parser.body_text.casefold()
-        if any(marker in body for marker in _NO_FULLTEXT_MARKERS):
-            return ArticleReadinessObservation(
-                readiness=ArticleReadiness.FULLTEXT_NOT_AUTHORIZED, page_pii=page_pii
-            )
+        # Without this article's own control, only the publisher's own words
+        # decide anything; with neither, keep waiting.
         return ArticleReadinessObservation(
-            readiness=ArticleReadiness.PENDING_RENDER, page_pii=page_pii
+            readiness=(
+                ArticleReadiness.FULLTEXT_NOT_AUTHORIZED
+                if cls._no_fulltext_notice(parser, source_url=source_url, page_pii=page_pii)
+                else ArticleReadiness.PENDING_RENDER
+            ),
+            pdf_control_url=control_url,
+            pdf_control_pii=control_pii,
+            page_pii=page_pii,
         )
 
     async def _observe_until_decided(self, classify, *, timeout: float, poll: float):
@@ -740,16 +891,44 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         the part that answers the question, and a page read there looks exactly
         like a page with nothing to give.  A page that has already rendered
         costs one observation, so this never becomes a fixed delay.
+
+        A read that fails because the page is between documents -- the
+        publisher's bot-check reloads itself, and Playwright refuses
+        ``page.content()`` while a navigation is in flight -- is the same
+        "not decided yet", not a reason to abandon the query.  It used to
+        escape as a bare ``ObservationUnavailable``, which the workflow could
+        only log by class name.  Re-reading is all this does: it never
+        navigates, reloads, or touches the page, and it ends at the same
+        deadline either way.
         """
 
         started = time.monotonic()
         deadline = started + timeout
-        html, current_url = await self._content()
-        verdict = classify(html, current_url)
-        while not verdict.decided and time.monotonic() < deadline:
+        html = current_url = verdict = None
+        unreadable: ObservationUnavailable | None = None
+        while True:
+            try:
+                html, current_url = await self._content()
+            except ObservationUnavailable as exc:
+                unreadable = exc
+            else:
+                verdict = classify(html, current_url)
+                if verdict.decided:
+                    break
+            if time.monotonic() >= deadline:
+                break
             await asyncio.sleep(poll)
-            html, current_url = await self._content()
-            verdict = classify(html, current_url)
+        if verdict is None:
+            # Not one readable observation in the whole window.
+            cause = unreadable.__cause__ if unreadable is not None else None
+            detail = " ".join(str(unreadable).split())
+            if cause is not None:
+                detail = f"{detail} ({type(cause).__name__}: {' '.join(str(cause).split())})"
+            raise SourceUnavailable(
+                "PAGE_OBSERVATION_TIMEOUT: the ScienceDirect page could not be read "
+                f"at any point within {timeout:g}s; "
+                f"LastObservationError={sanitize_text(detail)[:300]}"
+            ) from unreadable
         waited_ms = int((time.monotonic() - started) * 1000)
         return html, current_url, verdict, waited_ms
 
@@ -796,8 +975,44 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             return False
         return actual.group(1).casefold() == expected.group(1).casefold()
 
+    @classmethod
+    def observe_article_page(cls, html: str, *, source_url: str) -> ArticlePageState:
+        """Classify an article page without extracting from it.
+
+        Like ``observe_search_page`` this never raises, because it is polled
+        while the page settles.  A title outranks gate words: an article that
+        has said what it is cannot be a gate, whatever its abstract mentions.
+        """
+
+        try:
+            cls.detect_interruption(html, url=source_url)
+        except LiteratureSourceError:
+            return ArticlePageState.INTERRUPTED
+        parser = cls._parser(html)
+        if _article_title(parser) != UNKNOWN:
+            return ArticlePageState.METADATA_PRESENT
+        if _interstitial_gate_present(parser):
+            return ArticlePageState.PAGE_GATE
+        return ArticlePageState.PENDING
+
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
-        html, current_url = await self._content()
+        """Extract metadata, but only once the page has said what it is.
+
+        The extraction itself is untouched: the same HTML yields the same
+        record, and the identity lock downstream is exactly as strict.  What
+        changed is that a gate stops the run as a gate instead of as a failed
+        identity lock, and a document still arriving is given the same bounded
+        window the access check already had.  A page that never presents a
+        title is parsed as before and fails the lock closed, as before.
+        """
+
+        html, current_url, state, _waited = await self._observe_until_decided(
+            lambda body, url: self.observe_article_page(body, source_url=url),
+            timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
+            poll=ARTICLE_RENDER_POLL_SECONDS,
+        )
+        if state is ArticlePageState.PAGE_GATE:
+            raise self._interstitial_stop("article")
         return self.parse_article_html(html, source_url=current_url, search_query=search_query)
 
     async def extract_abstract(self) -> str:
@@ -812,6 +1027,11 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         ScienceDirect is still rendering the control the decision looks for --
         a moment at which an entitled, open-access article was indistinguishable
         from one behind a paywall, and was reported as the latter.
+
+        A refusal is returned here rather than asked of that decision.  The
+        HTML decision takes the first PDF-like control it meets, which is right
+        only while readiness vouches that the control is this article's; a page
+        can refuse with another article's PDF control still on it.
         """
 
         html, current_url, observation, waited_ms = await self._observe_until_decided(
@@ -834,6 +1054,18 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                     "either an enabled PDF control for this article or an explicit "
                     f"no-full-text notice within {ARTICLE_RENDER_TIMEOUT_SECONDS:g}s"
                 ),
+            )
+        if observation.readiness is ArticleReadiness.FULLTEXT_NOT_AUTHORIZED:
+            # The page refused, and the refusal is returned as one.  Handed to
+            # the HTML decision, the first PDF-like control on the page would
+            # answer instead -- on a hosted page a recommended article's -- and
+            # the refusal would come back as an authorisation of the wrong paper.
+            if observation.pdf_control_url == UNKNOWN:
+                return self._metadata_only_decision(_NO_PDF_CONTROL_REASON)
+            return self._metadata_only_decision(
+                "The article page gave an explicit no-full-text notice and no PDF "
+                "control for this article; the PDF controls on it belong to other "
+                f"articles (first seen: PII {observation.pdf_control_pii})"
             )
         return self.check_fulltext_access_html(html, source_url=current_url)
 
