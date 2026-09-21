@@ -28,6 +28,26 @@ from hunnu_harness.paths import (
 
 # The sealed audit numbers this corpus is frozen at.
 #
+# Resealed at 198/211/364 on 2026-09-21, from 188/201/351, at the user's
+# instruction.  Ten works entered the corpus for the AI-washing literature
+# runs.  On 2026-09-18 five came through the harness from SpringerLink (AMS
+# Review, Information Technology and Management, Review of Accounting
+# Studies, Journal of Business Ethics, SN Business & Economics), each
+# auto-classified under one existing topic except one filed under two: +6
+# assignments.  On 2026-09-19 four came through the harness (Journal of
+# Financial Economics and Journal of Accounting and Economics from
+# ScienceDirect, two Quarterly Journal of Economics papers from Oxford) and
+# one Organization Science paper through library-import.  Two of those were
+# auto-classified (+2); three carried no topic, and the user chose theirs,
+# confirmed through library-confirm-topics (HUMAN_CONFIRMED, +5):
+# PA652046627EC and P024706E4D39D under two topics each, P58B322BC42DF under
+# one.  Two of the three had raised nothing at all, which the confirmation
+# command refuses as needing taxonomy review, so the English alias table
+# gained "earnings persistence" (盈余质量与财务报告) and "political risk"
+# (风险承担与不确定性) first, with the per-language replay and the collision
+# canaries holding.  No topic was created.  The numbers are read from
+# LibraryFingerprinter().capture(), not derived.
+#
 # Resealed at 188/201/351 on 2026-09-05, from 187/200/349.  Three papers
 # entered the corpus today for the Fable5 Round 2 citation audit: Hummels,
 # Ishii and Yi (2001) and Koopman, Wang and Wei (2012) via ScienceDirect
@@ -71,9 +91,9 @@ from hunnu_harness.paths import (
 #
 # Unique topics stays 39 on purpose: every acquisition was filed under a topic
 # that already existed, and nothing here may create a fortieth.
-EXPECTED_WORKS = 188
-EXPECTED_VERSIONS = 201
-EXPECTED_TOPIC_ASSIGNMENTS = 351
+EXPECTED_WORKS = 198
+EXPECTED_VERSIONS = 211
+EXPECTED_TOPIC_ASSIGNMENTS = 364
 EXPECTED_UNIQUE_TOPICS = 39
 
 # Known fixtures in the real corpus, verified during discovery.
@@ -270,9 +290,28 @@ class TestEEnglishQuery(unittest.TestCase):
         self.assertTrue(any(item["concept"] == "ai_washing" for item in expansions))
 
     def test_chinese_query_reaches_english_works(self):
+        """A Chinese query reaches English WORKS through their own English titles.
+
+        This used to pin BANK_LOANS_WORK inside the top 12.  The 2026-09-21
+        reseal added English AI-washing works that now rank ahead of it (it is
+        13th, behind seven of them), so a fixed id measured the size of the
+        corpus rather than the cross-language path.  The path is what is
+        asserted now: an English title matched by the lexicon's English
+        expansion of the Chinese query -- not merely by the Chinese topic label
+        the work also carries, which a Chinese query would match anyway.
+        """
+
         payload = self.navigator.search("人工智能漂洗", top=12, use_fulltext=False)
-        ids = [row["paper_id"] for row in payload["results"]]
-        self.assertIn(BANK_LOANS_WORK, ids)
+        reached = [
+            row["paper_id"]
+            for row in payload["results"]
+            if not any("一" <= char <= "鿿" for char in row["title"])
+            and any(
+                hit.get("signal") == "title" and hit.get("source") == "expansion"
+                for hit in row["matched_by"]
+            )
+        ]
+        self.assertTrue(reached, [row["paper_id"] for row in payload["results"]])
 
 
 @unittest.skipUnless(LIBRARY_PRESENT, _SKIP)
