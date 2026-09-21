@@ -90,7 +90,7 @@ decision to the user in plain language.
 
 37. Adapter resolution comes before any Harness-managed publisher navigation. For a Harness-managed request, the resolved adapter owns source-specific official-site and institutional-route decisions once a compatible `BrowserCommandPort` exists. v0.2.18 adds `BrowserSessionBroker` and `MCPExecutor`: the broker owns logical session/page identity and the executor is the only allow-listed typed MCP tool-call boundary. The Python runtime still does not launch or attach a second browser; a host must supply an `MCPToolClient` for the existing dedicated Playwright MCP session. Raw MCP tools are not a literature fallback. Manual authentication, CAPTCHA, MFA, CAS, and WebVPN gates remain user-only stops under Rules 1–2 and 22–25.
 
-## Agent-facing Harness entry point (Harness v0.3.5; routing schema v0.2.9)
+## Agent-facing Harness entry point (Harness v0.3.6; routing schema v0.2.9)
 
 This section defines **how** an Agent calls Harness after global routing has selected it. It does not replace the safety rules above.
 
