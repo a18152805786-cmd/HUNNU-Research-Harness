@@ -721,5 +721,106 @@ class InstitutionalSpringerFinalizerTests(unittest.TestCase):
             self._cleanup_read_only(root)
 
 
+class OxfordDetailPageRouteTests(unittest.IsolatedAsyncioTestCase):
+    """The HUNNU detail page publishes its address in a click handler.
+
+    Observed live on 2026-09-19: the Oxford route stopped with "HUNNU database
+    detail did not expose one unambiguous official publisher link" because
+    _RouteHTMLParser collected only <a> elements, and this page has no anchor
+    carrying the publisher address at all.  The resolver was then driven with
+    HUNNU_OXFORD_ROUTE_URL as a manual workaround; these tests pin that the
+    route no longer needs it.
+    """
+
+    DETAIL_URL = (
+        "https://wisdom.chaoxing.com/newwisdom/doordatabase/"
+        "databasedetail.html?wfwfid=125449&pageId=36761&id=26605"
+    )
+    OXFORD_ENTRY = "https://academic.oup.com/journals"
+
+    def test_the_publisher_address_in_a_click_handler_is_read(self):
+        entries = HUNNUInstitutionalAccessResolver.discover_database_entries(
+            fixture("hunnu_oxford_detail.html"),
+            base_url=self.DETAIL_URL,
+            requested_source="OxfordAcademic",
+        )
+        urls = {entry.navigation_url for entry in entries}
+        self.assertIn(self.OXFORD_ENTRY, urls)
+
+    def test_the_off_campus_carsi_entry_is_not_an_unattended_candidate(self):
+        """This failing means the run may be steered into a federated sign-in.
+
+        It is also what keeps the two published addresses from tying under
+        choose_candidate and failing closed on an ambiguity that is not real.
+        """
+
+        entries = HUNNUInstitutionalAccessResolver.discover_database_entries(
+            fixture("hunnu_oxford_detail.html"),
+            base_url=self.DETAIL_URL,
+            requested_source="OxfordAcademic",
+        )
+        self.assertNotIn("https://academic.oup.com/", {e.navigation_url for e in entries})
+        chosen, match = HUNNUInstitutionalAccessResolver.choose_candidate(entries)
+        self.assertIs(match, True)
+        self.assertEqual(chosen.navigation_url, self.OXFORD_ENTRY)
+
+    def test_the_handler_is_read_never_evaluated(self):
+        """Only a percent-encoded absolute http(s) argument is a candidate."""
+
+        hostile = (
+            "<html><body>"
+            "<span onclick=\"redirecturl(1,0,1,'','javascript%3Aalert(1)',0)\">a</span>"
+            "<span onclick=\"redirecturl(2,0,1,'','%2Frelative%2Fpath',0)\">b</span>"
+            "<span onclick=\"redirecturl(3,0,1,'','https%3A%2F%2Fuser%3Apw%40evil.example%2F',0)\">c</span>"
+            "<span onclick=\"otherhandler('https%3A%2F%2Facademic.oup.com%2F')\">d</span>"
+            "<span onclick=\"redirecturl(5,0,1,'https%3A%2F%2Fa.example%2F','https%3A%2F%2Fb.example%2F',0)\">e</span>"
+            "</body></html>"
+        )
+        parser = HUNNUInstitutionalAccessResolver._parse(hostile)
+        self.assertEqual(parser.script_links, [])
+
+    def test_an_ordinary_page_gains_no_candidates_from_this(self):
+        """A page whose links are real anchors must behave exactly as before."""
+
+        parser = HUNNUInstitutionalAccessResolver._parse(
+            fixture("hunnu_springer_detail.html")
+        )
+        self.assertEqual(parser.script_links, [])
+
+    async def test_the_whole_route_resolves_without_the_environment_override(self):
+        pages = {
+            "https://www.hunnu.edu.cn/": fixture("hunnu_portal.html"),
+            "https://lib.hunnu.edu.cn/": fixture("hunnu_library.html"),
+            self.DETAIL_URL: fixture("hunnu_oxford_detail.html"),
+            self.OXFORD_ENTRY: (
+                "<html><head><title>Journals | Oxford Academic</title></head>"
+                "<body>Oxford Academic</body></html>"
+            ),
+        }
+        browser = _MockBrowser(pages)
+        # The detail URL is supplied as the discovered entry, not as the env
+        # override: what is under test is reading the page, not the override.
+        resolver = HUNNUInstitutionalAccessResolver(browser, oxford_route_url=self.DETAIL_URL)
+        result = await resolver.resolve(
+            "OxfordAcademic",
+            trigger=InstitutionalResolutionTrigger.DIRECT_ROUTE_UNAVAILABLE,
+        )
+        self.assertTrue(result.institutional_route_resolved)
+        self.assertIs(result.institutional_target_database_match, True)
+        self.assertEqual(result.publisher_entry_url, self.OXFORD_ENTRY)
+
+    def test_the_real_navigation_page_still_yields_one_oxford_entry(self):
+        """The click handlers must not create a rival that outranks the entry."""
+
+        entries = HUNNUInstitutionalAccessResolver.discover_database_entries(
+            fixture("hunnu_oxford_navigation.html"),
+            base_url="https://wisdom.chaoxing.com/newwisdom/doordatabase/database.html",
+            requested_source="OxfordAcademic",
+        )
+        chosen, match = HUNNUInstitutionalAccessResolver.choose_candidate(entries)
+        self.assertIs(match, True)
+        self.assertIn("id=26605", chosen.navigation_url)
+
+
 if __name__ == "__main__":
     unittest.main()
