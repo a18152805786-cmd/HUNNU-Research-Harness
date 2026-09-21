@@ -138,16 +138,26 @@ def _resolve_float_setting(
     return resolved
 
 
-def _resolve_burst_limit(explicit: int | None) -> int:
-    """Resolve the burst ceiling from an explicit value, env, or default."""
+def _resolve_burst_limit(
+    explicit: int | None,
+    *,
+    env_name: str = BURST_LIMIT_ENV,
+    default: int = BURST_WINDOW_LIMIT,
+) -> int:
+    """Resolve the burst ceiling from an explicit value, env, or default.
+
+    ``env_name``/``default`` are parameters so the search pacer can reuse this
+    validation with its own knob; the fetch ledger's own values are unchanged
+    defaults, so nothing about the download budget moves.
+    """
 
     raw: Any
     if explicit is not None:
         raw = explicit
     else:
-        raw = os.environ.get(BURST_LIMIT_ENV)
+        raw = os.environ.get(env_name)
         if raw is None:
-            return BURST_WINDOW_LIMIT
+            return default
     try:
         # Unlike the environment, an explicit setting is type-annotated as an
         # int; reject lossy float coercions instead of silently truncating.
@@ -156,11 +166,11 @@ def _resolve_burst_limit(explicit: int | None) -> int:
         resolved = int(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"{BURST_LIMIT_ENV} must be an integer >= 1; got {raw!r}."
+            f"{env_name} must be an integer >= 1; got {raw!r}."
         ) from exc
     if resolved < 1:
         raise ValueError(
-            f"{BURST_LIMIT_ENV} must be an integer >= 1; got {raw!r}."
+            f"{env_name} must be an integer >= 1; got {raw!r}."
         )
     return resolved
 
