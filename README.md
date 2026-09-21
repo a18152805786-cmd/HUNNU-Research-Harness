@@ -1,6 +1,111 @@
 # HUNNU Research Harness v0.3.6
 
-## 给安装 Agent 的指引（拿到 zip 后先读这一节）
+**一个面向经管实证研究、"人在环路"的科研自动化框架。** 学校统一认证、验证码和需要判断的地方，永远交给研究者本人；登录之后那些机械但不能出错的操作（数据库下载、文献检索与全文获取、入库归档、文献查找），交给 AI agent，但 agent 只能走 Harness 提供的受控接口，每一步都有校验、记账和审计。
+
+Python 3.11+ · Playwright · Windows + Chrome · 1300+ 项自动化测试 · GPL-3.0
+
+> **给安装 Agent：** 拿到 zip 后直接跳到下方[安装](#安装)一节逐步执行；开始干活前先读完 [AGENTS.md](AGENTS.md)。
+
+## 它解决什么问题
+
+做实证研究，要在学校购买的数据库和出版商网站之间反复往返：登录、检索、核对、下载、改名、归档，过段时间再把文献找回来。每一步都不难，但都不能错：下错一篇、重复下载、被出版商判为异常流量，代价都落在研究者自己的机构账号上。
+
+直接让 agent 去"点网页"，问题恰恰出在这里：它会把"没看清"当成"没有"，把"被拦住"当成"失败了再试一次"。Harness 的做法是把人和机器的边界画清楚，并且让边界由代码守住，而不是靠 agent 自觉。
+
+## 接口一览
+
+| 类别 | 接口 | 能力 |
+|---|---|---|
+| 金融数据库 | **CNRDS** 中国研究数据服务平台 · CNFS 财务报表 | 资产负债表、利润表、现金流量表；操作前校验数据库 / 模块 / 表状态，原始文件留档并计算 SHA-256 |
+| 中文文献 | **CNKI** 中国知网 | 检索、全文权限判断、授权下载；兼容 2026 年新版与旧版两套页面 |
+| 英文文献 | **ScienceDirect**（Elsevier）· **SpringerLink** · **Oxford Academic** | 检索、全文权限判断、授权下载、多来源预检、无人值守下载；ScienceDirect 能识别出版商的拒绝页并停下 |
+| 机构访问 | 湖南师范大学图书馆数据库导航 | 从图书馆入口解析到出版商的机构访问路由，带身份锁定；校外 CARSI 登录入口不作为自动路由 |
+| 公开证据 | **OfficialWeb** | 期刊投稿须知等公开官方网页，按域名白名单取证；遇登录、验证、付费墙即停 |
+| 文献库 | **Global Paper Library** | 去重、同一作品多版本、SHA-256、入库自动主题分类 + 人工确认溯源、受控外部导入 |
+| 文献导航 | **Paper Research Navigator**（9 个 `paper-*` 命令） | 中英跨语言检索、相关文献、阅读包、本地覆盖缺口分析、引用核验 |
+| Agent 接入 | `agent-route` · `capabilities` · `doctor` | 结构化请求路由与无网络 dry-run；所有命令支持 `--json`；分级退出码 0–5 |
+
+## 设计要点
+
+1. **人工闸门。** 遇到登录、验证码、MFA 或出版商的拒绝页，一律停下，以退出码 2 把控制权交还用户。不输入密码，不读取、不导出 cookie，不自动操作任何验证。
+2. **写前记账的下载额度。** 每次全文下载前先落账：每日总量默认 15（用户自己的旋钮），同一篇每天最多 2 次（防循环，不可调），下载之间至少间隔 15 秒、10 分钟内最多 12 次。先记账再下载，所以中途失败的下载也算数，不会因为"没成功"被反复重试。
+3. **跨进程检索限速。** 检索之间至少 20 秒、10 分钟内最多 6 次；状态落盘，多个进程共享。这条来自一次真实教训：几分钟内从 7 个独立进程各发一次检索，会话被出版商封了两次。
+4. **不把"判断不了"报成结论。** 无法判定全文权限 ≠ 出版商拒绝；读不到页面 ≠ 验证页已消失；零结果 ≠ 撞到了验证页。每一种都有单独的状态和测试。
+5. **身份锁定与可追溯。** 检索结果与详情页、下载文件与目标论文逐一核对 DOI / 标题；原始文件留档、计算 SHA-256，生成不含任何凭据的 manifest。
+6. **代码与数据分离。** 所有运行产物写在仓库外的 Output Root，代码目录里没有任何学校数据。
+7. **给 agent 的规则有执行审计。** [AGENTS.md](AGENTS.md) 共 74 条规则，[执行力审计](docs/AGENTS_ENFORCEMENT_AUDIT.md)逐条标注它由代码强制还是只靠约定（43 条由代码强制）。护栏由测试钉住，禁止为了让测试变绿而删测试、改护栏。
+
+## 架构
+
+```mermaid
+flowchart LR
+    U["用户本人<br/>学校认证 · 验证码 · 人工判断"]
+    A["AI Agent<br/>Codex / Claude"]
+    subgraph H["HUNNU Research Harness"]
+        CLI["CLI · agent-route<br/>JSON 输出 · 退出码 0-5"]
+        B["AdapterExecutionBroker<br/>数据源适配器"]
+        G["额度与限速<br/>FulltextFetchLedger · SearchPaceLedger"]
+        P["BrowserCommandPort"]
+        D["下载校验<br/>身份锁定 · SHA-256 · manifest"]
+        L["Global Paper Library"]
+        N["Paper Research Navigator"]
+    end
+    C["专用 Research Chrome<br/>用户已登录的会话"]
+    S[("CNRDS · CNKI · ScienceDirect<br/>SpringerLink · Oxford Academic")]
+    O[("Output Root<br/>runs · manifests · library · audit")]
+
+    A --> CLI --> B
+    B --> G
+    B --> P --> C --> S
+    U -.->|登录 / 过验证| C
+    B -.->|退出码 2：交还用户| U
+    C --> D --> L --> O
+    A --> N --> L
+```
+
+适配器从不直接操作 Playwright 对象，而是向 `BrowserCommandPort` 发送类型化命令，由本地 Playwright 或 Playwright MCP 执行；浏览器始终是用户本人登录过的专用 profile，不是日常浏览器。
+
+## 快速上手
+
+装好之后（见[安装](#安装)）：
+
+```powershell
+.venv\Scripts\hunnu-harness.exe doctor --json            # 本机是否就绪（无网络）
+.venv\Scripts\hunnu-harness.exe capabilities --json      # 支持的来源、旋钮、退出码
+.venv\Scripts\hunnu-harness.exe browser-start            # 启动专用 Research Chrome，由用户本人登录学校账号
+.venv\Scripts\hunnu-harness.exe library-fetch-budget     # 今天还剩多少下载额度
+.venv\Scripts\hunnu-harness.exe acquire --source sciencedirect --doi <DOI> --max-downloads 1
+.venv\Scripts\hunnu-harness.exe paper-search --query "数字化转型 与 企业创新"
+```
+
+更多命令与运行细节见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+
+## 实际使用情况
+
+- 在 CNKI、ScienceDirect、SpringerLink、Oxford Academic 四个站点完成过真实验收；CNRDS 完成过一次端到端验收。
+- 日常用于本人实证研究的文献工作：本地文献库 198 篇 / 211 个文件版本 / 39 个主题（截至 2026-09-21）。
+- 19 个版本，每版有发布记录与离线验收（[docs/RELEASE_HISTORY.md](docs/RELEASE_HISTORY.md)）；带真实文献库运行时 1314 项测试通过、0 失败。
+
+## 开发方式
+
+本项目采用 AI 协作开发：需求、架构取舍和验收标准由作者制定，Codex 与 Claude 负责实现与交叉审查，每项改动都要通过测试和人工审查才能合入。审查中拦下的问题和修复过程都留在提交历史与发布记录里。
+
+## 合规与使用边界
+
+- 仅用于个人科研，在所在学校已购数据库的授权范围内使用。
+- 不输入或保存密码、验证码、MFA；不读取或导出 cookie；不绕过付费墙、学校认证、验证码或下载限制。
+- 有额度、有限速，遇到出版商拒绝即停，不做批量爬取。
+- 学校授权数据、下载的全文和浏览器状态不进入 Git。
+- 使用者需自行遵守所在机构与数据库、出版商的使用条款。
+
+## 局限
+
+- 机构访问路由针对湖南师范大学图书馆；换学校需要适配入口与身份校验。
+- CNRDS 目前覆盖 CNFS 三张财务报表；万方、RESSET、EPS 等来源尚未实现，未实现的来源不会静默退回临时脚本。
+- 开发与验证环境为 Windows + Chrome。
+- 真实采集依赖出版商页面结构，改版后需要更新适配器；Harness 会报告页面无法识别，而不是猜。
+
+## 安装
 
 这一节写给替用户完成安装的 agent：按顺序执行，每一步都先跑命令、再跑验证、失败走对应分支。全程不需要用户账号密码；遇到密码、验证码、MFA 一律停下来交给用户本人。装完之后，操作契约在 [AGENTS.md](AGENTS.md)——先读完再动手干活。
 
@@ -62,178 +167,19 @@ python -m venv .venv
 
 **装完须知。** 真实采集（`live-*`）会用用户自己的学校账号配额：登录由用户本人在专用 Chrome profile 里完成（正常约每天一次），每日取件总量默认 15（`--daily-limit` 或 `HUNNU_HARNESS_DAILY_FETCH_LIMIT` 可调），同一篇一天最多 2 次的循环保护不可调。这些设计的理由都写在 AGENTS.md 里。
 
----
+## 文档
 
-湖南师范大学数字资源研究自动化 Harness。它把“人工完成学校认证”和“登录后的研究操作”明确分开：Harness 可以识别页面、进入 CNRDS CNFS、选择研究条件、触发合法下载并归档原始文件；它不会输入密码、验证码或 MFA，也不会导出 cookie。
+| 文档 | 内容 |
+|---|---|
+| [AGENTS.md](AGENTS.md) | 给 agent 的操作契约（74 条规则） |
+| [docs/AGENTS_ENFORCEMENT_AUDIT.md](docs/AGENTS_ENFORCEMENT_AUDIT.md) | 每条规则由什么守住：代码强制还是只靠约定 |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 运行细节：路径边界、浏览器生命周期、CNRDS 用法、OfficialWeb、分批预算 |
+| [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md) | Agent 接入与全局路由 |
+| [docs/GLOBAL_PAPER_LIBRARY.md](docs/GLOBAL_PAPER_LIBRARY.md) | 全局文献库与外部导入契约 |
+| [docs/PAPER_RESEARCH_NAVIGATOR.md](docs/PAPER_RESEARCH_NAVIGATOR.md) | 文献导航的设计与命令 |
+| [docs/POST_ACQUISITION_CLASSIFICATION.md](docs/POST_ACQUISITION_CLASSIFICATION.md) | 入库后主题分类与校准 |
+| [docs/RELEASE_HISTORY.md](docs/RELEASE_HISTORY.md) | 各版本变更记录 |
 
-## 当前能力
+## 许可证
 
-- 认证状态：`AUTH_UNKNOWN`、`AUTH_REQUIRED`、`AUTH_IN_PROGRESS`、`AUTH_SUCCESS`、`SESSION_EXPIRED`。
-- CNRDS Adapter：CNFS 三张表和核心动作接口已建立，操作前校验数据库/模块/表状态。
-- 下载管理：监测 `.crdownload`/`.part` 等临时文件，检查文件大小稳定，计算 SHA-256，复制原始文件到研究归档并生成 JSON manifest。
-- 专用浏览器：Playwright 持久化 profile 启动入口，不默认使用日常 Chrome profile。
-- Literature Acquisition：已实现 CNKI、SpringerLink、ScienceDirect、OxfordAcademic Adapter，以及湖南师范大学机构访问路由 fallback。v0.2.7 仅对专用 Research Chrome profile 定向启用 `plugins.always_open_pdf_externally`，因此 Harness 点击 Oxford 官方 PDF action 后可直接产生标准 Playwright download event，无需用户操作 Chrome PDF Viewer。下载继续进入既有 validator、Target Identity Lock、SHA-256、manifest 与 archive；`ManualDownloadHandoff` 仍保留为人工 fallback，但不计为无人值守成功。全程不 replay URL，也不自动操作 Viewer GUI。
-- Agent Integration：`agent-route` 为 Agent 提供稳定的结构化请求路由与无网络 dry-run；详见 [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md)。
-- Multi-source preflight：显式无人值守的多来源请求先动态扫查全部计划来源、批量汇总人工认证 Gate，并要求每来源完成一次本会话授权下载、文件验证与 Target Identity Lock 后才签发 `UnattendedRunClearance=true`。
-- Global Paper Library：在既有 run archive、Target Identity Lock、文件验证和 SHA-256 之后，把全文以现有 PaperID 纳入 `Output Root/library/`。JSONL 是 catalog source of truth，CSV 是人工查看投影；同一作品的不同 SHA-256 作为不同文件版本保留，绝不覆盖主版本。
-- OfficialWeb：通过正式 `OfficialWebExecutionBroker -> PublicOfficialWebAdapter -> BrowserCommandPort` 路径获取公开官方网页证据。请求必须提供 `AllowedDomains`；跳转出 allowlist、登录、CAPTCHA、安全挑战、付费墙或非 HTML 内容均 fail closed。它不下载论文，也不替代 CNKI/出版社 adapter。
-- Bounded multi-batch research：单批下载硬上限仍为 25；显式 `TotalDownloadBudget` 可由 planner 拆成多个受控批次，并保留总候选/下载预算、有限重试和可选 quota group 扩展点。规划不会自动执行下载。
-
-Global Library 与受控 external import 的正式契约见 [docs/GLOBAL_PAPER_LIBRARY.md](docs/GLOBAL_PAPER_LIBRARY.md)。外部工具只能显式 COPY 单个候选到 staging，再提交 claimed metadata；Harness 会先用本地 PDF 首页面内容独立核验 DOI/title，无法验证或存在冲突时进入 review。Harness 不提供全盘扫描、MOVE、DELETE、联网身份补全或静默覆盖入口。
-
-## v0.1 CNRDS 端到端验收
-
-`HarnessV01CNRDSTestPassed=true`
-
-已在用户人工完成湖南师范大学统一身份认证后，使用专用 Research Chrome 和 Playwright MCP 完成一次最小真实链路：CNRDS → CNFS → 现金流量表 → 000001 → 2024 → CSV。下载由 Download Manager 检测完成，原始压缩包保留、计算 SHA-256，并生成 manifest。
-
-### 实际使用流程
-
-1. 启动 HUNNU Research Chrome。
-2. 用户人工登录学校账号。
-3. 用户告诉 Codex：“已登录，继续”。
-4. Harness 检测认证状态、CNRDS 页面和当前数据表。
-5. Agent 设置数据库任务并执行最小样本预览与下载。
-6. Download Manager 检测下载完成及临时文件状态。
-7. 原始文件归档并保留原文件。
-8. 对原始下载文件计算 SHA-256。
-9. 生成不含密码、Cookie、session token、验证码或 MFA 信息的 manifest。
-
-## 环境准备
-
-```powershell
-cd <Harness 根目录>
-.venv\Scripts\python.exe -m pip install -e .
-# 需要本地 Playwright 后端时：
-.venv\Scripts\python.exe -m pip install -e ".[browser]"
-```
-
-### 路径边界
-
-代码工作区：
-
-`<Harness 根目录>`
-
-正式论文研究数据与既有非-Harness归档仍保存在：
-
-`你自己指定的正式研究资料目录`
-
-Harness 运行产物默认保存在项目内部：
-
-- Harness 主体：`<Harness 根目录>\`
-- Harness 统一输出根：Output Root（默认为兄弟目录 `<仓库名>-Output`，或 `HUNNU_HARNESS_OUTPUT_ROOT` 指定）
-- 授权下载归档：输出根下的 `downloads\authorized\`
-- Staging / Playwright 输出：输出根下的 `staging\` 与 `staging\playwright-output\`
-- Run / Manifest / 日志：输出根下的 `runs\`、`manifests\` 与 `logs\`
-- 截图、审计、审查包和临时文件：输出根下的 `screenshots\`、`audit\`、`review\` 与 `temp\`
-- 长期个人论文库：输出根下的 `library\papers\`、`library\notes\`、`library\catalog\` 与 `library\import_staging\`
-
-只有明确批准的正式研究数据才导出到你自己指定的正式研究资料目录；测试、smoke test 和 Harness 运行产物不得写入正式研究资料目录。
-
-Codex MCP（安装/配置一次即可）：
-
-```powershell
-codex mcp add playwright npx "@playwright/mcp@0.0.79"
-codex mcp list
-```
-
-## 启动专用 Chrome
-
-```powershell
-.venv\Scripts\python.exe -m hunnu_harness.cli browser-start
-```
-
-默认 profile 位于：
-
-`%USERPROFILE%\ResearchHarness\chrome-profile`
-
-首次打开后，请由用户本人完成湖南师范大学图书馆/学校统一认证。Harness 只等待并读取可见页面状态。遇到密码、验证码、二维码、MFA 或 WebVPN，必须人工完成后再继续。
-
-## 对 Codex 的使用示例
-
-人工登录成功后，对 Codex 说：
-
-```text
-请使用 HUNNU Research Harness。
-数据库：CNRDS
-模块：CNFS
-表：利润表
-公司：000001
-日期：2024-01-01 至 2024-12-31
-字段：营业收入、净利润
-只下载，不做数据清洗。
-```
-
-每次下载前必须确认当前 URL、页面标题、数据库、模块和表。下载完成后，Harness 会保留原始文件、计算 SHA-256，并在独立 Output Root 的 `downloads\authorized\` 和 `manifests\` 生成归档与 manifest。Output Root 只保存运行产物，不是第二套 Harness 工程。
-
-## 安全边界
-
-- 不输入或保存学校密码、个人密码、验证码、OTP、MFA。
-- 不绕过付费墙、学校认证、验证码、下载限制。
-- 不修改原始研究数据，不覆盖 raw 文件。
-- 不自动运行回归、构造研究变量或修改论文。
-- 不把学校授权数据提交到 Git。
-
-## OfficialWeb 公开证据
-
-`OfficialWeb` 只处理公开、无需登录的期刊、主办方、出版社、投稿系统公开页、征稿/投稿须知、栏目、公告与正式访谈页面。它不是通用爬虫，也不使用 `requests`、临时 Playwright 脚本或 `curl` 绕过 Harness。
-
-结构化请求必须给出显式证据 URL 和任务级域名 allowlist。`OfficialDomainClaims` 用配置的官方域名及主办/出版关系把结果分为 `OFFICIAL_CONFIRMED`、`OFFICIAL_PROBABLE` 或 `UNVERIFIED`；标题本身从不构成官方性证明。候选 URL discovery 与 evidence fetch 是两个概念阶段，只有重新通过 allowlist、最终跳转域名和 officiality 检查的页面才能进入证据。
-
-```json
-{
-  "TaskType": "official_web",
-  "Query": "查找期刊投稿须知",
-  "URLs": ["https://journal.example.edu/submission"],
-  "AllowedDomains": ["journal.example.edu", "sponsor.example.edu"],
-  "OfficialDomainClaims": [
-    {
-      "Domain": "journal.example.edu",
-      "SourceType": "JournalOfficialWebsite",
-      "Relationship": "configured journal-owned domain"
-    }
-  ]
-}
-```
-
-## Bounded Multi-Batch
-
-`MaxDownloads`/`MaxDownloadsPerRun` 继续限制单批最多 25。较大的正式目标必须显式声明总预算，由 `BoundedBatchPlanner` 拆批；`BoundedBatchCoordinator` 拒绝批次或累计结果超预算，并将每批重试限制在 `MaxRetries + 1` 次。只有带明确已提交下载数的 `RetryableBatchError` 才会自动重试；未知异常立即停止该批，避免无法核算的重复下载。
-
-```json
-{
-  "TaskType": "literature_search",
-  "Query": "bounded candidate pool",
-  "PreferredSources": ["CNKI"],
-  "MaxCandidates": 80,
-  "MaxDownloads": 25,
-  "TotalCandidateBudget": 80,
-  "TotalDownloadBudget": 36,
-  "PerBatchDownloadBudget": 25,
-  "MaxRetries": 1
-}
-```
-
-该请求只生成两个下载预算为 `18 + 18` 的批次计划，并进入既有 planning/budget gate；不会自动下载 36 篇。
-
-## 当前尚未实现
-
-- 已打开的日常 Chrome 标签页自动接管尚未作为默认路径启用；v0.1 优先使用专用 profile。Chrome Extension/CDP 接管需要单独验证和人工完成扩展操作。
-- CNRDS 动态页面的所有真实字段选择器尚未在本地公开网页上完成端到端验证。
-- 万方、RESSET、EPS 等尚未实现的来源不能静默退回临时浏览器流程；需先报告缺失能力并获得用户授权后才可扩展。
-- Agent 文献 live execution 的 Python `BrowserTransport` → Codex Playwright MCP bridge 尚未实现；必须先经 `AdapterExecutionBroker`，不能用裸 MCP 浏览器操作替代 adapter。
-- FDM 接管下载的兼容性尚未启用；建议专用 profile 使用浏览器原生下载，以便 Harness 可靠识别下载链路。
-
-`browser-start` 启动专用 Research Chrome profile 并让它一直运行到 `browser-stop`，机构登录状态因此能跨多次运行保留；已在运行时它原样返回而不重启。`browser-stop` 通过 CDP 的 `Browser.close` 让 Chrome 正常退出（Chrome 会在退出时写回会话与 Preferences），并且只有在确认调试端口已关闭、且没有任何 Chrome 进程仍占用该 profile 之后才报告 `PersistentBrowserStopped=true`；限时内未退出则如实报告 `PersistentBrowserRunning=true` 并以退出码 2 结束，绝不把"已断开连接"当作"已停止"。`browser-status` 只报告是否在监听以及 profile 是否被占用（`ProfileInUse`），不会启动浏览器；它与 `browser-stop` 依据同一组事实作答。它在运行时，后续 `acquire` 运行会附着到它而不是再启动一个。因此 ScienceDirect 采集应先 `browser-start` 再 `acquire`，让运行用上你已登录的会话（AGENTS.md 规则 73）；需要说明的是，报告里的 `BrowserLaunched` 对附着和自启同为 true，不能用它判断走了哪一条。2026-09-19 的实测还表明，附着本身并不能避免出版商的拒绝——短时间内的大量检索才是诱因，检索因此按 `Output Root\audit\search_pace_ledger.jsonl` 跨进程限速（规则 74）。`browser-start` 以 Chrome 自带的 `--restore-last-session`（即"继续浏览上次打开的网页"）启动专用浏览器，因此正常退出后再次启动时，发布商在机构登录后签发的无过期时间会话 Cookie 会被恢复而不是在启动时清除；没有持久浏览器时由运行自行启动的 Playwright 浏览器也带同一开关，以免在共用 profile 上抹掉已保存的登录。`browser-configure-session-restore` 不再修改 Preferences——`session.restore_on_startup` 在 Windows 上属于 Chrome 受保护的 tracked preference，Chrome 会在下次启动时把它从 Preferences 迁走并按机器绑定的 MAC 校验，Harness 无法也不应伪造——该命令只报告实际生效的机制。Python API 仍提供 `research_browser.start()`、`status()`、`stop()`，供后续服务化封装使用。
-
-## 测试
-
-```powershell
-.venv\Scripts\python.exe -m pytest -q
-```
-
-必须经由 pytest 运行（不要用 `python -m unittest discover`）：`tests/conftest.py` 的 autouse fixture 把真实的 fetch 台账重定向到护栏目录并在每个测试前后快照比对，unittest 不会加载它，直接跑就可能污染真实台账。
-
-## 版本控制
-
-代码、配置模板和文档可以进入 Git；学校下载数据、PDF、表格、日志私密内容和浏览器状态已加入 `.gitignore`。
+[GPL-3.0](LICENSE)
