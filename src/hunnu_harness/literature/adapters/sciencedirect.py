@@ -57,6 +57,22 @@ _NO_RESULTS_MARKERS = (
     "did not match any",
     "\u672a\u627e\u5230\u7ed3\u679c",
 )
+# Elsevier's refusal page, read from the live page on 2026-09-19 (the run
+# artifacts keep no page content, so this was captured out of band).  Both
+# halves are required: the sentence alone is something a search page could
+# echo back inside a query, and a hexadecimal token alone is not a refusal.
+# Together they are a statement the publisher makes about this session, and
+# nothing else on ScienceDirect says it.
+_PUBLISHER_BLOCK_WORDING = (
+    "there was a problem providing the content you requested",
+)
+_PUBLISHER_BLOCK_REFERENCE = re.compile(
+    r"reference\s+number\s*[:\uff1a]\s*(?P<reference>[0-9a-f]{12,40})",
+    re.IGNORECASE,
+)
+# Elsevier's own code for the refusal, kept separate because it is diagnostic
+# detail the user hands to the library, not part of the match.
+_PUBLISHER_BLOCK_CODE = re.compile(r"\b(CPE\d{5})\b")
 # A bounded wait on those landmarks, never a fixed sleep: a page that has
 # already rendered is read immediately.
 SEARCH_RENDER_TIMEOUT_SECONDS = 20.0
@@ -294,6 +310,10 @@ class SearchPageType(str, Enum):
     # the search had come back empty.
     PENDING = "PENDING"
     NON_SEARCH_PAGE = "NON_SEARCH_PAGE"
+    # The publisher refused this session outright and said so, with a support
+    # reference number.  It is not a layout change and not an empty search,
+    # and unlike the bot-check interstitial it will not clear by waiting.
+    PUBLISHER_BLOCKED = "PUBLISHER_BLOCKED"
 
 
 @dataclass(frozen=True)
@@ -340,6 +360,9 @@ class ArticlePageState(str, Enum):
     # reports it, so this only says the page has decided.
     INTERRUPTED = "INTERRUPTED"
     PAGE_GATE = "PAGE_GATE"
+    # The publisher refused this session and said so with a reference number.
+    # Unlike PAGE_GATE this does not clear by waiting.
+    PUBLISHER_BLOCKED = "PUBLISHER_BLOCKED"
     PENDING = "PENDING"
 
     @property
@@ -532,11 +555,17 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         """
 
         parser = cls._parser(html)
+        # Read first, and only on a page with no results on it: a refusal is
+        # decided on its first read, because waiting out the render budget for
+        # a page that will never render is the 20s this run used to spend.
         article_links = sum(
             1
             for anchor in parser.anchors
             if anchor.in_results and _ARTICLE_PATH.search(anchor.href)
         )
+        if not article_links and not parser.result_cards:
+            if cls.publisher_block_evidence(parser) is not None:
+                return SearchPageObservation(page_type=SearchPageType.PUBLISHER_BLOCKED)
         if article_links or parser.result_cards:
             return SearchPageObservation(
                 page_type=SearchPageType.RESULTS_PRESENT,
@@ -739,6 +768,12 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         await self.browser.execute(NavigateCommand(url))
         html, current_url, observation = await self._settled_search_page(source_url=url)
         self.last_search_observation = observation
+        if observation.page_type is SearchPageType.PUBLISHER_BLOCKED:
+            # Before detect_interruption: a refusal is not a challenge to pass,
+            # and it must not be reported as one.
+            raise self._publisher_block_stop(
+                "search", self.publisher_block_evidence(self._parser(html)) or "PublisherReference=unknown"
+            )
         if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
             # Challenge first: a page that is not a search page never reaches the
             # result parser.  CAPTCHA and login text stay ``detect_interruption``'s
@@ -775,6 +810,27 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 f"{SEARCH_RENDER_TIMEOUT_SECONDS:g}s; ParsedResultCount=0"
             )
         return results
+
+    @staticmethod
+    def _publisher_block_stop(stage: str, evidence: str) -> SourceActionRequired:
+        """The stop for an explicit refusal by the publisher.
+
+        This is a human's decision, not a wait: the page carries a support
+        reference number and clears on the publisher's terms, not on ours.
+        Reporting it as SOURCE_LAYOUT_CHANGED sent the next query into an
+        active block and told the user their adapter had broken; on
+        2026-09-19 it also produced the conclusion that the campus IP had been
+        banned, which was wrong.  The reason quotes the publisher's own
+        reference so it can be given to the library as-is.
+        """
+
+        return SourceActionRequired(
+            "ACTION_REQUIRED_USER_DECISION=true; "
+            f"Reason=ScienceDirect refused this session on the {stage} page and returned a "
+            f"support reference rather than content; {evidence}; "
+            "the run stopped without retrying and nothing was interacted with",
+            reason=HumanActionReason.UNSPECIFIED,
+        )
 
     @staticmethod
     def _interstitial_stop(stage: str) -> SourceActionRequired:
@@ -976,6 +1032,31 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         return actual.group(1).casefold() == expected.group(1).casefold()
 
     @classmethod
+    def publisher_block_evidence(cls, parser: "_ScienceDirectHTMLParser") -> str | None:
+        """The publisher's refusal, quoted back, or ``None``.
+
+        Conservative on purpose: the wording and a reference number must both
+        be present.  ee971e0 had to reorder these checks once already, because
+        a query containing "one moment" would otherwise have turned a real
+        search into a gate -- a search page echoes the query back, and an
+        abstract can mention anything, but neither produces a support
+        reference number next to that sentence.
+        """
+
+        body = parser.body_text
+        folded = body.casefold()
+        if not any(marker in folded for marker in _PUBLISHER_BLOCK_WORDING):
+            return None
+        reference = _PUBLISHER_BLOCK_REFERENCE.search(body)
+        if reference is None:
+            return None
+        code = _PUBLISHER_BLOCK_CODE.search(body)
+        detail = f"PublisherReference={reference.group('reference')}"
+        if code is not None:
+            detail = f"{detail}; PublisherCode={code.group(1)}"
+        return detail
+
+    @classmethod
     def observe_article_page(cls, html: str, *, source_url: str) -> ArticlePageState:
         """Classify an article page without extracting from it.
 
@@ -991,6 +1072,11 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         parser = cls._parser(html)
         if _article_title(parser) != UNKNOWN:
             return ArticlePageState.METADATA_PRESENT
+        # A refused article page presents no title, so it used to wait out the
+        # render budget and then fail the identity lock with a reason that
+        # blamed the document.
+        if cls.publisher_block_evidence(parser) is not None:
+            return ArticlePageState.PUBLISHER_BLOCKED
         if _interstitial_gate_present(parser):
             return ArticlePageState.PAGE_GATE
         return ArticlePageState.PENDING
@@ -1011,6 +1097,10 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
             poll=ARTICLE_RENDER_POLL_SECONDS,
         )
+        if state is ArticlePageState.PUBLISHER_BLOCKED:
+            raise self._publisher_block_stop(
+                "article", self.publisher_block_evidence(self._parser(html)) or "PublisherReference=unknown"
+            )
         if state is ArticlePageState.PAGE_GATE:
             raise self._interstitial_stop("article")
         return self.parse_article_html(html, source_url=current_url, search_query=search_query)

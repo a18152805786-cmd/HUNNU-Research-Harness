@@ -30,7 +30,7 @@ def build_capabilities() -> dict[str, Any]:
     from .literature.adapters.oxfordacademic import OxfordAcademicAdapter
     from .literature.adapters.sciencedirect import ScienceDirectAdapter
     from .literature.adapters.springerlink import SpringerLinkAdapter
-    from .literature import fetch_ledger
+    from .literature import fetch_ledger, search_pace
     from .navigator.cli import NAVIGATOR_COMMANDS
 
     sources = []
@@ -80,6 +80,16 @@ def build_capabilities() -> dict[str, Any]:
             ),
             fetch_ledger.BURST_LIMIT_ENV: (
                 f"fetches allowed per burst window (default {fetch_ledger.BURST_WINDOW_LIMIT})"
+            ),
+            search_pace.MIN_SEARCH_INTERVAL_ENV: (
+                "minimum seconds between publisher searches "
+                f"(default {search_pace.MIN_SEARCH_INTERVAL_SECONDS})"
+            ),
+            search_pace.SEARCH_BURST_WINDOW_ENV: (
+                f"search burst window seconds (default {search_pace.SEARCH_BURST_WINDOW_SECONDS})"
+            ),
+            search_pace.SEARCH_BURST_LIMIT_ENV: (
+                f"searches allowed per burst window (default {search_pace.SEARCH_BURST_LIMIT})"
             ),
         },
         "NotKnobs": {

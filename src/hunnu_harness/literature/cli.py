@@ -342,7 +342,9 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.put("Reason", result.action_required_reason)
         report.put("BrowserReadyForManualAction", False, plain="false")
         report.note(
-            "Use the registered Playwright MCP session to keep Research Chrome open for manual login."
+            "Hand the gate back to the user before starting another source that needs the "
+            "same institutional session: run `hunnu-harness browser-start` to hold the "
+            "dedicated Research Chrome open, say which page needs the manual step, and wait."
         )
     if result.status == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD:
         report.put("ACTION_REQUIRED_USER_LOGIN", False, plain="false")

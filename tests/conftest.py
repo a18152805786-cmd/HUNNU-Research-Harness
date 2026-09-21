@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 from hunnu_harness.literature import fetch_ledger as _fetch_ledger_module
+from hunnu_harness.literature import search_pace as _search_pace_module
 
 # Captured once at import time, before any test can repoint the module
 # constant: this is the file no test may ever touch.
@@ -81,10 +82,57 @@ def clear_fetch_ledger_tuning_environment(monkeypatch):
         MIN_FETCH_INTERVAL_ENV,
     )
 
+    from hunnu_harness.literature.search_pace import (
+        MIN_SEARCH_INTERVAL_ENV,
+        SEARCH_BURST_LIMIT_ENV,
+        SEARCH_BURST_WINDOW_ENV,
+    )
+
     for env_name in (
         DAILY_FETCH_LIMIT_ENV,
         MIN_FETCH_INTERVAL_ENV,
         BURST_WINDOW_ENV,
         BURST_LIMIT_ENV,
+        MIN_SEARCH_INTERVAL_ENV,
+        SEARCH_BURST_WINDOW_ENV,
+        SEARCH_BURST_LIMIT_ENV,
     ):
         monkeypatch.delenv(env_name, raising=False)
+
+
+# The search pace ledger is the same kind of live state as the fetch ledger:
+# a test row in the real file makes the user's next real search wait for a
+# search that never happened.  Same guard, same reasons.
+REAL_SEARCH_PACE_LEDGER_PATH = Path(_search_pace_module.SEARCH_PACE_LEDGER_PATH)
+
+
+def _search_pace_snapshot() -> tuple[bool, int, int] | None:
+    try:
+        stat = os.stat(REAL_SEARCH_PACE_LEDGER_PATH)
+    except OSError:
+        return None
+    return (True, stat.st_size, stat.st_mtime_ns)
+
+
+@pytest.fixture(autouse=True)
+def isolated_search_pace_ledger_path(monkeypatch):
+    """No test can reach the real search pace ledger, with or without an injection."""
+
+    from hunnu_harness.paths import TEMP_DIR
+
+    before = _search_pace_snapshot()
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="search-pace-guard-", dir=TEMP_DIR) as tmp:
+        monkeypatch.setattr(
+            _search_pace_module,
+            "SEARCH_PACE_LEDGER_PATH",
+            Path(tmp) / "search_pace_ledger.jsonl",
+        )
+        yield
+    after = _search_pace_snapshot()
+    if before != after:
+        pytest.fail(
+            "this test touched the real search pace ledger at "
+            f"{REAL_SEARCH_PACE_LEDGER_PATH} (before={before}, after={after}); "
+            "search pacing is live state and tests must never write it"
+        )

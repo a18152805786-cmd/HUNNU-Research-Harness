@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+  Mirrors the HUNNU database detail page for Oxford Journals Collection as it
+  was observed on 2026-09-19 (wisdom.chaoxing.com/newwisdom/doordatabase/
+  databasedetail.html?...&id=26605), reduced to the parts the route reads.
+
+  The point of this fixture is what is NOT here: no <a> element carries the
+  publisher address.  The library publishes it as a click handler, and it
+  publishes two of them -- the direct address and an off-campus CARSI
+  sign-in -- which is why an anchor-only reader saw a detail page with no
+  publisher link at all.
+-->
+<html lang="zh-CN">
+  <head><title>Oxford Journals Collection牛津期刊现刊库</title></head>
+  <body>
+    <h1>Oxford Journals Collection牛津期刊现刊库</h1>
+    <div class="dataPage">
+      <span class="dataPageLeft">访问地址：</span>
+      <div class="fr dataPageRight">
+        <p><span onclick="redirecturl(26605,0,1,'','https%3A%2F%2Facademic.oup.com%2Fjournals',0)" class="link" style="cursor:pointer">网络地址</span></p>
+        <p><span onclick="redirecturl(26605,0,1,'','https%3A%2F%2Facademic.oup.com%2F',1)" class="link" style="cursor:pointer">校外CARSI地址链接</span></p>
+      </div>
+    </div>
+    <a href="//lib.hunnu.edu.cn/engine2/m/0/94394/214892?p=36761&amp;t=2981082&amp;currentBranch=1">访问指南</a>
+  </body>
+</html>

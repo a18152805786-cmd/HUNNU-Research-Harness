@@ -567,16 +567,19 @@ class ArticlePageStateTests(_FastWindows):
 # -- the whole run --------------------------------------------------------------
 
 
-def run_workflow(script, *keywords: str, max_results: int = 5):
+def run_workflow(script, *keywords: str, max_results: int = 5, search_pacer=None):
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sdresil-", dir=TEMP_DIR) as raw:
         tmp = Path(raw)
         port = ScriptedPort(script, downloads_dir=tmp)
+        if search_pacer is not None:
+            search_pacer.port = port
         workflow = LiteratureAcquisitionWorkflow(
             ScienceDirectAdapter(port),
             run_root=tmp / "run",
             human_like_delay_seconds=0.0,
             allow_outside_project_for_tests=True,
+            search_pacer=search_pacer,
         )
         result = asyncio.run(workflow.run(request(*keywords, max_results=max_results)))
         with workflow.writer.query_log_path.open(encoding="utf-8-sig", newline="") as handle:
@@ -655,6 +658,196 @@ class RunStopsAtTheGateTests(_FastWindows):
         self.assertFalse(
             any("identity lock failed" in error for error in result.errors), result.errors
         )
+
+
+
+# -- Case 6: an explicit refusal by the publisher -------------------------------
+
+
+def block_page(reference: str = "a3d722eaede511e1", code: str = "CPE00001") -> str:
+    """Elsevier's refusal page, as read from the live page on 2026-09-19.
+
+    The run artifacts keep no page content, so this wording was captured out
+    of band during that run.  Note what it does NOT contain: no CAPTCHA or
+    login words, no result cards, and no no-results notice -- which is exactly
+    why it used to be read as PENDING for the whole render budget and then
+    reported as a layout change.
+    """
+
+    return (
+        '<!doctype html><html lang="en"><head><title>ScienceDirect</title></head><body>'
+        "<h1>There was a problem providing the content you requested</h1>"
+        "<p>Please contact our support team for more information and provide the "
+        "details below.</p>"
+        f"<p>Reference number: {reference}</p>"
+        "<p>IP Address: 203.0.113.10</p>"
+        "<p>Timestamp: 2026-09-19 08:14:22 UTC</p>"
+        f"<p>{code}</p>"
+        "</body></html>"
+    )
+
+
+class PublisherBlockIsNotALayoutChangeTests(_FastWindows):
+    """2026-09-19: ScienceDirect refused the session and said so.
+
+    The page carried a support reference number.  It was classified PENDING,
+    waited out the 20s render budget, and surfaced as SOURCE_LAYOUT_CHANGED --
+    so the run reported a broken adapter, went on to the next query against an
+    active block, and the session reading the output concluded the campus IP
+    had been banned, which was wrong.
+    """
+
+    def test_the_refusal_is_decided_on_the_first_read(self) -> None:
+        """This failing means the run waits out the render budget again."""
+
+        observation = ScienceDirectAdapter.observe_search_page(
+            block_page(), source_url="https://www.sciencedirect.com/search?qs=x"
+        )
+        self.assertIs(observation.page_type, SearchPageType.PUBLISHER_BLOCKED)
+        self.assertTrue(observation.decided)
+
+    def test_it_is_neither_an_empty_search_nor_a_layout_change(self) -> None:
+        observation = ScienceDirectAdapter.observe_search_page(
+            block_page(), source_url="https://www.sciencedirect.com/search?qs=x"
+        )
+        self.assertIsNot(observation.page_type, SearchPageType.GENUINE_ZERO_RESULTS)
+        self.assertIsNot(observation.page_type, SearchPageType.PENDING)
+
+    def test_search_stops_and_quotes_the_publisher_reference(self) -> None:
+        port = ScriptedPort(by_query({'"x"': [block_page()]}))
+        adapter = ScienceDirectAdapter(port)
+        with self.assertRaises(SourceActionRequired) as caught:
+            asyncio.run(adapter.search('"x"', request("x")))
+        message = str(caught.exception)
+        self.assertIn("a3d722eaede511e1", message)
+        self.assertIn("CPE00001", message)
+        self.assertNotIn("SEARCH_READINESS_TIMEOUT", message)
+
+    def test_the_wording_alone_is_not_a_refusal(self) -> None:
+        """A search page echoes the query back; an abstract can say anything.
+
+        ee971e0 already had to reorder these checks once, because a query
+        containing "one moment" would otherwise have become a gate.  Both the
+        wording and a support reference number are required.
+        """
+
+        no_reference = (
+            '<!doctype html><html><head><title>ScienceDirect</title></head><body>'
+            "<p>There was a problem providing the content you requested</p>"
+            "</body></html>"
+        )
+        observation = ScienceDirectAdapter.observe_search_page(
+            no_reference, source_url="https://www.sciencedirect.com/search?qs=x"
+        )
+        self.assertIsNot(observation.page_type, SearchPageType.PUBLISHER_BLOCKED)
+
+    def test_a_reference_number_alone_is_not_a_refusal(self) -> None:
+        only_reference = search_shell("<p>Reference number: a3d722eaede511e1</p>")
+        observation = ScienceDirectAdapter.observe_search_page(
+            only_reference, source_url="https://www.sciencedirect.com/search?qs=x"
+        )
+        self.assertIsNot(observation.page_type, SearchPageType.PUBLISHER_BLOCKED)
+
+    def test_a_real_results_page_quoting_the_wording_is_still_results(self) -> None:
+        """A page with results on it is never a refusal, whatever it quotes."""
+
+        page = results_page(card(*A1)).replace(
+            "<ol", "<p>There was a problem providing the content you requested. "
+            "Reference number: a3d722eaede511e1</p><ol"
+        )
+        observation = ScienceDirectAdapter.observe_search_page(
+            page, source_url="https://www.sciencedirect.com/search?qs=x"
+        )
+        self.assertIs(observation.page_type, SearchPageType.RESULTS_PRESENT)
+
+    def test_an_article_page_refusal_does_not_become_a_failed_identity_lock(self) -> None:
+        self.assertIs(observe_article(block_page()), ArticlePageState.PUBLISHER_BLOCKED)
+
+    def test_the_run_stops_instead_of_sending_the_next_query(self) -> None:
+        """This failing means the loop queries a publisher that already refused."""
+
+        keywords = ("AI washing", "earnings management", "discretionary accruals")
+        first = '"AI washing" AND "earnings management"'
+        port, result, query_log = run_workflow(
+            by_query({first: [block_page()]}), *keywords, max_results=5
+        )
+        searched = [
+            url
+            for url in port.navigations
+            if "/search" in url
+        ]
+        self.assertEqual(len(searched), 1)
+        self.assertEqual(result.status, RunStatus.ACTION_REQUIRED_USER_LOGIN)
+
+    def test_the_refusal_is_not_treated_as_a_page_that_clears_itself(self) -> None:
+        """The browser layer must not wait its whole budget on this page.
+
+        _INTERSTITIAL_*_MARKERS mean "a gate that clears by itself"; a refusal
+        with a support reference never does.
+        """
+
+        from hunnu_harness.browser import playwright_backend
+
+        markers = " ".join(
+            (
+                *playwright_backend._INTERSTITIAL_TITLE_MARKERS,
+                *playwright_backend._INTERSTITIAL_BODY_MARKERS,
+            )
+        ).casefold()
+        self.assertNotIn("there was a problem providing", markers)
+        self.assertNotIn("reference number", markers)
+
+
+# -- Case 7: the search throttle is asked before each search goes out -----------
+
+
+class _RecordingPacer:
+    """Notes how many searches had already gone out each time it was asked to wait."""
+
+    port: ScriptedPort | None = None
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def pace(self, *, source: str, query: str) -> float:
+        assert self.port is not None
+        self.calls.append((query, len(self.port.search_navigations)))
+        return 0.0
+
+
+class SearchIsPacedBeforeItGoesOutTests(_FastWindows):
+    """The pace ledger only protects the session if the workflow asks it first.
+
+    Pacing after the request would record the search but not delay it, and the
+    block page it exists to prevent is served to the request itself.
+    """
+
+    def test_every_query_waits_before_its_search_is_sent(self) -> None:
+        pacer = _RecordingPacer()
+        gate = RunStopsAtTheGateTests
+        port, result, _query_log = run_workflow(
+            by_query({gate.Q1: [NO_RESULTS], gate.Q2: [NO_RESULTS], gate.Q3: [NO_RESULTS]}),
+            *gate.KEYWORDS,
+            search_pacer=pacer,
+        )
+        self.assertEqual(len(port.search_navigations), 3)
+        self.assertEqual(pacer.calls, [(gate.Q1, 0), (gate.Q2, 1), (gate.Q3, 2)])
+
+    def test_an_isolated_run_neither_waits_nor_shares_the_real_ledger(self) -> None:
+        """This failing means every workflow test sleeps 20s per query."""
+
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="sdresil-", dir=TEMP_DIR) as raw:
+            tmp = Path(raw)
+            workflow = LiteratureAcquisitionWorkflow(
+                ScienceDirectAdapter(ScriptedPort(by_query({}), downloads_dir=tmp)),
+                run_root=tmp / "run",
+                human_like_delay_seconds=0.0,
+                allow_outside_project_for_tests=True,
+            )
+            pacer = workflow.search_pacer
+            self.assertEqual(pacer.min_interval_seconds, 0.0)
+            self.assertTrue(pacer.path.resolve().is_relative_to(tmp.resolve()))
 
 
 if __name__ == "__main__":

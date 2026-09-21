@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from html.parser import HTMLParser
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from ..browser.commands import NavigateCommand, ObservationUnavailable, ObserveCommand
 from ..browser.port import ensure_browser_command_port
@@ -141,10 +141,71 @@ class _Anchor:
     attributes: dict[str, str]
 
 
+# The HUNNU library's database detail page does not publish a database's
+# address as an href.  It publishes it as a click handler:
+#
+#   <span onclick="redirecturl(26605,0,1,'','https%3A%2F%2Facademic.oup.com%2Fjournals',0)">网络地址</span>
+#
+# so an anchor-only reader sees a page with no publisher link on it at all,
+# which is what happened on 2026-09-19.  Only a percent-encoded absolute
+# http(s) URL argument is recognised, by this pattern alone: the script is
+# never executed, and an argument that is not such a URL is not a candidate.
+_REDIRECT_URL_ARGUMENT = re.compile(
+    r"""['"](?P<encoded>https?%3A%2F%2F[^'"()\s]*)['"]""",
+    re.IGNORECASE,
+)
+# Only these handlers are read.  A bare "some_function('https%3A%2F%2F...')"
+# elsewhere on a page is not an access address the library published.
+_REDIRECT_HANDLER = re.compile(r"\bredirecturl\s*\(", re.IGNORECASE)
+
+
+# A HUNNU database entry usually publishes two addresses: the direct one, and
+# an off-campus link that starts a CARSI/federated sign-in.  The second is a
+# manual-authentication route, which this Harness never drives (Rules 1-2 and
+# 22-25), so it is not an unattended candidate.  Excluding it is also what
+# keeps the pair from tying under choose_candidate and failing closed on an
+# ambiguity that is not real: the two are different kinds of route, not two
+# guesses at the same one.
+_OFF_CAMPUS_ROUTE_MARKERS = ("carsi", "校外", "webvpn", "shibboleth")
+
+
+def _is_off_campus_login_route(text: str) -> bool:
+    lowered = unicodedata.normalize("NFKC", str(text)).casefold()
+    return any(marker in lowered for marker in _OFF_CAMPUS_ROUTE_MARKERS)
+
+
+def _decode_redirect_url(handler: str) -> str:
+    """The one absolute http(s) URL a redirect handler carries, or "".
+
+    Reading, never evaluating: the handler text is matched against one strict
+    pattern and nothing else.  Two different encoded URLs in a single handler
+    are not disambiguated here -- returning "" leaves the element out rather
+    than guessing which one the library meant.
+    """
+
+    found = _REDIRECT_URL_ARGUMENT.findall(handler)
+    if len(found) != 1:
+        return ""
+    decoded = unquote(found[0])
+    parsed = urlsplit(decoded)
+    if parsed.scheme.casefold() not in ("http", "https"):
+        return ""
+    if not parsed.hostname:
+        return ""
+    if parsed.username is not None or parsed.password is not None:
+        return ""
+    return decoded
+
+
 class _RouteHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.anchors: list[_Anchor] = []
+        # Click-handler addresses, kept apart from real anchors so a caller
+        # chooses to read them; they carry the same _Anchor shape so every
+        # check an href gets applies unchanged.
+        self.script_links: list[_Anchor] = []
+        self._script_link_stack: list[tuple[str, str, dict[str, str], list[str]]] = []
         self._anchor_href: str | None = None
         self._anchor_attributes: dict[str, str] = {}
         self._anchor_text: list[str] = []
@@ -170,7 +231,12 @@ class _RouteHTMLParser(HTMLParser):
             self._anchor_href = values.get("href", "")
             self._anchor_attributes = values
             self._anchor_text = []
-        elif lowered == "title":
+        handler = values.get("onclick", "")
+        if handler and _REDIRECT_HANDLER.search(handler):
+            decoded = _decode_redirect_url(handler)
+            if decoded:
+                self._script_link_stack.append((lowered, decoded, values, []))
+        if lowered == "title":
             self._in_title = True
         elif lowered == "input":
             identity = " ".join(
@@ -187,6 +253,12 @@ class _RouteHTMLParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.casefold()
+        for index in range(len(self._script_link_stack) - 1, -1, -1):
+            if self._script_link_stack[index][0] == lowered:
+                _tag, url, attributes, parts = self._script_link_stack.pop(index)
+                text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+                self.script_links.append(_Anchor(url, text, attributes))
+                break
         if lowered == "a" and self._anchor_href is not None:
             text = re.sub(r"\s+", " ", " ".join(self._anchor_text)).strip()
             self.anchors.append(_Anchor(self._anchor_href, text, self._anchor_attributes))
@@ -205,6 +277,8 @@ class _RouteHTMLParser(HTMLParser):
             self._title_parts.append(value)
         if self._anchor_href is not None:
             self._anchor_text.append(value)
+        for entry in self._script_link_stack:
+            entry[3].append(value)
 
 
 def _normalized_label(value: str) -> str:
@@ -623,7 +697,10 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
         aliases = tuple(_normalized_label(alias) for alias in cls._SOURCE_ALIASES[canonical])
         target_domains = cls._SOURCE_DOMAINS[canonical]
         candidates: list[InstitutionalRouteCandidate] = []
-        for anchor in cls._parse(html).anchors:
+        parsed = cls._parse(html)
+        # Click-handler addresses are read on the same terms as hrefs: the
+        # HUNNU detail page publishes a database's address only that way.
+        for anchor in (*parsed.anchors, *parsed.script_links):
             navigation_url = urljoin(base_url, anchor.href)
             host = _hostname(navigation_url)
             evidence = " ".join(
@@ -634,6 +711,8 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
                     anchor.attributes.get("data-name", ""),
                 )
             )
+            if _is_off_campus_login_route(evidence):
+                continue
             normalized_evidence = _normalized_label(evidence)
             alias_match = any(alias and alias in normalized_evidence for alias in aliases)
             domain_match = host in target_domains

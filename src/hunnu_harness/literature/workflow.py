@@ -47,6 +47,7 @@ from .models import (
 from .planning import LiteratureSearchPlanner
 from .normalization import normalize_doi, normalize_person, normalize_title
 from .screening import LiteratureScreener
+from .search_pace import SearchPaceLedger
 from .security import LiteratureAuditLogger, scan_files_for_sensitive_leaks
 
 if TYPE_CHECKING:
@@ -81,6 +82,35 @@ def _download_manager_for_run(
         make_archive_read_only=not allow_outside_project_for_tests,
         global_library=library,
         topic_classifier=classifier,
+    )
+
+
+def _search_pacer_for_run(
+    explicit: "SearchPaceLedger | None",
+    writer: LiteratureArtifactWriter,
+    *,
+    allow_outside_project_for_tests: bool,
+) -> SearchPaceLedger:
+    """The throttle a run should use, isolated the way its library is.
+
+    A real run shares one ledger across processes -- that is the whole point,
+    since the searches that tripped the publisher came from separate ones.  An
+    isolated test run must never reach it, and must never actually sleep: it
+    gets a ledger inside its own tree with pacing switched off, matching how
+    ``_download_manager_for_run`` keeps the real Library out of tests.
+    """
+
+    if explicit is not None:
+        return explicit
+    isolated = allow_outside_project_for_tests or is_within(writer.run_root, TEMP_DIR)
+    if not isolated:
+        return SearchPaceLedger()
+    return SearchPaceLedger(
+        writer.run_root / "audit" / "search_pace_ledger.jsonl",
+        min_interval_seconds=0.0,
+        burst_limit=10**6,
+        sleeper=lambda _seconds: None,
+        allow_outside_output_for_tests=allow_outside_project_for_tests,
     )
 
 
@@ -203,10 +233,16 @@ class LiteratureAcquisitionWorkflow:
         allow_outside_project_for_tests: bool = False,
         institutional_resolver: "InstitutionalAccessResolver | None" = None,
         institutional_trigger: "InstitutionalResolutionTrigger | None" = None,
+        search_pacer: "SearchPaceLedger | None" = None,
     ):
         self.adapter = adapter
         self.writer = LiteratureArtifactWriter(
             run_root,
+            allow_outside_project_for_tests=allow_outside_project_for_tests,
+        )
+        self.search_pacer = _search_pacer_for_run(
+            search_pacer,
+            self.writer,
             allow_outside_project_for_tests=allow_outside_project_for_tests,
         )
         self.download_manager = _download_manager_for_run(
@@ -261,6 +297,10 @@ class LiteratureAcquisitionWorkflow:
             inspected = 0
             query_error = UNKNOWN
             try:
+                # Wait out the publisher-search throttle before the request
+                # goes out, not after: the block page this prevents is served
+                # to the query, and by then the session is already spent.
+                self.search_pacer.pace(source=self.adapter.name, query=plan.query)
                 query_results = await self.adapter.search(plan.query, request)
                 remaining = request.max_search_results - len(records)
                 query_results = query_results[:remaining]

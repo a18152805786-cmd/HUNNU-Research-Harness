@@ -1,4 +1,4 @@
-# AGENTS.md 71 条执行力审计（代码强制 vs 散文）
+# AGENTS.md 74 条执行力审计（代码强制 vs 散文）
 
 分发方案任务 3.5 的交付物。它回答一个问题：**把这个仓库交给一个陌生 agent，哪些规则是机器挡着的，哪些只靠它自觉？**
 
@@ -79,16 +79,19 @@
 | 69 | 话题归档由 Harness 做、冻结分类法 | 代码强制 | 自动分类＋分类法校验＋WORK 级复用（大测试族）；`library-import` 与下载路径走同一 `classify_after_ingest`，结果同一字段集（`test_library_import_topic_filing.py`） |
 | 70 | `library-confirm-topics` 唯一人工确认路径 | 代码强制 | 提案约束＋`HUMAN_CONFIRMED` 溯源＋改判拒绝（测试钉住）；门槛是 WORK 自身是否已有话题而非分类器重算结论，无话题 WORK 永不失联（`UnfiledWorkTests`） |
 | 71 | 写前记账、预算、`--allow-refetch` 范围 | 代码强制 | `fetch_ledger.py`（写前 attempt、15/天默认旋钮、2/篇不可调、pacing）；2.2 起 `--allow-refetch` 只豁免重复检查；conftest 结构性护栏使真实台账对测试不可达。本次审计已同步修正第 71 条散文（路径控制字符损坏、"25/天"过时、flag 范围过时） |
+| 72 | 人工闸门必须交还用户，不得转去同一机构会话的另一个源 | 散文 | `browser-start` 为交还 surface；`literature/cli.py` 的 `ACTION_REQUIRED_USER_LOGIN` HumanNotes 已改为指向它（旧文案指向 Playwright MCP，已过时）。无网络工作可继续并随 handoff 一并汇报 |
+| 73 | ScienceDirect 采集前先 `browser-start`；被拒的 run 交还用户，绝不重试 | 散文 | 附着由 `playwright_backend.start()` 的 `connect_over_cdp` 分支完成；2026-09-19 时间线已证伪「附着即可避免封锁」（两次附着 run 同样失败），故本条按观察陈述。`BrowserLaunched` 对附着与自启同为 true，不能用来判别 |
+| 74 | 出版商明确拒绝＝停机交人；检索跨进程限速 | 代码强制 | `sciencedirect.py` 的 `publisher_block_evidence`＋`SearchPageType.PUBLISHER_BLOCKED`／`ArticlePageState.PUBLISHER_BLOCKED` 首读即判，抛 `SourceActionRequired` 停止查询循环（`test_sciencedirect_query_resilience.py`）；`search_pace.py` 落盘台账跨进程限速，只等待不拒绝（`test_search_pace_ledger.py`） |
 
 ## 统计
 
-- **代码强制**：42 条（含 3 条"多数强制"）
+- **代码强制**：43 条（含 3 条"多数强制"）
 - **测试钉住（结构性）**：1 条（#6，全包扫描式）
 - **设计缺失**：6 条
 - **部分**：8 条
-- **仅散文**：14 条
+- **仅散文**：16 条
 
-散文条款集中在三类：agent 行为选择（7、10、11、20、21、29、38、43、64、65 的行为半边）、对用户个人资产的尊重（12、17、57）、未来动作规程（58）。**这三类本质上无法由本仓库的代码强制**——第一类发生在 agent 的决策层，第二类涉及仓库外的路径，第三类约束还不存在的代码。它们正是 AGENTS.md 作为散文契约仍然不可替代的部分。
+散文条款集中在三类：agent 行为选择（7、10、11、20、21、29、38、43、64、65 的行为半边，以及 72、73）、对用户个人资产的尊重（12、17、57）、未来动作规程（58）。**这三类本质上无法由本仓库的代码强制**——第一类发生在 agent 的决策层，第二类涉及仓库外的路径，第三类约束还不存在的代码。它们正是 AGENTS.md 作为散文契约仍然不可替代的部分。
 
 ## 本次审计顺手完成的硬化
 
