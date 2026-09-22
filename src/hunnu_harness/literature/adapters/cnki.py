@@ -718,6 +718,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
         self._expected_record: LiteratureRecord | None = None
         self._detail_record: LiteratureRecord | None = None
         self._last_challenge_diagnostic: ChallengeDiagnostic | None = None
+        # query string -> (mode, search term) actually sent to CNKI, so a result
+        # can be refreshed with the same search that found it (see open_result).
+        self._search_inputs: dict[str, tuple[str, str]] = {}
 
     @staticmethod
     def _parser(html: str) -> _CNKIHTMLParser:
@@ -1656,6 +1659,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
         mode, search_term = self._search_input(query, request)
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
+        self._search_inputs[query] = (mode, search_term)
         await self.browser.execute(NavigateCommand(self.build_search_url(search_term, mode=mode)))
         result_limit = min(request.max_results_per_source, request.max_search_results)
         parse_limit = (
@@ -1711,6 +1715,32 @@ class CNKIAdapter(LiteratureSourceAdapter):
             (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),
             None,
         )
+        original_search = self._search_inputs.get(record.search_query)
+        if fresh_record is None and original_search is not None and original_search[0] != "exact_title":
+            # Some CNKI titles are unreachable by an exact-title query even though
+            # the record exists -- e.g. "“互联网+”为什么加出了业绩", where the
+            # nested quotes around "+" return zero hits.  When the record was
+            # found by a different search, refresh once with that same search.
+            # The relock rule is unchanged: identity_matches must still hold.
+            mode, term = original_search
+            await self.browser.execute(NavigateCommand(self.build_search_url(term, mode=mode)))
+            fresh_records, _current_url, same_page_navigation_urls = await self._settled_search_records(
+                query=record.search_query,
+                max_results=30,
+            )
+            fresh_record = next(
+                (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),
+                None,
+            )
+            if (
+                fresh_record is not None
+                and _is_cnki_detail_url(fresh_record.navigation_url)
+                and urlsplit(fresh_record.navigation_url).path.casefold().startswith(_CNKI_2026_DETAIL_PATH)
+            ):
+                # Follow the fresh 2026 detail link in-page, as the exact-title path
+                # does.  A click on this result page can leave a second tab on the
+                # same article, which the page-identity gate then refuses to act on.
+                same_page_navigation_urls = frozenset(same_page_navigation_urls | {fresh_record.navigation_url})
         if fresh_record is None:
             raise SourceLayoutChanged("CNKI exact-title refresh could not relock the requested result")
         if fresh_record.navigation_url in same_page_navigation_urls:

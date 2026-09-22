@@ -977,6 +977,107 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
             await adapter.open_result(expected)
         self.assertEqual(browser.click_attempts, 2)
 
+    class _RoutedBrowser(_HTMLBrowser):
+        """Serve CNKI result pages by search field (korder), one page per navigation."""
+
+        def __init__(self, pages_by_order: dict[str, list[str]]) -> None:
+            super().__init__([""])
+            self.pages_by_order = {order: list(pages) for order, pages in pages_by_order.items()}
+            self.current_html = ""
+
+        async def execute(self, command):
+            from urllib.parse import parse_qs, urlsplit
+
+            self.commands.append(command)
+            if isinstance(command, NavigateCommand):
+                self.current_url = command.url
+                order = parse_qs(urlsplit(command.url).query).get("korder", [""])[0]
+                pages = self.pages_by_order.get(order)
+                if pages:
+                    self.current_html = pages.pop(0) if len(pages) > 1 else pages[0]
+                return self._observation(self.current_html)
+            if isinstance(command, ObserveCommand):
+                self.observe_count += 1
+                return self._observation(self.current_html)
+            if isinstance(command, ClickCommand):
+                return self._observation(self.current_html)
+            raise AssertionError(type(command).__name__)
+
+    _PLUS_TITLE = "“互联网+”为什么加出了业绩"
+    _NO_HITS = "<html><head><title>检索-中国知网</title></head><body><main><div>共找到 0 条结果</div></main></body></html>"
+
+    @classmethod
+    def _one_hit(cls, title: str) -> str:
+        return f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 1 条结果</div>
+            <a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=GGYY201805005">{title}</a>
+          </main>
+        </body></html>
+        """
+
+    def _plus_request(self) -> LiteratureSearchRequest:
+        return LiteratureSearchRequest(
+            original_research_request="CNKI title unreachable by exact-title search",
+            exact_titles=(self._PLUS_TITLE,),
+            keywords_cn=("为什么加出了业绩",),
+            max_search_results=1,
+            max_results_per_source=1,
+            max_downloads=0,
+            max_downloads_per_run=0,
+        )
+
+    def _korders(self, browser) -> list[str]:
+        from urllib.parse import parse_qs, urlsplit
+
+        return [
+            parse_qs(urlsplit(command.url).query).get("korder", [""])[0]
+            for command in browser.commands
+            if isinstance(command, NavigateCommand) and "korder=" in command.url
+        ]
+
+    async def test_refresh_falls_back_to_the_search_that_found_a_title_exact_search_cannot_reach(self) -> None:
+        # If this fails, a paper that CNKI's keyword search finds but its exact-title
+        # search cannot (nested quotes around "+") is again undownloadable.
+        browser = self._RoutedBrowser({"SU": [self._one_hit(self._PLUS_TITLE)], "TI": [self._NO_HITS]})
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search("为什么加出了业绩", self._plus_request())
+        self.assertEqual([record.title for record in records], [self._PLUS_TITLE])
+        await adapter.open_result(records[0])
+        self.assertEqual(self._korders(browser), ["SU", "TI", "SU"])
+        # Followed in-page, never clicked: a click here once left two tabs on the
+        # same article and the page-identity gate stopped the download.
+        self.assertFalse(any(isinstance(command, ClickCommand) for command in browser.commands))
+        last_navigation = [command.url for command in browser.commands if isinstance(command, NavigateCommand)][-1]
+        self.assertIn("/kcms2/article/abstract?", last_navigation)
+        self.assertIn("GGYY201805005", last_navigation)
+
+    async def test_refresh_fallback_never_applies_to_a_record_found_by_exact_title(self) -> None:
+        # If this fails, the fallback widened the exact-title path it was meant to leave alone.
+        from hunnu_harness.literature.adapters.base import SourceLayoutChanged
+
+        title = "人工智能技术应用如何影响企业创新"
+        browser = self._RoutedBrowser({"TI": [self._one_hit(title), self._NO_HITS]})
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search(f'"{title}"', self._request(title))
+        with self.assertRaisesRegex(SourceLayoutChanged, "could not relock"):
+            await adapter.open_result(records[0])
+        self.assertEqual(self._korders(browser), ["TI", "TI"])
+
+    async def test_refresh_fallback_still_requires_the_same_identity(self) -> None:
+        # If this fails, the fallback relocked onto a different paper than the one screened.
+        from hunnu_harness.literature.adapters.base import SourceLayoutChanged
+
+        browser = self._RoutedBrowser({
+            "SU": [self._one_hit(self._PLUS_TITLE), self._one_hit("“互联网+”为什么加出了业绩——另一篇")],
+            "TI": [self._NO_HITS],
+        })
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search("为什么加出了业绩", self._plus_request())
+        with self.assertRaisesRegex(SourceLayoutChanged, "could not relock"):
+            await adapter.open_result(records[0])
+        self.assertEqual(self._korders(browser), ["SU", "TI", "SU"])
+
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_mcp_snapshot_fallback_ignores_proven_offscreen_challenge(self) -> None:
