@@ -18,7 +18,9 @@ from hunnu_harness.navigator import lexicon
 
 class ConfigurableVocabularyTests(unittest.TestCase):
     def test_packaged_defaults_are_loaded_and_keep_the_canary_match(self) -> None:
-        self.assertEqual(len(lexicon.CONCEPTS), 20)
+        # 20 -> 22 on 2026-09-23: macro_inflation and cultural_industry added so
+        # works titled on inflation / the film market raise a confirmable topic.
+        self.assertEqual(len(lexicon.CONCEPTS), 22)
         self.assertEqual(lexicon.CONCEPTS_BY_KEY["ai_washing"].terms[0], "ai washing")
         self.assertTrue(any(match.key == "ai_washing" for match in lexicon.match_concepts("AI washing")))
         self.assertIn("AI漂洗", taxonomy_aliases.ENGLISH_SUBTOPIC_ALIASES)
