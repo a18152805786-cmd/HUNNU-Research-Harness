@@ -28,6 +28,23 @@ from hunnu_harness.paths import (
 
 # The sealed audit numbers this corpus is frozen at.
 #
+# Resealed at 221/234/402 on 2026-09-23, from 198/211/364, at the user's
+# instruction.  Twenty-three works entered the corpus, all from 中国工业经济.
+# Twenty-two are the rest of a 2017-2023 mediation-analysis reading list the
+# user's advisor sent, acquired through the CNKI adapter on 2026-09-22/23:
+# one arrived after a DOWNLOAD_COMPLETION_TIMEOUT and came in through
+# library-import, and "“互联网+”为什么加出了业绩" only after f14d881 let the
+# adapter relock a record its exact-title search cannot reach.  The
+# twenty-third is the CNKI copy of a paper previously held only outside the
+# library (a scanned copy).  Six were auto-classified under one topic each
+# (+6); seventeen carried no topic and the user chose theirs, confirmed
+# through library-confirm-topics (HUMAN_CONFIRMED, +32).  Four of those had
+# raised nothing at all, so the Navigator lexicon gained terms and two narrow
+# concepts first (01f44d2), with the classification backtests and alias
+# canaries holding.  No topic was created; unique topics stay 39 and nested
+# variants 13.  The numbers are read from LibraryFingerprinter().capture(),
+# not derived.
+#
 # Resealed at 198/211/364 on 2026-09-21, from 188/201/351, at the user's
 # instruction.  Ten works entered the corpus for the AI-washing literature
 # runs.  On 2026-09-18 five came through the harness from SpringerLink (AMS
@@ -91,9 +108,9 @@ from hunnu_harness.paths import (
 #
 # Unique topics stays 39 on purpose: every acquisition was filed under a topic
 # that already existed, and nothing here may create a fortieth.
-EXPECTED_WORKS = 198
-EXPECTED_VERSIONS = 211
-EXPECTED_TOPIC_ASSIGNMENTS = 364
+EXPECTED_WORKS = 221
+EXPECTED_VERSIONS = 234
+EXPECTED_TOPIC_ASSIGNMENTS = 402
 EXPECTED_UNIQUE_TOPICS = 39
 
 # Known fixtures in the real corpus, verified during discovery.
