@@ -6,13 +6,16 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from ..browser.playwright_backend import (
     PlaywrightBrowser,
     PlaywrightUnavailable,
     ProfileLockedError,
+    ResearchChromeNotRunning,
     discover_chrome_executable,
 )
+from ..browser.research_chrome_lock import ResearchChromeBusy
 from ..cli_output import CliReport, attach_json_flag
 from ..exit_codes import (
     EXIT_BUDGET_EXHAUSTED,
@@ -232,6 +235,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _run_live(args: argparse.Namespace) -> int:
     report = CliReport(bool(getattr(args, "json", False)))
+    exit_code, _result = await _run_live_into(args, report)
+    report.flush()
+    return exit_code
+
+
+async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[int, Any]:
+    """Run one live acquisition, reporting into ``report`` without printing it.
+
+    Returns the graded exit code and the workflow result (``None`` when the
+    run stopped before the workflow produced one).  ``acquire-batch`` runs
+    every queue item through here, so an item gets exactly the single-paper
+    path -- the same pacing, fetch ledger, identity lock, validation, archive
+    and exit ladder -- rather than a second implementation of it.
+    """
+
     request = _request_from_args(args)
     staging = Path(args.run_root) / "downloads" / "staging"
     browser = PlaywrightBrowser(
@@ -240,6 +258,7 @@ async def _run_live(args: argparse.Namespace) -> int:
         executable_path=args.chrome,
         headless=args.headless,
         human_wait_seconds=float(getattr(args, "human_wait", 0.0) or 0.0),
+        require_attach=bool(getattr(args, "require_attached_browser", False)),
     )
     try:
         await browser.start()
@@ -276,13 +295,17 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", str(exc))
         report.put("ProfileModified", False, plain="false")
-        report.flush()
-        return EXIT_ENV_NOT_READY
+        return EXIT_ENV_NOT_READY, None
+    except (ResearchChromeBusy, ResearchChromeNotRunning) as exc:
+        # Nothing touched the browser: the lock is taken, and the attach-only
+        # check made, before the first browser command.
+        report.put("Status", "SOURCE_UNAVAILABLE")
+        report.put("Reason", str(exc))
+        return EXIT_ENV_NOT_READY, None
     except PlaywrightUnavailable as exc:
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", str(exc))
-        report.flush()
-        return EXIT_CAPABILITY_MISSING
+        return EXIT_CAPABILITY_MISSING, None
     except LiteratureSourceError as exc:
         # Setup-phase source errors (an unresolved institutional route, a
         # source-side stop before the workflow loop) must honor the same
@@ -292,16 +315,14 @@ async def _run_live(args: argparse.Namespace) -> int:
         status = getattr(exc, "status", RunStatus.SOURCE_UNAVAILABLE)
         report.put("Status", status.value)
         report.put("Reason", str(exc))
-        report.flush()
         if status in {RunStatus.ACTION_REQUIRED_USER_LOGIN, RunStatus.ACTION_REQUIRED_USER_DOWNLOAD}:
-            return EXIT_HUMAN_ACTION_REQUIRED
-        return EXIT_ENV_NOT_READY
+            return EXIT_HUMAN_ACTION_REQUIRED, None
+        return EXIT_ENV_NOT_READY, None
     except Exception as exc:
         reason = f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:300]
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", reason)
-        report.flush()
-        return EXIT_ENV_NOT_READY
+        return EXIT_ENV_NOT_READY, None
     finally:
         # Read the browser's own account of what it did before tearing it down.
         # An Agent that has to infer this from missing output gets it wrong:
@@ -354,8 +375,7 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.note(
             "Click the Chrome PDF Viewer native Download button once; Harness will ingest the new file."
         )
-    report.flush()
-    return _live_exit_code(result, budget_refusals)
+    return _live_exit_code(result, budget_refusals), result
 
 
 def _live_exit_code(result: Any, budget_refusals: int) -> int:

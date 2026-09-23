@@ -136,3 +136,28 @@ def isolated_search_pace_ledger_path(monkeypatch):
             f"{REAL_SEARCH_PACE_LEDGER_PATH} (before={before}, after={after}); "
             "search pacing is live state and tests must never write it"
         )
+
+
+# The Research Chrome lock is live in a different way: a test holding the real
+# lock refuses the user's real acquisition running beside the suite, and a
+# real batch holding it would fail every test that starts a browser.
+@pytest.fixture(autouse=True)
+def isolated_research_chrome_lock(monkeypatch):
+    """Every test takes the Research Chrome lock in its own throwaway directory."""
+
+    from hunnu_harness.browser import research_chrome_lock
+    from hunnu_harness.paths import TEMP_DIR
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="chrome-lock-guard-", dir=TEMP_DIR) as tmp:
+        monkeypatch.setattr(
+            research_chrome_lock,
+            "LOCK_PATH",
+            Path(tmp) / "research_chrome.lock",
+        )
+        try:
+            yield
+        finally:
+            # A test that started a browser without closing it still holds the
+            # lock; drop the hold before its directory is removed.
+            research_chrome_lock._release_all_for_tests()

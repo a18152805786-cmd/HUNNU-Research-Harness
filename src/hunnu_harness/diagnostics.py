@@ -55,6 +55,14 @@ def build_capabilities() -> dict[str, Any]:
         "HarnessVersion": __version__,
         "Sources": sources,
         "AcquisitionEntry": "hunnu-harness acquire --source <cli_source> ...",
+        "BatchAcquisitionEntry": (
+            "hunnu-harness acquire-batch --queue <queue.json> [--dry-run] "
+            "(up to 25 papers, run one after another; stops at the first manual gate)"
+        ),
+        "ConcurrentAcquisition": (
+            "refused: one process at a time holds the Research Chrome lock "
+            "(Output Root/audit/research_chrome.lock)"
+        ),
         "NavigatorCommands": sorted(NAVIGATOR_COMMANDS),
         "ExitCodeLadder": {
             "0": "run completed (zero hits included; read Results)",
