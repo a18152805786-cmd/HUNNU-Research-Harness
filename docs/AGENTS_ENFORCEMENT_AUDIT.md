@@ -1,4 +1,4 @@
-# AGENTS.md 74 条执行力审计（代码强制 vs 散文）
+# AGENTS.md 75 条执行力审计（代码强制 vs 散文）
 
 分发方案任务 3.5 的交付物。它回答一个问题：**把这个仓库交给一个陌生 agent，哪些规则是机器挡着的，哪些只靠它自觉？**
 
@@ -82,10 +82,11 @@
 | 72 | 人工闸门必须交还用户，不得转去同一机构会话的另一个源 | 散文 | `browser-start` 为交还 surface；`literature/cli.py` 的 `ACTION_REQUIRED_USER_LOGIN` HumanNotes 已改为指向它（旧文案指向 Playwright MCP，已过时）。无网络工作可继续并随 handoff 一并汇报 |
 | 73 | ScienceDirect 采集前先 `browser-start`；被拒的 run 交还用户，绝不重试 | 散文 | 附着由 `playwright_backend.start()` 的 `connect_over_cdp` 分支完成；2026-09-19 时间线已证伪「附着即可避免封锁」（两次附着 run 同样失败），故本条按观察陈述。`BrowserLaunched` 对附着与自启同为 true，不能用来判别 |
 | 74 | 出版商明确拒绝＝停机交人；检索跨进程限速 | 代码强制 | `sciencedirect.py` 的 `publisher_block_evidence`＋`SearchPageType.PUBLISHER_BLOCKED`／`ArticlePageState.PUBLISHER_BLOCKED` 首读即判，抛 `SourceActionRequired` 停止查询循环（`test_sciencedirect_query_resilience.py`）；`search_pace.py` 落盘台账跨进程限速，只等待不拒绝（`test_search_pace_ledger.py`） |
+| 75 | 多篇论文走 `acquire-batch` 队列；并行采集被拒 | 代码强制 | `literature/acquire_batch.py`：单队列不超过 25（规则 62）、待下载超过 10 篇须 `--confirm-budget`（规则 41）、首个人工闸门／出版商拒绝／当日总额用尽／环境失败即整队停下、连续 3 篇到了出版商却没拿到文件即停、失败的下载重跑时不再抓取（规则 71）、从不传 `--allow-refetch`、只附着已运行的 Research Chrome 绝不自启、库里已有的论文（精确 DOI／标题）不检索（`test_acquire_batch.py`，每条护栏均做过改坏即红的核验）；`browser/research_chrome_lock.py`：`PlaywrightBrowser.start()` 在碰浏览器之前取操作系统文件锁（Output Root 的 audit 目录下 `research_chrome.lock`），`close()` 释放，进程内可重入，第二个进程被拒（exit 5），进程崩溃由操作系统释放、不留陈旧锁（`test_research_chrome_lock.py`）；conftest 结构性护栏使真实锁对测试不可达 |
 
 ## 统计
 
-- **代码强制**：43 条（含 3 条"多数强制"）
+- **代码强制**：44 条（含 3 条"多数强制"）
 - **测试钉住（结构性）**：1 条（#6，全包扫描式）
 - **设计缺失**：6 条
 - **部分**：8 条

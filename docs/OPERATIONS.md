@@ -77,6 +77,18 @@ v0.1 的端到端验收（`HarnessV01CNRDSTestPassed=true`）：在用户人工�
 
 `--source` 可选 `sciencedirect`、`springerlink`、`cnki`、`oxfordacademic`；目标用 `--title`、`--doi` 或 `--request-json` 指定。退出码 2 表示需要人（登录、人工下载或人工判断），这时停下交还用户（AGENTS.md 规则 72），不要转去同一机构会话的另一个来源。
 
+**批量队列（`acquire-batch`，规则 75）。** 多篇论文写进一个队列文件，由一个进程一篇接一篇地跑完，每篇走的都是上面 `acquire` 的同一条路径（限速、写前记账、身份锁、校验、SHA-256、manifest、归档、分类都不变）：
+
+```powershell
+.venv\Scripts\hunnu-harness.exe browser-start                                   # 批量只附着已运行的 Research Chrome，绝不自启
+.venv\Scripts\hunnu-harness.exe acquire-batch --queue queue.json --dry-run      # 先规划：校验队列、跳过库里已有的、看额度
+.venv\Scripts\hunnu-harness.exe acquire-batch --queue queue.json                # 真跑；停下后原样再跑一次即续跑
+```
+
+队列文件格式：`{"BatchName": "Example_Batch_01", "Items": [{"Source": "cnki", "Title": "..."}, {"Source": "springerlink", "DOI": "10.1007/..."}]}`，每项只给 `Title` 或 `DOI` 之一，可选 `ItemID`、`Note`。一个队列最多 25 篇（规则 62）；待下载超过 10 篇须在用户确认后加 `--confirm-budget`（规则 41）。遇到第一个人工闸门、出版商拒绝、当日总额用尽或环境失败，整队停下（退出码与单篇 `acquire` 相同）；连续 3 篇到了出版商却没拿到文件也停（退出码 1）。状态记在 `Output Root\runs\AcquireBatch\<BatchName>\BATCH_STATE.jsonl`，每篇的运行证据在同目录 `items\` 下；重跑时已有最终结果的条目（包括下载失败的，规则 71）一律跳过，被闸门挡住的那篇最先跑。批量从不传 `--allow-refetch`。
+
+**同一时间只允许一个采集进程。** 任何驱动 Research Chrome 的运行（`acquire`、批量队列、脚本里交给路由器的 `PlaywrightBrowser`）从浏览器启动到关闭都持有 `Output Root\audit\research_chrome.lock`，第二个进程会被拒绝（退出码 5）。原因：并行运行会共用同一个标签页、整个浏览器共用的下载目录，以及全局的限速台账。实测表明慢在 agent 每篇之间的来回（2026-09-23：63 分钟里 harness 只跑了约 9 分钟），不在单篇本身；已接近限速上限的脚本批量（2026-09-22：每篇中位数 104 秒）再加并发也快不了。并行的 agent 应该用在下载之后：读本地全文、抽证据、筛摘要。
+
 **多来源预检。** 显式无人值守的多来源请求先动态扫查全部计划来源、批量汇总人工认证闸门，并要求每个来源完成一次本会话授权下载、文件验证与目标身份锁定后，才签发 `UnattendedRunClearance=true`。
 
 **Agent 接入。** `agent-route` 为 agent 提供稳定的结构化请求路由与无网络 dry-run，详见 [AGENT_INTEGRATION.md](AGENT_INTEGRATION.md)。live 执行必须经 `AdapterExecutionBroker`，不能用裸 MCP 浏览器操作替代适配器。
