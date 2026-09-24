@@ -4,12 +4,13 @@ import asyncio
 import dataclasses
 import html as html_lib
 import json
+import math
 import re
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, quote_plus, unquote_plus, urljoin, urlsplit
 
 from ...browser.commands import (
     BrowserCommandError,
@@ -20,7 +21,13 @@ from ...browser.commands import (
     ObservationUnavailable,
     ObserveCommand,
 )
-from .base import LiteratureSourceAdapter, SourceActionRequired, SourceLayoutChanged, SourceUnavailable
+from .base import (
+    LiteratureSourceAdapter,
+    LiteratureSourceError,
+    SourceActionRequired,
+    SourceLayoutChanged,
+    SourceUnavailable,
+)
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
 from ..cnki_challenge import (
     CAPTCHA_CHALLENGE_STATES,
@@ -76,6 +83,48 @@ _ACCESS_SETTLE_DELAY_SECONDS = 2.0
 _ACCESS_SETTLE_MAX_OBSERVATIONS = 4
 _CNKI_CLICK_RETRY_DELAY_SECONDS = 1.0
 _CNKI_CLICK_RETRIES = 1
+
+# Restricted search (LiteratureSearchRequest.resource_type / source_journals).
+# The values below are read off CNKI's own kns8s result pages as saved in the
+# Output Root (2026-08): the 学术期刊 tab is
+# ``a[name=classify][classid=YSTT4HG0][resource=JOURNAL]`` with
+# ``data-chs="CJFQ,CAPJ,ZHYX,CJTL"`` and ``data-en="WWJD"``; the hidden
+# ``#CheckedDB`` and ``briefRequest.kuaKuCode`` carry the resource-code list
+# that CNKI's home page sends as the ``crossids`` URL parameter; and the field
+# list offers ``LY`` (文献来源) beside ``SU``/``TI``/``AU``.  What no saved page
+# can show -- that ``crossids=YSTT4HG0`` alone confines the search -- is what
+# every restricted result page is checked for before anything is returned.
+_CNKI_JOURNAL_CLASSID = "YSTT4HG0"
+_CNKI_JOURNAL_RESOURCE = "JOURNAL"
+_CNKI_JOURNAL_PRODUCTS = frozenset({"CJFQ", "CAPJ", "ZHYX", "CJTL", "WWJD"})
+_CNKI_ONLINE_FIRST_PRODUCT = "CAPJ"
+# The 数据库 cell of a result row, as CNKI prints it for those products.
+_CNKI_JOURNAL_ROW_LABELS = frozenset({"期刊"})
+_CNKI_RESTRICTED_FIELDS = {"journal_topic": "SU", "journal_source": "LY"}
+# The one-box search input carries maxlength="100" on the saved pages.
+_CNKI_SEARCH_BOX_MAX_CHARS = 100
+# CNKI reads these as operators or grouping inside a one-box query; a source
+# name that contains one is searched as a single quoted term.
+_CNKI_QUERY_OPERATOR_CHARS = frozenset(" *+-()/%=")
+_SOURCE_QUERY_RE = re.compile(r'^source:\s*"(?P<name>.+)"$', re.IGNORECASE)
+_CNKI_REPORTED_TOTAL_RE = re.compile(r"共(?:为您)?找到(?:约)?\s*([\d,，]+)\s*(?:条|篇|项)")
+
+
+class CNKIRestrictionUnconfirmed(SourceLayoutChanged):
+    """CNKI did not demonstrably apply a requested restriction.
+
+    Nothing from such a page is returned as restricted.  The run also sends no
+    further search: the next query would meet the same page, and a search that
+    cannot succeed still spends the session (AGENTS.md Rule 74).
+    """
+
+    halts_remaining_searches = True
+
+
+class CNKIRestrictedQueryRefused(LiteratureSourceError):
+    """A restricted query CNKI's one-box search cannot carry; nothing was sent."""
+
+    status = RunStatus.NO_RESULTS
 
 
 class _CNKIObservationUnreadable(SourceUnavailable):
@@ -705,12 +754,313 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         ) >= 2
 
 
+class _CNKIResultRowParser(_CNKIHTMLParser):
+    """Read kns8s result rows cell by cell, plus the page's own briefRequest.
+
+    The exact-title path reads only title links; a restricted search also
+    needs each row's 来源, 发表时间 and 数据库 cells, which are how the page
+    says what every result is.  Cells are recognized by their class token
+    (``td.name``/``td.source``/``td.date``/``td.data``), never by position.
+    """
+
+    _ROW_CELLS = ("name", "author", "source", "date", "data")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listing_rows: list[dict[str, Any]] = []
+        self.brief_request: str | None = None
+        self._row: dict[str, Any] | None = None
+        self._cell: str | None = None
+        self._mark_captures: list[tuple[int, list[str]]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        super().handle_starttag(tag, attrs)
+        attributes = {key.casefold(): (value or "") for key, value in attrs}
+        lowered = tag.casefold()
+        if lowered == "input" and attributes.get("id", "") == "briefRequest":
+            self.brief_request = attributes.get("value", "")
+            return
+        if lowered == "tr":
+            self._finish_row()
+            self._row = {
+                "cells": defaultdict(list),
+                "anchors": [],
+                "products": [],
+                "resources": [],
+                "marks": [],
+            }
+            return
+        if self._row is None:
+            return
+        classes = set(attributes.get("class", "").casefold().split())
+        if lowered in {"td", "th"}:
+            self._cell = (
+                next((name for name in self._ROW_CELLS if name in classes), None)
+                if lowered == "td"
+                else None
+            )
+            return
+        if attributes.get("data-dbname", "").strip():
+            self._row["products"].append(attributes["data-dbname"].strip().upper())
+        if attributes.get("data-resource", "").strip():
+            self._row["resources"].append(attributes["data-resource"].strip().upper())
+        if self._cell == "name" and "marktip" in classes and lowered not in _VOID_ELEMENTS:
+            self._mark_captures.append((len(self._open_tags), []))
+
+    def handle_data(self, data: str) -> None:
+        super().handle_data(data)
+        if self._row is None or self._cell is None:
+            return
+        if self._hidden_depths or self._non_content_depths:
+            return
+        text = data.strip()
+        if not text:
+            return
+        self._row["cells"][self._cell].append(text)
+        for _depth, parts in self._mark_captures:
+            parts.append(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        anchors_before = len(self.anchors)
+        super().handle_endtag(tag)
+        if self._row is not None and self._cell == "name" and len(self.anchors) > anchors_before:
+            self._row["anchors"].append(self.anchors[-1])
+        remaining = len(self._open_tags)
+        open_marks: list[tuple[int, list[str]]] = []
+        for depth, parts in self._mark_captures:
+            if depth <= remaining:
+                open_marks.append((depth, parts))
+            elif self._row is not None:
+                self._row["marks"].append(" ".join(parts))
+        self._mark_captures = open_marks
+        if lowered in {"td", "th"}:
+            self._cell = None
+        elif lowered in {"tr", "tbody", "table"}:
+            self._finish_row()
+
+    def close(self) -> None:
+        super().close()
+        self._finish_row()
+
+    def _finish_row(self) -> None:
+        row, self._row, self._cell = self._row, None, None
+        self._mark_captures = []
+        if row is not None and row["anchors"]:
+            self.listing_rows.append(row)
+
+
+@dataclasses.dataclass(frozen=True)
+class _CNKIListingRow:
+    title: str
+    navigation_url: str
+    stable_identifier: str
+    source: str
+    date: str
+    year: str
+    database_label: str
+    products: tuple[str, ...]
+    resources: tuple[str, ...]
+    online_first: bool
+
+    def is_journal_article(self) -> bool | None:
+        """Whether the row says it is an academic journal article.
+
+        ``None`` means the row carries no type at all, which a restricted
+        search cannot vouch for either way.
+        """
+
+        if not (self.database_label or self.products or self.resources):
+            return None
+        if self.database_label and self.database_label not in _CNKI_JOURNAL_ROW_LABELS:
+            return False
+        if self.products and not set(self.products) <= _CNKI_JOURNAL_PRODUCTS:
+            return False
+        if self.resources and set(self.resources) != {_CNKI_JOURNAL_RESOURCE}:
+            return False
+        return True
+
+    def describe(self) -> str:
+        kind = self.database_label or "/".join(self.products or self.resources) or UNKNOWN
+        return f"{self.title[:40]} [{kind}; 来源={self.source}]"
+
+
+@dataclasses.dataclass(frozen=True)
+class _CNKISearchScope:
+    """What the result page says CNKI executed: its hidden ``briefRequest``."""
+
+    cross_ids: frozenset[str]
+    classids: frozenset[str]
+    resources: frozenset[str]
+    products: frozenset[str]
+    conditions: tuple[tuple[str, str], ...]
+    search_from: str
+    sort: str
+
+    @property
+    def journal_only(self) -> bool:
+        cross_database = self.cross_ids == frozenset({_CNKI_JOURNAL_CLASSID})
+        single_database = self.classids == frozenset({_CNKI_JOURNAL_CLASSID}) and self.resources == frozenset(
+            {_CNKI_JOURNAL_RESOURCE}
+        )
+        if not (cross_database or single_database):
+            return False
+        return not self.products or self.products <= _CNKI_JOURNAL_PRODUCTS
+
+    def describe_conditions(self) -> str:
+        return " AND ".join(f"{field}={value}" for field, value in self.conditions) or "no search condition"
+
+    def evidence(self) -> str:
+        return (
+            f"briefRequest: CrossIds={','.join(sorted(self.cross_ids)) or UNKNOWN}; "
+            f"Products={','.join(sorted(self.products)) or UNKNOWN}; "
+            f"Condition={self.describe_conditions()}; {self.search_from or UNKNOWN}"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _CNKIRestrictedPage:
+    rows: tuple[_CNKIListingRow, ...]
+    scope: _CNKISearchScope | None
+    terminal: bool
+    reported_total: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _CNKIRestrictedSearchSpec:
+    query: str
+    mode: str
+    field: str
+    term: str
+    journal: str
+    year_start: int | None
+    year_end: int | None
+    result_limit: int
+
+    def describe(self) -> str:
+        return f"{self.field}={self.term} within 学术期刊 ({_CNKI_JOURNAL_CLASSID})"
+
+
+def _cnki_codes(value: Any) -> frozenset[str]:
+    return frozenset(item.strip().upper() for item in str(value or "").split(",") if item.strip())
+
+
+def _cnki_query_conditions(node: Any) -> list[tuple[str, str]]:
+    """Every (field, value) condition in a briefRequest ``qnode`` tree."""
+
+    found: list[tuple[str, str]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            field_name = value.get("field")
+            field_value = value.get("value")
+            if isinstance(field_name, str) and field_name.strip() and field_value not in (None, ""):
+                found.append((field_name.strip().upper(), str(field_value)))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(node)
+    return found
+
+
+def _parse_cnki_brief_request(value: str | None) -> _CNKISearchScope | None:
+    """Read the page's own statement of the search it ran, or ``None``."""
+
+    if not value:
+        return None
+    try:
+        outer = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(outer, dict):
+        return None
+    raw_query = outer.get("queryJson")
+    if isinstance(raw_query, str):
+        try:
+            inner = json.loads(raw_query)
+        except ValueError:
+            return None
+    else:
+        inner = raw_query if isinstance(raw_query, dict) else {}
+    if not isinstance(inner, dict):
+        return None
+    cross_ids = _cnki_codes(inner.get("kuaKuCode")) | _cnki_codes(
+        outer.get("kuakuCode") or outer.get("kuaKuCode")
+    )
+    classids = frozenset(
+        str(item).strip().upper() for item in (inner.get("classid"), outer.get("classid")) if str(item or "").strip()
+    )
+    resources = frozenset(
+        str(item).strip().upper() for item in (inner.get("resource"), outer.get("resource")) if str(item or "").strip()
+    )
+    sort = " ".join(
+        str(item).strip() for item in (outer.get("sortField"), outer.get("sortType")) if str(item or "").strip()
+    )
+    return _CNKISearchScope(
+        cross_ids=cross_ids,
+        classids=classids,
+        resources=resources,
+        products=_cnki_codes(inner.get("Products")),
+        conditions=tuple(_cnki_query_conditions(inner.get("qnode"))),
+        search_from=str(outer.get("searchFrom") or "").strip(),
+        sort=sort,
+    )
+
+
+def _cnki_query_value(value: str) -> str:
+    """Compare one-box query values the way CNKI stores them, quotes aside."""
+
+    text = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value))).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text.casefold()
+
+
+def _cnki_source_term(journal: str) -> str:
+    """The one-box value for a 文献来源 search of one named journal."""
+
+    if any(character in _CNKI_QUERY_OPERATOR_CHARS for character in journal):
+        return f'"{journal}"'
+    return journal
+
+
+def _carry_listing_metadata(listed: LiteratureRecord, detail: LiteratureRecord) -> None:
+    """Keep what CNKI's own result row said where the article page is silent.
+
+    Only a restricted search lists journal and year on its records -- the
+    exact-title path never does, so it is untouched.  The identity lock has
+    already compared both wherever the article page states its own (and on the
+    saved 2026-08 pages they always agreed); the row fills only what the page
+    left unknown: online-first (CAPJ) article pages state neither.
+    """
+
+    if _cnki_known(listed.journal) and not _cnki_known(detail.journal):
+        detail.journal = listed.journal
+        # With no journal, the page's own classification was inferred from
+        # body text (navigation menus mention 报纸 and 学位论文); the row is
+        # CNKI's database label for this very article.
+        if _cnki_known(listed.publication_type):
+            detail.publication_type = listed.publication_type
+            detail.publication_status = listed.publication_status
+    if _cnki_known(listed.year) and not _cnki_known(detail.year):
+        detail.year = listed.year
+    if (
+        listed.publication_status == PublicationStatus.ONLINE_FIRST.value
+        and detail.publication_status == PublicationStatus.UNKNOWN.value
+    ):
+        detail.publication_status = listed.publication_status
+
+
 class CNKIAdapter(LiteratureSourceAdapter):
     """Bounded CNKI adapter for manually authenticated, normally authorized access."""
 
     name = "CNKI"
     supports_unattended_download = True
     supports_preflight = True
+    supports_restricted_search = True
     search_origin = "https://kns.cnki.net"
 
     def __init__(self, browser: Any):
@@ -721,6 +1071,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
         # query string -> (mode, search term) actually sent to CNKI, so a result
         # can be refreshed with the same search that found it (see open_result).
         self._search_inputs: dict[str, tuple[str, str]] = {}
+        # query string -> what a restricted search confirmed and discarded.
+        self._restriction_reports: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _parser(html: str) -> _CNKIHTMLParser:
@@ -912,9 +1264,27 @@ class CNKIAdapter(LiteratureSourceAdapter):
 
     @classmethod
     def build_search_url(cls, query: str, *, mode: str = "keyword") -> str:
+        if mode in _CNKI_RESTRICTED_FIELDS:
+            return cls._journal_scoped_search_url(query, field=_CNKI_RESTRICTED_FIELDS[mode])
         order = {"exact_title": "TI", "title": "TI", "author": "AU", "keyword": "SU"}.get(mode, "SU")
         query_value = _canonicalize_cnki_exact_query(query) if mode in {"exact_title", "title"} else query
         return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={quote_plus(query_value)}"
+
+    @classmethod
+    def _journal_scoped_search_url(cls, term: str, *, field: str) -> str:
+        """One kns8s search over academic journals only, in one field.
+
+        ``crossids`` is the resource set CNKI's home page sends; ``YSTT4HG0``
+        alone is 学术期刊.  The term goes through ``quote``, not ``quote_plus``:
+        CNKI keeps a ``+`` in ``kw`` literally (the saved result pages show
+        ``A+B`` as the executed query for a title sent as ``A B``), so a space
+        must arrive as ``%20`` to reach the search box as a space.
+        """
+
+        return (
+            f"{cls.search_origin}/kns8s/defaultresult/index?crossids={_CNKI_JOURNAL_CLASSID}"
+            f"&korder={field}&kw={quote(term, safe='')}"
+        )
 
     @classmethod
     def parse_search_results_html(
@@ -1039,6 +1409,73 @@ class CNKIAdapter(LiteratureSourceAdapter):
             if len(records) >= max_results:
                 break
         return records
+
+    @classmethod
+    def parse_restricted_search_html(
+        cls,
+        html: str,
+        *,
+        source_url: str = "https://kns.cnki.net/kns8s/defaultresult/index",
+        challenge_state: ChallengeState | None = None,
+    ) -> _CNKIRestrictedPage:
+        """Read a kns8s result page as a restricted search needs it.
+
+        Challenge and login evidence is enforced first, exactly as for every
+        other CNKI page.  Nothing here decides whether the restriction held;
+        it only reports what the page says -- every result row with its
+        来源/发表时间/数据库 cells, and the page's own statement of the search
+        it executed.
+        """
+
+        cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
+        parser = _CNKIResultRowParser()
+        parser.feed(html)
+        parser.close()
+        rows: list[_CNKIListingRow] = []
+        for raw in parser.listing_rows:
+            candidates = [
+                (0 if "fz14" in anchor.attributes.get("class", "").casefold().split() else 1, index, anchor)
+                for index, anchor in enumerate(raw["anchors"])
+                if _is_cnki_detail_url(urljoin(source_url, anchor.href))
+            ]
+            if not candidates:
+                continue
+            _priority, _index, anchor = sorted(candidates, key=lambda item: item[:2])[0]
+            title = _normalize_cnki_observed_title_spacing(anchor.text)
+            if not title or any(label in title for label in _REJECT_DOWNLOAD_LABELS):
+                continue
+            absolute = urljoin(source_url, anchor.href)
+            cells = raw["cells"]
+            source = re.sub(r"\s+", " ", " ".join(cells.get("source", []))).strip() or UNKNOWN
+            date = re.sub(r"\s+", " ", " ".join(cells.get("date", []))).strip() or UNKNOWN
+            year_match = re.search(r"(?:18|19|20|21)\d{2}", date) if date != UNKNOWN else None
+            products = tuple(dict.fromkeys(raw["products"]))
+            rows.append(
+                _CNKIListingRow(
+                    title=title,
+                    navigation_url=absolute,
+                    stable_identifier=_stable_identifier(absolute),
+                    source=source,
+                    date=date,
+                    year=year_match.group(0) if year_match else UNKNOWN,
+                    database_label=re.sub(r"\s+", "", " ".join(cells.get("data", []))),
+                    products=products,
+                    resources=tuple(dict.fromkeys(raw["resources"])),
+                    online_first=(
+                        any("网络首发" in mark for mark in raw["marks"])
+                        or _CNKI_ONLINE_FIRST_PRODUCT in products
+                    ),
+                )
+            )
+        total_match = _CNKI_REPORTED_TOTAL_RE.search(re.sub(r"\s+", "", parser.visible_body_text))
+        return _CNKIRestrictedPage(
+            rows=tuple(rows),
+            scope=_parse_cnki_brief_request(parser.brief_request),
+            terminal=cls._search_outcome_is_stable("html", html),
+            reported_total=(
+                int(re.sub(r"[,，]", "", total_match.group(1))) if total_match else None
+            ),
+        )
 
     @classmethod
     def parse_article_html(
@@ -1670,6 +2107,8 @@ class CNKIAdapter(LiteratureSourceAdapter):
         )
 
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
+        if request.restricted_search:
+            return await self._restricted_search(query, request)
         mode, search_term = self._search_input(query, request)
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
@@ -1706,6 +2145,322 @@ class CNKIAdapter(LiteratureSourceAdapter):
         if not results and not _is_cnki_host(urlsplit(current_url).hostname):
             raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
         return results
+
+    # -- restricted search ----------------------------------------------------
+
+    def search_restriction_report(self, query: str) -> dict[str, Any] | None:
+        report = self._restriction_reports.get(query)
+        return dict(report) if report is not None else None
+
+    def search_restriction_reports(self) -> list[dict[str, Any]]:
+        """Every restricted search this adapter ran, in the order it ran them."""
+
+        return [dict(report) for report in self._restriction_reports.values()]
+
+    @staticmethod
+    def _restricted_search_spec(query: str, request: LiteratureSearchRequest) -> _CNKIRestrictedSearchSpec:
+        """Turn one planned query into the single journal-scoped search it means.
+
+        A ``source:"<journal>"`` query searches 文献来源 for that journal; any
+        other query searches 主题 (SU).  A request that names journals is only
+        ever searched by source -- the planner never sends it a topic query.
+        """
+
+        base_limit = min(request.max_results_per_source, request.max_search_results)
+        source_match = _SOURCE_QUERY_RE.match(query.strip())
+        if source_match:
+            requested = source_match.group("name").strip()
+            journal = next(
+                (
+                    name
+                    for name in request.source_journals
+                    if _canonicalize_cnki_title_identity(name) == _canonicalize_cnki_title_identity(requested)
+                ),
+                None,
+            )
+            if journal is None:
+                raise ValueError(f"{query!r} does not name one of the request's SourceJournals")
+            # The candidate cap is split across the named journals, never
+            # expanded: a first journal must not use every slot on its own.
+            limit = max(1, math.ceil(base_limit / len(request.source_journals)))
+            return _CNKIRestrictedSearchSpec(
+                query=query,
+                mode="journal_source",
+                field=_CNKI_RESTRICTED_FIELDS["journal_source"],
+                term=_cnki_source_term(journal),
+                journal=journal,
+                year_start=request.year_start,
+                year_end=request.year_end,
+                result_limit=limit,
+            )
+        if request.source_journals:
+            raise ValueError("A request that names SourceJournals is searched by source only")
+        raw = query.strip()
+        term = raw[1:-1].strip() if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"') else raw
+        return _CNKIRestrictedSearchSpec(
+            query=query,
+            mode="journal_topic",
+            field=_CNKI_RESTRICTED_FIELDS["journal_topic"],
+            term=term,
+            journal="",
+            year_start=request.year_start,
+            year_end=request.year_end,
+            result_limit=base_limit,
+        )
+
+    def _restriction_report(
+        self,
+        spec: _CNKIRestrictedSearchSpec,
+        *,
+        confirmed: bool,
+        note: str,
+        page: _CNKIRestrictedPage | None = None,
+        **counts: Any,
+    ) -> dict[str, Any]:
+        years = sorted(
+            {int(row.year) for row in (page.rows if page is not None else ()) if row.year != UNKNOWN}
+        )
+        report: dict[str, Any] = {
+            "Query": spec.query,
+            "SearchField": spec.field,
+            "SearchTerm": spec.term,
+            "CrossIds": _CNKI_JOURNAL_CLASSID,
+            "ResourceType": "JournalArticle",
+            "SourceJournal": spec.journal or UNKNOWN,
+            "YearStart": spec.year_start if spec.year_start is not None else UNKNOWN,
+            "YearEnd": spec.year_end if spec.year_end is not None else UNKNOWN,
+            "ScopeConfirmed": confirmed,
+            "ScopeEvidence": (
+                page.scope.evidence() if page is not None and page.scope is not None else UNKNOWN
+            ),
+            "SortedBy": (
+                page.scope.sort or UNKNOWN if page is not None and page.scope is not None else UNKNOWN
+            ),
+            "ReportedTotal": (
+                page.reported_total if page is not None and page.reported_total is not None else UNKNOWN
+            ),
+            "RowsOnPage": len(page.rows) if page is not None else 0,
+            "RowsKept": 0,
+            "RowsDroppedOtherSource": 0,
+            "RowsDroppedOutsideYears": 0,
+            "RowsDroppedYearUnreadable": 0,
+            "RowsDroppedDuplicate": 0,
+            "RowsBeyondLimit": 0,
+            "PageYears": f"{years[0]}-{years[-1]}" if years else UNKNOWN,
+            "Note": note,
+        }
+        report.update(counts)
+        self._restriction_reports[spec.query] = report
+        return report
+
+    def _restriction_failure(
+        self,
+        spec: _CNKIRestrictedSearchSpec,
+        message: str,
+        *,
+        page: _CNKIRestrictedPage | None = None,
+    ) -> CNKIRestrictionUnconfirmed:
+        detail = f"{message}; searched {spec.describe()}; nothing from this page is returned as restricted"
+        self._restriction_report(spec, confirmed=False, note=detail, page=page)
+        return CNKIRestrictionUnconfirmed(detail)
+
+    async def _restricted_search(
+        self,
+        query: str,
+        request: LiteratureSearchRequest,
+    ) -> list[LiteratureRecord]:
+        """One journal-scoped search, returned only if the page confirms it.
+
+        The workflow has already waited out the search pace ledger for this
+        query, and this sends exactly one request.  Every observation passes
+        the same challenge and login gates as any CNKI page; then the page's
+        own briefRequest must show that CNKI searched academic journals only,
+        with this query and nothing else, and every row must say it is a
+        journal article.  Rows from another journal or outside the requested
+        years are dropped and counted, never returned.
+        """
+
+        spec = self._restricted_search_spec(query, request)
+        if len(spec.term) > _CNKI_SEARCH_BOX_MAX_CHARS:
+            message = (
+                f"CNKI_RESTRICTED_QUERY_TOO_LONG: CNKI's search box takes at most "
+                f"{_CNKI_SEARCH_BOX_MAX_CHARS} characters and this query has {len(spec.term)}; "
+                "give KeywordsCN/KeywordsEN or SourceJournals rather than a long research "
+                "question; nothing was sent"
+            )
+            self._restriction_report(spec, confirmed=False, note=message)
+            raise CNKIRestrictedQueryRefused(message)
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        self._search_inputs[query] = (spec.mode, spec.term)
+        await self.browser.execute(NavigateCommand(self.build_search_url(spec.term, mode=spec.mode)))
+        page = await self._settled_restricted_page(spec)
+        return self._restricted_records(page, spec)
+
+    async def _settled_restricted_page(self, spec: _CNKIRestrictedSearchSpec) -> _CNKIRestrictedPage:
+        """Observe a bounded window until the page states the search we sent."""
+
+        current_url = self.search_origin
+        last_unreadable: _CNKIObservationUnreadable | None = None
+        readable_observation_seen = False
+        problem: str | None = None
+        last_page: _CNKIRestrictedPage | None = None
+        for observation_number in range(_SEARCH_SETTLE_MAX_OBSERVATIONS):
+            try:
+                content_kind, content, current_url = await self._content()
+            except _CNKIObservationUnreadable as exc:
+                last_unreadable = exc
+            else:
+                readable_observation_seen = True
+                if content_kind != "html":
+                    # The live challenge gate has already run on this very
+                    # observation; what a snapshot cannot show is the scope.
+                    raise self._restriction_failure(
+                        spec,
+                        "CNKI_RESTRICTION_UNCONFIRMED: the result page was readable only as an "
+                        "accessibility snapshot, which does not show the scope CNKI searched",
+                    )
+                page = self.parse_restricted_search_html(
+                    content,
+                    source_url=current_url,
+                    challenge_state=self._runtime_challenge_state(),
+                )
+                if page.terminal:
+                    last_page = page
+                    if page.scope is None:
+                        problem = (
+                            "CNKI_RESTRICTION_UNCONFIRMED: the result page did not state the scope "
+                            "it searched (no briefRequest)"
+                        )
+                    elif not (
+                        len(page.scope.conditions) == 1
+                        and page.scope.conditions[0][0] == spec.field
+                        and _cnki_query_value(page.scope.conditions[0][1]) == _cnki_query_value(spec.term)
+                    ):
+                        problem = (
+                            "CNKI_RESTRICTION_UNCONFIRMED: the result page shows a different search "
+                            f"({page.scope.describe_conditions()}) than the one sent"
+                        )
+                    else:
+                        return page
+            if observation_number + 1 < _SEARCH_SETTLE_MAX_OBSERVATIONS:
+                await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
+        if not readable_observation_seen and last_unreadable is not None:
+            raise last_unreadable
+        if not _is_cnki_host(urlsplit(current_url).hostname):
+            raise SourceUnavailable("CNKI search navigation did not reach an official CNKI host")
+        if problem is None:
+            raise SourceUnavailable(
+                "CNKI search results did not reach a terminal state after bounded observation"
+            )
+        raise self._restriction_failure(spec, problem, page=last_page)
+
+    def _restricted_records(
+        self,
+        page: _CNKIRestrictedPage,
+        spec: _CNKIRestrictedSearchSpec,
+    ) -> list[LiteratureRecord]:
+        scope = page.scope
+        assert scope is not None
+        if not scope.journal_only:
+            raise self._restriction_failure(
+                spec,
+                "CNKI_RESTRICTION_NOT_APPLIED: CNKI did not search academic journals only "
+                f"({scope.evidence()})",
+                page=page,
+            )
+        for position, row in enumerate(page.rows, start=1):
+            verdict = row.is_journal_article()
+            if verdict is None:
+                raise self._restriction_failure(
+                    spec,
+                    f"CNKI_RESTRICTION_UNCONFIRMED: result row {position} states no resource type "
+                    f"({row.describe()})",
+                    page=page,
+                )
+            if not verdict:
+                raise self._restriction_failure(
+                    spec,
+                    f"CNKI_RESTRICTION_NOT_APPLIED: result row {position} is not an academic "
+                    f"journal article ({row.describe()})",
+                    page=page,
+                )
+        wanted_source = _canonicalize_cnki_title_identity(spec.journal) if spec.journal else None
+        years_bounded = spec.year_start is not None or spec.year_end is not None
+        kept: list[_CNKIListingRow] = []
+        other_source = outside_years = year_unreadable = duplicates = 0
+        seen: set[str] = set()
+        for row in page.rows:
+            if wanted_source is not None and _canonicalize_cnki_title_identity(row.source) != wanted_source:
+                other_source += 1
+                continue
+            if years_bounded:
+                if row.year == UNKNOWN:
+                    year_unreadable += 1
+                    continue
+                year = int(row.year)
+                if (spec.year_start is not None and year < spec.year_start) or (
+                    spec.year_end is not None and year > spec.year_end
+                ):
+                    outside_years += 1
+                    continue
+            identity = (
+                row.stable_identifier
+                if row.stable_identifier != UNKNOWN
+                else normalize_title(row.title)
+            )
+            if identity in seen:
+                duplicates += 1
+                continue
+            seen.add(identity)
+            kept.append(row)
+        returned = kept[: spec.result_limit]
+        note = (
+            "CNKI searched academic journals only, as the page's briefRequest states; only the "
+            f"first result page is read ({scope.sort or 'sort order unstated'})"
+        )
+        if not returned and page.rows and years_bounded and outside_years:
+            note += (
+                "; no row on it falls in the requested years -- later pages, which are not read, "
+                "may hold such articles, so this is no evidence that the journal has none"
+            )
+        self._restriction_report(
+            spec,
+            confirmed=True,
+            note=note,
+            page=page,
+            RowsKept=len(returned),
+            RowsDroppedOtherSource=other_source,
+            RowsDroppedOutsideYears=outside_years,
+            RowsDroppedYearUnreadable=year_unreadable,
+            RowsDroppedDuplicate=duplicates,
+            RowsBeyondLimit=len(kept) - len(returned),
+        )
+        records: list[LiteratureRecord] = []
+        for row in returned:
+            paper_id = stable_paper_id(title=row.title)
+            records.append(
+                LiteratureRecord(
+                    paper_id=paper_id,
+                    title=row.title,
+                    year=row.year,
+                    journal=row.source,
+                    language="zh" if re.search(r"[㐀-鿿]", row.title) else UNKNOWN,
+                    publication_type="JournalArticle",
+                    publication_status=(
+                        PublicationStatus.ONLINE_FIRST.value
+                        if row.online_first
+                        else PublicationStatus.UNKNOWN.value
+                    ),
+                    source_database=self.name,
+                    source_page=sanitize_url(row.navigation_url),
+                    navigation_url=row.navigation_url,
+                    stable_identifier=row.stable_identifier,
+                    search_query=spec.query,
+                    canonical_paper_id=paper_id,
+                )
+            )
+        return records
 
     async def open_result(self, record: LiteratureRecord) -> None:
         target_url = record.navigation_url if record.navigation_url != UNKNOWN else record.source_page
@@ -1845,6 +2600,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             record.paper_id = self._expected_record.paper_id
             record.canonical_paper_id = self._expected_record.paper_id
             record.target_identity_confirmed = True
+            _carry_listing_metadata(self._expected_record, record)
         self._detail_record = record
         return record
 

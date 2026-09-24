@@ -91,6 +91,31 @@ def _field(mapping: Mapping[str, Any], *names: str, default: Any = None) -> Any:
     return default
 
 
+def _single_field(mapping: Mapping[str, Any], *names: str, default: Any = None) -> Any:
+    """Like ``_field``, but a field spelled twice with different values fails.
+
+    Used where a silently chosen spelling would change what is searched --
+    ``YearFrom`` beside ``YearStart``, say.
+    """
+
+    def comparable(value: Any) -> str:
+        if isinstance(value, (str, int, float, bool)):
+            return str(value).strip()
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    wanted = {_canonical(name) for name in names}
+    present = [
+        (str(key), value)
+        for key, value in mapping.items()
+        if _canonical(key) in wanted and value is not None and value != ""
+    ]
+    distinct = {comparable(value) for _key, value in present}
+    if len(distinct) > 1:
+        spellings = ", ".join(key for key, _value in present)
+        raise ValueError(f"{names[0]} is given more than once with different values ({spellings})")
+    return present[0][1] if present else default
+
+
 def _strings(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -698,13 +723,23 @@ class AgentRequestRouter:
                 "ExactTitles": ("ExactTitles", "exact_titles"),
                 "Authors": ("Authors", "authors"),
                 "DOIs": ("DOIs", "dois"),
-                "YearStart": ("YearStart", "year_start"),
-                "YearEnd": ("YearEnd", "year_end"),
                 "PreferredPublicationTypes": ("PreferredPublicationTypes", "preferred_publication_types"),
                 "JournalPriority": ("JournalPriority", "journal_priority"),
             }
             for target, aliases in passthrough.items():
                 value = _field(payload, *aliases, default=None)
+                if value is not None:
+                    base_mapping[target] = value
+            # The restriction and its years are read strictly: two spellings
+            # that disagree fail rather than one of them being dropped.
+            restriction_fields = {
+                "YearStart": ("YearStart", "year_start", "YearFrom", "year_from"),
+                "YearEnd": ("YearEnd", "year_end", "YearTo", "year_to"),
+                "ResourceType": ("ResourceType", "resource_type"),
+                "SourceJournals": ("SourceJournals", "source_journals"),
+            }
+            for target, aliases in restriction_fields.items():
+                value = _single_field(payload, *aliases, default=None)
                 if value is not None:
                     base_mapping[target] = value
             base_request = LiteratureSearchRequest.from_mapping(base_mapping)
@@ -714,6 +749,26 @@ class AgentRequestRouter:
         source_selection = self._select_literature_sources(payload, original, base_request.preferred_languages)
         if isinstance(source_selection, str):
             return self._unsupported_literature_request(original, source_selection)
+        if base_request.restricted_search:
+            registry = self.adapter_factory.registry
+            unable = [
+                source
+                for source in source_selection
+                if not getattr(registry.get(source), "supports_restricted_search", False)
+            ]
+            if unable:
+                able = sorted(
+                    source
+                    for source, adapter_type in registry.items()
+                    if getattr(adapter_type, "supports_restricted_search", False)
+                )
+                return self._unsupported_literature_request(
+                    original,
+                    "A ResourceType/SourceJournals restriction cannot be honoured by "
+                    f"{', '.join(unable)}; restricted search is implemented for "
+                    f"{', '.join(able) or 'no source'} only -- choose that source in "
+                    "PreferredSources or drop the restriction",
+                )
         candidate_budgets = _distribute_cap(max_candidates, source_selection)
         download_budgets = _distribute_cap(effective_downloads, source_selection)
         plans = tuple(

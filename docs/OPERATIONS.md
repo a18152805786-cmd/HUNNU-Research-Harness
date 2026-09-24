@@ -77,6 +77,28 @@ v0.1 的端到端验收（`HarnessV01CNRDSTestPassed=true`）：在用户人工�
 
 `--source` 可选 `sciencedirect`、`springerlink`、`cnki`、`oxfordacademic`；目标用 `--title`、`--doi` 或 `--request-json` 指定。退出码 2 表示需要人（登录、人工下载或人工判断），这时停下交还用户（AGENTS.md 规则 72），不要转去同一机构会话的另一个来源。
 
+**受限检索（只找学术期刊、只找指定刊物、只找指定年份；目前仅 CNKI，规则 39）。** 在请求 JSON 里加可选字段：`ResourceType`（只接受 `JournalArticle`，其他值直接判为无效请求）、`SourceJournals`（最多 8 个刊名，给了刊名即视为 `JournalArticle`）、`YearStart`/`YearEnd`（也可写 `YearFrom`/`YearTo`，两种写法数值不一致则拒绝）。受限请求里的年份对每条结果强制生效，不再只是筛选时扣分：
+
+```powershell
+.venv\Scripts\hunnu-harness.exe acquire --source cnki --request-json restricted.json --json
+```
+
+```json
+{
+  "OriginalResearchRequest": "2019-2026年《示例学刊》《样本评论》中的示例议题研究（写法样本）",
+  "SourceJournals": ["示例学刊", "样本评论"],
+  "YearStart": 2019,
+  "YearEnd": 2026,
+  "KeywordsCN": ["示例议题", "示例概念"],
+  "MaxSearchResults": 20,
+  "MaxResultsPerSource": 20,
+  "MaxDownloads": 0,
+  "MaxDownloadsPerRun": 0
+}
+```
+
+CNKI 的一框式检索一次只检一个字段，所以指定刊名时按「文献来源」逐刊检索（每刊一次，照常经检索限速台账排队），主题词交给筛选打分，不塞进检索式；只给 `ResourceType` 时按「主题」检索。每次检索都带 `crossids=YSTT4HG0`（只检学术期刊），并且只读第一页结果。结果返回前，页面自己的 `briefRequest` 必须写明 CNKI 确实只检了学术期刊、执行的正是这条检索式，每条结果的「数据库」栏也必须是「期刊」；做不到就以 `CNKI_RESTRICTION_UNCONFIRMED` / `CNKI_RESTRICTION_NOT_APPLIED` 结束这一条，不把该页任何结果当作受限结果返回，本次运行也不再发出后续检索。其他刊物、年份范围外的条目会被丢弃并计数。`acquire` 输出里的 `SearchRestrictionOutcome`、run 目录下 `SEARCH_QUERY_LOG.csv` 的 `RestrictionOutcome` 与 `audit\LITERATURE_EVENTS.jsonl` 逐条记录确认依据、保留与丢弃数量和本页覆盖的年份。CNKI 默认按发表时间倒序，第一页够不到的年份会返回 0 条并在备注里说明——这不能当作「该刊没有这类文章」的证据。受限请求不能与 `ExactTitles`、`DOIs`、`Authors` 同用；其他来源遇到受限请求在启动浏览器前就拒绝（`UNSUPPORTED_CAPABILITY`，退出码 1）。
+
 **批量队列（`acquire-batch`，规则 75）。** 多篇论文写进一个队列文件，由一个进程一篇接一篇地跑完，每篇走的都是上面 `acquire` 的同一条路径（限速、写前记账、身份锁、校验、SHA-256、manifest、归档、分类都不变）：
 
 ```powershell

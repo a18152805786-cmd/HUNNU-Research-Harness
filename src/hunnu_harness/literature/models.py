@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -9,6 +10,20 @@ from typing import Any, Mapping
 
 
 UNKNOWN = "unknown"
+
+#: The resource types a restricted search can be confined to.  Only academic
+#: journal articles are implemented; any other value fails closed rather than
+#: silently searching everything.
+SUPPORTED_RESOURCE_TYPES = ("JournalArticle",)
+_RESOURCE_TYPE_ALIASES = {
+    "journalarticle": "JournalArticle",
+    "学术期刊": "JournalArticle",
+}
+#: One planned search per named journal, so the cap matches the planner's
+#: default query budget instead of being truncated by it.
+MAX_SOURCE_JOURNALS = 8
+MAX_SOURCE_JOURNAL_LENGTH = 80
+_SOURCE_JOURNAL_FORBIDDEN = re.compile(r"[\"'\x00-\x1f\x7f]")
 
 
 class RunStatus(str, Enum):
@@ -109,6 +124,76 @@ def _optional_year(value: Any, *, field_name: str) -> int | None:
     return year
 
 
+def _single_year(mapping: Mapping[str, Any], *names: str, field_name: str) -> int | None:
+    """Read a year that may be spelled several ways, refusing a contradiction.
+
+    ``YearFrom``/``YearTo`` are accepted as spellings of ``YearStart``/
+    ``YearEnd``.  When a request carries two spellings with different years
+    there is no safe way to choose one, so it fails instead of guessing.
+    """
+
+    wanted = {_canonical_key(name) for name in names}
+    found: list[tuple[str, int | None]] = [
+        (str(key), _optional_year(value, field_name=field_name))
+        for key, value in mapping.items()
+        if _canonical_key(str(key)) in wanted
+    ]
+    years = {year for _key, year in found if year is not None}
+    if len(years) > 1:
+        spellings = ", ".join(f"{key}={year}" for key, year in found if year is not None)
+        raise ValueError(f"{field_name} is given more than once with different years ({spellings})")
+    return years.pop() if years else None
+
+
+def _resource_type(value: Any) -> str | None:
+    """Canonicalize a requested resource type, failing closed on anything unknown."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() == UNKNOWN:
+        return None
+    canonical = _RESOURCE_TYPE_ALIASES.get(_canonical_key(text) or text)
+    if canonical is None:
+        raise ValueError(
+            f"ResourceType {text!r} is not supported; the supported value is "
+            "JournalArticle (学术期刊)"
+        )
+    return canonical
+
+
+def _journal_names(value: Any) -> tuple[str, ...]:
+    """Split named journals without cutting an English title at its comma."""
+
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        parts: list[Any] = re.split(r"[\n;；，、]+", value)
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        raise ValueError("SourceJournals must be a list of journal names")
+    return tuple(str(part) for part in parts if str(part).strip())
+
+
+def _clean_journal_name(value: str) -> str:
+    name = re.sub(r"\s+", " ", str(value)).strip()
+    if name.startswith("《") and name.endswith("》"):
+        name = name[1:-1].strip()
+    if not name:
+        raise ValueError("SourceJournals entries cannot be empty")
+    if len(name) > MAX_SOURCE_JOURNAL_LENGTH:
+        raise ValueError(
+            f"SourceJournals entry {name[:20]!r}... is longer than {MAX_SOURCE_JOURNAL_LENGTH} characters"
+        )
+    if _SOURCE_JOURNAL_FORBIDDEN.search(name):
+        raise ValueError(
+            f"SourceJournals entry {name!r} contains a quote or control character, "
+            "which cannot be searched as one source name"
+        )
+    return name
+
+
 @dataclass(frozen=True)
 class LiteratureSearchRequest:
     original_research_request: str
@@ -130,6 +215,12 @@ class LiteratureSearchRequest:
     max_downloads_per_run: int = 5
     require_full_text: bool = False
     ai_assisted_screening: bool = False
+    # A restricted search: "academic journal articles only, from these named
+    # journals".  Both are optional; either one makes the request restricted,
+    # and a restricted request also enforces YearStart/YearEnd on every result
+    # instead of only weighing them in screening.
+    resource_type: str | None = None
+    source_journals: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.original_research_request.strip():
@@ -138,6 +229,35 @@ class LiteratureSearchRequest:
             raise ValueError("YearStart cannot be later than YearEnd")
         if self.max_downloads > self.max_downloads_per_run:
             object.__setattr__(self, "max_downloads", self.max_downloads_per_run)
+        journals: list[str] = []
+        seen: set[str] = set()
+        for raw in self.source_journals:
+            name = _clean_journal_name(raw)
+            key = unicodedata.normalize("NFKC", name).casefold()
+            if key not in seen:
+                seen.add(key)
+                journals.append(name)
+        if len(journals) > MAX_SOURCE_JOURNALS:
+            raise ValueError(f"SourceJournals names at most {MAX_SOURCE_JOURNALS} journals")
+        object.__setattr__(self, "source_journals", tuple(journals))
+        resource_type = _resource_type(self.resource_type)
+        if journals and resource_type is None:
+            # Named journals are journals: the restriction is to their articles.
+            resource_type = SUPPORTED_RESOURCE_TYPES[0]
+        object.__setattr__(self, "resource_type", resource_type)
+        if self.restricted_search and (self.exact_titles or self.dois or self.authors):
+            raise ValueError(
+                "ResourceType/SourceJournals restrict a topic or journal search; an exact-title, "
+                "DOI, or author lookup already names its target and cannot be restricted this way "
+                "(ExactTitles may also come from quoted text in the request -- pass ExactTitles: [] "
+                "to clear them)"
+            )
+
+    @property
+    def restricted_search(self) -> bool:
+        """Whether a source must honour ResourceType/SourceJournals or refuse."""
+
+        return bool(self.resource_type or self.source_journals)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "LiteratureSearchRequest":
@@ -164,8 +284,8 @@ class LiteratureSearchRequest:
             exact_titles=_tuple_of_strings(_value(mapping, "ExactTitles", "exact_titles")),
             authors=_tuple_of_strings(_value(mapping, "Authors", "authors")),
             dois=_tuple_of_strings(_value(mapping, "DOIs", "dois")),
-            year_start=_optional_year(_value(mapping, "YearStart", "year_start"), field_name="YearStart"),
-            year_end=_optional_year(_value(mapping, "YearEnd", "year_end"), field_name="YearEnd"),
+            year_start=_single_year(mapping, "YearStart", "year_start", "YearFrom", "year_from", field_name="YearStart"),
+            year_end=_single_year(mapping, "YearEnd", "year_end", "YearTo", "year_to", field_name="YearEnd"),
             preferred_languages=_tuple_of_strings(
                 _value(mapping, "PreferredLanguages", "preferred_languages", default=("zh", "en"))
             ),
@@ -207,6 +327,8 @@ class LiteratureSearchRequest:
             ai_assisted_screening=bool(
                 _value(mapping, "AI_ASSISTED", "ai_assisted_screening", default=False)
             ),
+            resource_type=_value(mapping, "ResourceType", "resource_type"),
+            source_journals=_journal_names(_value(mapping, "SourceJournals", "source_journals")),
         )
 
     @classmethod
@@ -323,6 +445,8 @@ class LiteratureSearchRequest:
             "MaxDownloadsPerRun": self.max_downloads_per_run,
             "RequireFullText": self.require_full_text,
             "AI_ASSISTED": self.ai_assisted_screening,
+            "ResourceType": self.resource_type or UNKNOWN,
+            "SourceJournals": list(self.source_journals),
         }
 
 

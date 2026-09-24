@@ -13,6 +13,16 @@ class PlannedQuery:
     rationale: str
 
 
+def source_journal_query(journal: str) -> str:
+    """The planned query for one named journal (a 文献来源 search).
+
+    Only a source that declares ``supports_restricted_search`` ever receives
+    one: the workflow refuses a restricted request everywhere else.
+    """
+
+    return f'source:"{journal}"'
+
+
 class LiteratureSearchPlanner:
     """Create a small, deterministic query set with an explicit hard cap."""
 
@@ -29,7 +39,24 @@ class LiteratureSearchPlanner:
             "PreferredPublicationTypes": list(request.preferred_publication_types),
             "MaxResultsPerSource": request.max_results_per_source,
         }
+        if request.restricted_search:
+            filters["ResourceType"] = request.resource_type
+            filters["SourceJournals"] = list(request.source_journals)
         candidates: list[PlannedQuery] = []
+
+        if request.source_journals:
+            # A one-box search searches one field.  Named journals are searched
+            # by source, one query each; topic terms cannot be joined to that
+            # query, so they are left to screening instead of being dropped
+            # into the source search where they would match nothing.
+            return [
+                PlannedQuery(
+                    source_journal_query(journal),
+                    filters,
+                    "Named journal searched by source (文献来源); topic terms are screened, not searched",
+                )
+                for journal in request.source_journals[: self.max_queries]
+            ]
 
         for doi in request.dois:
             normalized = normalize_doi(doi)

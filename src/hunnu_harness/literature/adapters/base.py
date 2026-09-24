@@ -28,6 +28,10 @@ from ..models import AccessDecision, LiteratureRecord, LiteratureSearchRequest, 
 
 class LiteratureSourceError(RuntimeError):
     status = RunStatus.SOURCE_UNAVAILABLE
+    # When true the workflow sends no further search in this run: the next
+    # query would meet the same condition, and a search that cannot succeed
+    # still spends the session's goodwill (AGENTS.md Rule 74).
+    halts_remaining_searches = False
 
 
 class HumanActionReason(str, Enum):
@@ -113,6 +117,10 @@ class LiteratureSourceAdapter(ABC):
     supports_authorized_download: bool = True
     supports_unattended_download: bool = False
     supports_preflight: bool = False
+    # Whether the source can confine a search to ResourceType/SourceJournals
+    # and confirm on the page that it did.  A restricted request is refused,
+    # before any search, by every source that leaves this False.
+    supports_restricted_search: bool = False
 
     # The write-ahead fetch budget (literature/fetch_ledger.py).  ``None``
     # means the real ledger in the Output Root's audit directory -- there is
@@ -156,6 +164,14 @@ class LiteratureSourceAdapter(ABC):
     @abstractmethod
     async def open_result(self, record: LiteratureRecord) -> None:
         raise NotImplementedError
+
+    def search_restriction_report(self, query: str) -> dict[str, Any] | None:
+        """What a restricted search for *query* confirmed and discarded.
+
+        ``None`` for a source without restricted search, or before one ran.
+        """
+
+        return None
 
     async def current_target_matches(self, record: LiteratureRecord) -> bool:
         """Is the browser already on *record*'s locked target page?

@@ -49,6 +49,7 @@ def build_capabilities() -> dict[str, Any]:
                 "supports_authorized_download": bool(adapter.supports_authorized_download),
                 "supports_unattended_download": bool(adapter.supports_unattended_download),
                 "supports_preflight": bool(adapter.supports_preflight),
+                "supports_restricted_search": bool(adapter.supports_restricted_search),
             }
         )
     return {
@@ -62,6 +63,12 @@ def build_capabilities() -> dict[str, Any]:
         "ConcurrentAcquisition": (
             "refused: one process at a time holds the Research Chrome lock "
             "(Output Root/audit/research_chrome.lock)"
+        ),
+        "RestrictedSearch": (
+            "optional request fields ResourceType (JournalArticle), SourceJournals and "
+            "YearStart/YearEnd confine a search to academic journal articles, from the named "
+            "journals, in those years; a source without supports_restricted_search refuses "
+            "such a request before any search, and an unconfirmed restriction returns nothing"
         ),
         "NavigatorCommands": sorted(NAVIGATOR_COMMANDS),
         "ExitCodeLadder": {

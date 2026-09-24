@@ -292,13 +292,29 @@ class LiteratureAcquisitionWorkflow:
             request=request.as_dict(),
             manual_authentication=True,
         )
-        plans = self.planner.plan(request)
         records: list[LiteratureRecord] = []
         downloads: list[DownloadManifestEntry] = []
         errors: list[str] = []
         action_required_reason = UNKNOWN
         status = RunStatus.SUCCESS
 
+        if request.restricted_search and not getattr(self.adapter, "supports_restricted_search", False):
+            # Searching anyway would return unrestricted results under a
+            # restricted request -- the failure this refusal exists to prevent.
+            errors.append(
+                f"RESTRICTED_SEARCH_UNSUPPORTED: {self.adapter.name} cannot confine a search to "
+                "ResourceType/SourceJournals; no search was sent"
+            )
+            return self._finalize(
+                request=request,
+                status=RunStatus.SOURCE_UNAVAILABLE,
+                records=records,
+                downloads=downloads,
+                errors=errors,
+                query_count=0,
+            )
+
+        plans = self.planner.plan(request)
         if not plans:
             errors.append("No bounded query could be generated from the request")
             return self._finalize(
@@ -311,8 +327,9 @@ class LiteratureAcquisitionWorkflow:
             )
 
         stop_for_auth = False
+        stop_searching = False
         for plan in plans:
-            if len(records) >= request.max_search_results or stop_for_auth:
+            if len(records) >= request.max_search_results or stop_for_auth or stop_searching:
                 break
             query_results: list[LiteratureRecord] = []
             inspected = 0
@@ -401,18 +418,37 @@ class LiteratureAcquisitionWorkflow:
                 query_error = str(exc)
                 errors.append(str(exc))
                 status = exc.status
+                stop_searching = exc.halts_remaining_searches
             except Exception as exc:
                 query_error = f"Search failed: {type(exc).__name__}"
                 errors.append(query_error)
                 status = RunStatus.PARTIAL_SUCCESS if records else RunStatus.SOURCE_UNAVAILABLE
             finally:
+                filters = dict(plan.filters)
+                if request.restricted_search:
+                    # What the source confirmed and discarded for this query,
+                    # beside what was asked of it, whichever way it ended.
+                    report_for = getattr(self.adapter, "search_restriction_report", None)
+                    restriction = report_for(plan.query) if callable(report_for) else None
+                    if restriction is not None:
+                        filters["RestrictionOutcome"] = restriction
+                        self.logger.log(
+                            "literature_search_restriction_checked",
+                            status=(
+                                RunStatus.SUCCESS.value
+                                if restriction.get("ScopeConfirmed")
+                                else RunStatus.SOURCE_LAYOUT_CHANGED.value
+                            ),
+                            source=self.adapter.name,
+                            **restriction,
+                        )
                 self.writer.append_query_log(
                     QueryLogEntry(
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         source=self.adapter.name,
                         original_research_request=request.original_research_request,
                         generated_query=plan.query,
-                        filters=json.dumps(plan.filters, ensure_ascii=False, sort_keys=True),
+                        filters=json.dumps(filters, ensure_ascii=False, sort_keys=True),
                         results_returned=len(query_results),
                         results_inspected=inspected,
                         errors=query_error,
