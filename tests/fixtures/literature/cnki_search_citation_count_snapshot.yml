@@ -1,0 +1,26 @@
+### Page
+- Page URL: https://kns.cnki.net/kns8s/defaultresult/index?korder=SU&kw=示例关键词
+- Page Title: 检索-中国知网
+### Snapshot
+- generic [active] [ref=e1]:
+  - generic [ref=e2]: 共找到 1 条结果
+  - table [ref=e3]:
+    - rowgroup [ref=e4]:
+      - row "题名 作者 来源 发表时间 数据库 被引 下载 操作" [ref=e5]:
+        - columnheader [ref=e6]
+        - columnheader "题名" [ref=e7]
+        - columnheader "作者" [ref=e8]
+        - columnheader "被引" [ref=e9]
+    - rowgroup [ref=e10]:
+      - row [ref=e11]:
+        - cell "1" [ref=e12]
+        - cell [ref=e13]:
+          - link "企业数字化转型与资本市场表现——来自股票流动性的经验证据" [ref=e14]:
+            - /url: https://kns.cnki.net/kcms2/article/abstract?v=fixture-row-1&uniplatform=NZKPT&language=CHS
+        - cell [ref=e15]:
+          - link "作者甲" [ref=e16]:
+            - /url: https://kns.cnki.net/kcms2/author/detail?v=fixture-author-1
+        - cell "1572" [ref=e17]:
+          - link "1572" [ref=e18]:
+            - /url: https://kns.cnki.net/kcms2/article/abstract?v=fixture-row-1&uniplatform=NZKPT&language=CHS&anchor=citnet
+  - contentinfo [ref=e19]

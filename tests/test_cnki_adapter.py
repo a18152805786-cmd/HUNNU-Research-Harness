@@ -1408,6 +1408,213 @@ class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(downloads[0].suggested_filename, f"{record.paper_id}.pdf")
 
 
+class CNKICitationCountLinkTests(unittest.IsolatedAsyncioTestCase):
+    """A result row's citation count links to its article; it is not a result.
+
+    kns8s prints each row's citation count in ``td.quote`` as
+    ``<a class="quoteCnt" href="/kcms2/article/abstract?v=...&anchor=citnet">7</a>``.
+    That is a kcms2 detail URL, so it passes the result-link filter, and a 2026
+    ``v=`` URL carries no dbcode/filename to de-duplicate it against the row's
+    title.  The rows are synthetic; they mirror the cells of saved kns8s result
+    pages, as cnki_search_citation_count_snapshot.yml mirrors a saved
+    accessibility snapshot.
+    """
+
+    ARTICLE_TITLE = "企业数字化转型与资本市场表现——来自股票流动性的经验证据"
+    OTHER_TITLE = "城市轨道交通网络韧性评价"
+
+    class _ResultsThenArticleBrowser:
+        """Serve the result page to every search and the article page to a detail URL."""
+
+        navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+        def __init__(self, results_html: str, article_html: str) -> None:
+            self.results_html = results_html
+            self.article_html = article_html
+            self.commands: list[object] = []
+            self.current_url = "about:blank"
+            self.session = SessionHandle("cnki-citation-count-test")
+            self.page_handle = PageHandle("main", session=self.session)
+
+        async def execute(self, command):
+            self.commands.append(command)
+            if isinstance(command, NavigateCommand):
+                self.current_url = command.url
+            elif not isinstance(command, (ObserveCommand, ClickCommand)):
+                raise AssertionError(type(command).__name__)
+            on_article = "/kcms2/article/abstract" in self.current_url
+            return BrowserObservation(
+                session=self.session,
+                page=self.page_handle,
+                generation=len(self.commands),
+                url=self.current_url,
+                title="中国知网" if on_article else "检索-中国知网",
+                html=self.article_html if on_article else self.results_html,
+            )
+
+    @staticmethod
+    def _detail_url(token: str, *, anchor: str = "") -> str:
+        url = f"https://kns.cnki.net/kcms2/article/abstract?v={token}&amp;uniplatform=NZKPT&amp;language=CHS"
+        return f"{url}&amp;anchor={anchor}" if anchor else url
+
+    @classmethod
+    def _citation_link(cls, token: str, count: str, *, anchor: str = "citnet") -> str:
+        return (
+            f'<span><a class="quoteCnt" target="_blank" '
+            f'href="{cls._detail_url(token, anchor=anchor)}">{count}</a></span>'
+        )
+
+    @classmethod
+    def _results_page(cls, *rows: tuple[str, str, str], plain_title_rows: tuple[str, ...] = ()) -> str:
+        """One kns8s result table; each row is ``(title, v token, td.quote content)``.
+
+        CNKI prints a title with subscripts as a plain ``a.fz14`` without
+        ``inline``; the rows whose tokens are in ``plain_title_rows`` get one.
+        """
+
+        body = "".join(
+            f"""
+              <tr>
+                <td class="seq">{number}</td>
+                <td class="name"><a class="{'fz14' if token in plain_title_rows else 'fz14 inline'}" target="_blank" href="{cls._detail_url(token)}">{title}</a></td>
+                <td class="author"><a class="KnowledgeNetLink" target="knet" href="https://kns.cnki.net/kcms2/author/detail?v=fixture-author">作者甲</a></td>
+                <td class="source"><p><a target="_blank" href="https://navi.cnki.net/knavi/detail?p=fixture-journal">示例期刊</a></p></td>
+                <td class="date">2026-07-30 13:08</td>
+                <td class="data"><span>期刊</span></td>
+                <td class="quote">{quote}</td>
+                <td class="download"><div><a class="downloadCnt" href="javascript:void(0);">77</a></div></td>
+              </tr>"""
+            for number, (title, token, quote) in enumerate(rows, start=1)
+        )
+        return f"""<!doctype html>
+        <html lang="zh-CN"><head><meta charset="utf-8"><title>检索-中国知网</title></head>
+        <body><main>
+          <div class="pagerTitleCell">共找到 {len(rows)} 条结果</div>
+          <table class="result-table-list">
+            <thead><tr><th></th><th>题名</th><th>作者</th><th>来源</th><th>发表时间</th><th>数据库</th><th>被引</th><th>下载</th></tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+        </main></body></html>
+        """
+
+    @staticmethod
+    def _titles(html: str) -> list[str]:
+        records = CNKIAdapter.parse_search_results_html(html, query='author:"作者甲"', max_results=30)
+        return [record.title for record in records]
+
+    def test_a_citation_count_in_a_result_row_is_not_a_result_of_its_own(self) -> None:
+        # If this fails, every CNKI result row with a citation count adds a record titled
+        # with that count ("1", "7", "77"), and a run then spends one CNKI exact-title
+        # search on each number -- the saved 2026-08-20 runs searched kw=1, kw=14, kw=77.
+        html = self._results_page(
+            (self.ARTICLE_TITLE, "row-a", self._citation_link("row-a", "7")),
+            (self.OTHER_TITLE, "row-b", self._citation_link("row-b", "77")),
+            ("高速铁路站点布局研究", "row-c", ""),
+        )
+        records = CNKIAdapter.parse_search_results_html(html, query='author:"作者甲"', max_results=30)
+        self.assertEqual(
+            [record.title for record in records],
+            [self.ARTICLE_TITLE, self.OTHER_TITLE, "高速铁路站点布局研究"],
+        )
+        self.assertFalse([record for record in records if "anchor=citnet" in record.navigation_url])
+
+    def test_a_title_that_begins_with_digits_is_still_a_result(self) -> None:
+        # If this fails, the citation-count filter drops real results whose titles merely
+        # begin with a number -- a count of samples, a year range, a chemical locant.
+        titles = [
+            "26份谷子种质资源的农艺性状与遗传多样性分析",
+            "2015—2025年城市轨道交通客流特征分析",
+            "1 , 4 -丁二醇的合成研究",
+            "12 个高速铁路项目集中开工",
+            "5G与高速铁路通信研究",
+        ]
+        html = self._results_page(*((title, f"row-{index}", "") for index, title in enumerate(titles)))
+        self.assertEqual(self._titles(html), titles)
+
+    def test_a_citnet_link_is_rejected_even_when_its_text_is_not_a_bare_number(self) -> None:
+        # If this fails, a citation link is recognised only by its text being a number, so
+        # a count CNKI prints any other way ("1,234", "被引 12") becomes a result again.
+        for count in ("1,234", "被引 12"):
+            with self.subTest(count=count):
+                html = self._results_page((self.OTHER_TITLE, "row-a", self._citation_link("row-a", count)))
+                self.assertEqual(self._titles(html), [self.OTHER_TITLE])
+
+    def test_a_bare_number_link_is_rejected_even_without_the_citnet_anchor(self) -> None:
+        # If this fails, a citation link is recognised only by its ``anchor=citnet``
+        # parameter, so one whose URL loses that parameter becomes a result titled "12".
+        html = self._results_page(
+            (self.OTHER_TITLE, "row-a", self._citation_link("row-a", "12", anchor="")),
+        )
+        self.assertEqual(self._titles(html), [self.OTHER_TITLE])
+
+    def test_citation_counts_do_not_crowd_a_real_title_out_of_the_result_window(self) -> None:
+        # If this fails, row 1's citation count again takes a result slot ahead of row 2's
+        # title and a real hit falls outside max_results: CNKI prints a title with
+        # subscripts as a plain ``a.fz14``, which ranks with the count links, not before them.
+        from urllib.parse import parse_qs, urlsplit
+
+        html = self._results_page(
+            (self.ARTICLE_TITLE, "row-a", self._citation_link("row-a", "1572")),
+            ("Fe<sub>3</sub>O<sub>4</sub>纳米颗粒的制备与表征", "row-b", self._citation_link("row-b", "8")),
+            plain_title_rows=("row-b",),
+        )
+        records = CNKIAdapter.parse_search_results_html(html, query='author:"作者甲"', max_results=2)
+        self.assertEqual(
+            [parse_qs(urlsplit(record.navigation_url).query)["v"][0] for record in records],
+            ["row-a", "row-b"],
+        )
+        self.assertFalse([record for record in records if record.title.isdigit()])
+
+    def test_the_snapshot_parser_leaves_the_same_citation_count_link_out(self) -> None:
+        # If this fails, the accessibility-snapshot fallback -- what a CNKI run parses when
+        # the HTML observation is unavailable -- turns a row's citation count back into a
+        # result.  cnki_search_snapshot.yml cannot show it: its count link carries
+        # dbcode/filename, so de-duplication drops the count even without the filter.
+        records = CNKIAdapter.parse_search_results_snapshot(
+            fixture("cnki_search_citation_count_snapshot.yml"),
+            query="示例关键词",
+            max_results=30,
+        )
+        self.assertEqual([record.title for record in records], [self.ARTICLE_TITLE])
+
+    async def test_an_author_search_sends_no_exact_title_search_for_a_citation_count(self) -> None:
+        # If this fails, an author or keyword search again treats a citation count as a paper:
+        # an exact-title search for "7", a click on whatever reads "7", and a visit to the
+        # row's citation page -- all before the identity lock throws the record out.
+        from urllib.parse import parse_qs, urlsplit
+
+        browser = self._ResultsThenArticleBrowser(
+            self._results_page((self.ARTICLE_TITLE, "row-a", self._citation_link("row-a", "7"))),
+            fixture("cnki_abstract_2026.html"),
+        )
+        request = LiteratureSearchRequest(
+            original_research_request="CNKI author search over a row with a citation count",
+            authors=("作者甲",),
+            max_search_results=5,
+            max_results_per_source=5,
+            max_downloads=0,
+            max_downloads_per_run=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = await LiteratureAcquisitionWorkflow(
+                CNKIAdapter(browser),
+                run_root=Path(directory) / "run",
+                human_like_delay_seconds=0,
+                allow_outside_project_for_tests=True,
+            ).run(request)
+
+        navigations = [command.url for command in browser.commands if isinstance(command, NavigateCommand)]
+        exact_title_terms = [
+            parse_qs(urlsplit(url).query)["kw"][0]
+            for url in navigations
+            if parse_qs(urlsplit(url).query).get("korder") == ["TI"]
+        ]
+        self.assertEqual(exact_title_terms, [self.ARTICLE_TITLE])
+        self.assertFalse([url for url in navigations if "anchor=citnet" in url])
+        self.assertEqual([record.title for record in result.records], [self.ARTICLE_TITLE])
+        self.assertEqual(result.errors, [])
+
+
 class CNKIDownloadAndManifestTests(unittest.TestCase):
     def _manager(self, root: Path) -> LiteratureDownloadManager:
         return LiteratureDownloadManager(

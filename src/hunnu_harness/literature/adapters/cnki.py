@@ -1309,7 +1309,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
             ranked_anchors.append((layout_priority, index, anchor, absolute))
         for _layout_priority, _index, anchor, absolute in sorted(ranked_anchors):
             title = _normalize_cnki_observed_title_spacing(anchor.text)
-            if not title or any(label in title for label in _REJECT_DOWNLOAD_LABELS):
+            # A row's citation count (td.quote) links to the same detail page
+            # with ``anchor=citnet``.  Its 2026 ``v=`` URL has no stable
+            # identifier, so title de-duplication cannot catch it either;
+            # reject it as the snapshot parser does.
+            if (
+                not title
+                or title.isdigit()
+                or any(label in title for label in _REJECT_DOWNLOAD_LABELS)
+                or "anchor=citnet" in urlsplit(absolute).query.casefold()
+            ):
                 continue
             stable_identifier = _stable_identifier(absolute)
             identity = stable_identifier if stable_identifier != UNKNOWN else normalize_title(title)
