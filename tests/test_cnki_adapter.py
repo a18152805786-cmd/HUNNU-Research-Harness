@@ -1416,7 +1416,8 @@ class CNKICitationCountLinkTests(unittest.IsolatedAsyncioTestCase):
     That is a kcms2 detail URL, so it passes the result-link filter, and a 2026
     ``v=`` URL carries no dbcode/filename to de-duplicate it against the row's
     title.  The rows are synthetic; they mirror the cells of saved kns8s result
-    pages.
+    pages, as cnki_search_citation_count_snapshot.yml mirrors a saved
+    accessibility snapshot.
     """
 
     ARTICLE_TITLE = "企业数字化转型与资本市场表现——来自股票流动性的经验证据"
@@ -1464,14 +1465,18 @@ class CNKICitationCountLinkTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @classmethod
-    def _results_page(cls, *rows: tuple[str, str, str]) -> str:
-        """One kns8s result table; each row is ``(title, v token, td.quote content)``."""
+    def _results_page(cls, *rows: tuple[str, str, str], plain_title_rows: tuple[str, ...] = ()) -> str:
+        """One kns8s result table; each row is ``(title, v token, td.quote content)``.
+
+        CNKI prints a title with subscripts as a plain ``a.fz14`` without
+        ``inline``; the rows whose tokens are in ``plain_title_rows`` get one.
+        """
 
         body = "".join(
             f"""
               <tr>
                 <td class="seq">{number}</td>
-                <td class="name"><a class="fz14 inline" target="_blank" href="{cls._detail_url(token)}">{title}</a></td>
+                <td class="name"><a class="{'fz14' if token in plain_title_rows else 'fz14 inline'}" target="_blank" href="{cls._detail_url(token)}">{title}</a></td>
                 <td class="author"><a class="KnowledgeNetLink" target="knet" href="https://kns.cnki.net/kcms2/author/detail?v=fixture-author">作者甲</a></td>
                 <td class="source"><p><a target="_blank" href="https://navi.cnki.net/knavi/detail?p=fixture-journal">示例期刊</a></p></td>
                 <td class="date">2026-07-30 13:08</td>
@@ -1541,6 +1546,36 @@ class CNKICitationCountLinkTests(unittest.IsolatedAsyncioTestCase):
             (self.OTHER_TITLE, "row-a", self._citation_link("row-a", "12", anchor="")),
         )
         self.assertEqual(self._titles(html), [self.OTHER_TITLE])
+
+    def test_citation_counts_do_not_crowd_a_real_title_out_of_the_result_window(self) -> None:
+        # If this fails, row 1's citation count again takes a result slot ahead of row 2's
+        # title and a real hit falls outside max_results: CNKI prints a title with
+        # subscripts as a plain ``a.fz14``, which ranks with the count links, not before them.
+        from urllib.parse import parse_qs, urlsplit
+
+        html = self._results_page(
+            (self.ARTICLE_TITLE, "row-a", self._citation_link("row-a", "1572")),
+            ("Fe<sub>3</sub>O<sub>4</sub>纳米颗粒的制备与表征", "row-b", self._citation_link("row-b", "8")),
+            plain_title_rows=("row-b",),
+        )
+        records = CNKIAdapter.parse_search_results_html(html, query='author:"作者甲"', max_results=2)
+        self.assertEqual(
+            [parse_qs(urlsplit(record.navigation_url).query)["v"][0] for record in records],
+            ["row-a", "row-b"],
+        )
+        self.assertFalse([record for record in records if record.title.isdigit()])
+
+    def test_the_snapshot_parser_leaves_the_same_citation_count_link_out(self) -> None:
+        # If this fails, the accessibility-snapshot fallback -- what a CNKI run parses when
+        # the HTML observation is unavailable -- turns a row's citation count back into a
+        # result.  cnki_search_snapshot.yml cannot show it: its count link carries
+        # dbcode/filename, so de-duplication drops the count even without the filter.
+        records = CNKIAdapter.parse_search_results_snapshot(
+            fixture("cnki_search_citation_count_snapshot.yml"),
+            query="示例关键词",
+            max_results=30,
+        )
+        self.assertEqual([record.title for record in records], [self.ARTICLE_TITLE])
 
     async def test_an_author_search_sends_no_exact_title_search_for_a_citation_count(self) -> None:
         # If this fails, an author or keyword search again treats a citation count as a paper:
