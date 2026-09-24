@@ -46,7 +46,7 @@ from hunnu_harness.literature.models import (
     UNKNOWN,
 )
 from hunnu_harness.literature.normalization import normalize_title, sha256_file
-from hunnu_harness.literature.workflow import finalize_captured_cnki_acceptance
+from hunnu_harness.literature.workflow import LiteratureAcquisitionWorkflow, finalize_captured_cnki_acceptance
 
 from literature_test_support import isolated_fetch_ledger, write_minimal_pdf
 
@@ -552,6 +552,296 @@ class CNKIParserTests(unittest.TestCase):
                 "投贷联动、媒体监督与科技企业AI漂洗",
                 "《财经科学》2026年第2期\n投贷联动、媒体监督与科技企业 AI 漂洗\n李媛媛 崔梦萦",
             )
+        )
+
+
+ONLINE_FIRST_TITLE = "城市轨道交通网络规划的示例研究"
+NEWSPAPER_TITLE = "示例城市推进社区体育设施建设"
+
+
+class CNKIOnlineFirstAndNewspaperPageTests(unittest.IsolatedAsyncioTestCase):
+    """Online-first (CAPJ) and newspaper (CCND) pages carry no issue citation.
+
+    Their source is the first link in ``.top-tip`` and their date sits under a
+    label of its own (网络首发时间 / 报纸日期).  On the saved 2026-08 CNKI pages,
+    every online-first and newspaper page paired by title with its own result
+    row agreed with that row's 来源 and 发表时间.
+    """
+
+    DETAIL_URL = "https://kns.cnki.net/kcms2/article/abstract?v=fixture&uniplatform=NZKPT&language=CHS"
+    NAME_LINK = (
+        '<a target="_blank" href="https://navi.cnki.net/knavi/detail?p=fixture-journal&amp;uniplatform=NZKPT">'
+        "示例管理评论 . </a>"
+    )
+    FIRST_PUBLISHED = "<span>（录用定稿）网络首发时间：2026-04-11 15:03:27</span>"
+
+    @classmethod
+    def parse(cls, html: str) -> LiteratureRecord:
+        return CNKIAdapter.parse_article_html(html, source_url=cls.DETAIL_URL)
+
+    @staticmethod
+    def result_page(title: str, *, source: str, date: str, database: str) -> str:
+        """One kns8s result row laid out as on the saved 2026 result pages."""
+
+        return f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 1 条结果</div>
+            <table class="result-table-list"><tbody><tr>
+              <td class="name"><a class="fz14 inline" target="_blank"
+                href="/kcms2/article/abstract?v=fixture&amp;uniplatform=NZKPT&amp;language=CHS">{title}</a></td>
+              <td class="source"><p><a target="_blank" href="https://navi.cnki.net/knavi/detail?p=fixture">{source}</a></p></td>
+              <td class="date">{date}</td>
+              <td class="data"><span>{database}</span></td>
+            </tr></tbody></table>
+          </main>
+        </body></html>
+        """
+
+    def test_online_first_page_reads_journal_from_its_top_tip_link_and_year_from_its_first_published_time(self) -> None:
+        # If this fails, online-first pages lose journal and year again: .top-tip
+        # holds only "刊名 . " there, and the date is in .head-time.
+        for stage in ("录用定稿", "排版定稿"):
+            with self.subTest(stage=stage):
+                record = self.parse(fixture("cnki_article_online_first_2026.html").replace("录用定稿", stage))
+                self.assertEqual(record.title, ONLINE_FIRST_TITLE)
+                self.assertEqual(record.journal, "示例管理评论")
+                self.assertEqual(record.year, "2026")
+                self.assertEqual(record.issue, UNKNOWN)
+                self.assertEqual(record.pages_or_article_number, UNKNOWN)
+                self.assertEqual(record.stable_identifier, "capj:FIXTURE20260409001")
+
+    def test_an_online_first_article_stays_a_journal_article_whatever_the_navigation_menu_names(self) -> None:
+        # If this fails, the body-text guess decides again: the menu on these
+        # pages names 学位论文 and 报纸, and online-first articles were filed as
+        # Dissertation.
+        html = fixture("cnki_article_online_first_2026.html")
+        self.assertIn("<li>学位论文</li>", html)
+        record = self.parse(html)
+        self.assertEqual(record.publication_type, "JournalArticle")
+        self.assertEqual(record.publication_status, PublicationStatus.ONLINE_FIRST.value)
+
+    def test_newspaper_page_reads_the_newspaper_and_the_year_of_its_newspaper_date(self) -> None:
+        # If this fails, newspaper pages lose their source and date again, or the
+        # level beside the name (地方级) leaks into it.
+        record = self.parse(fixture("cnki_article_newspaper_2026.html"))
+        self.assertEqual(record.title, NEWSPAPER_TITLE)
+        self.assertEqual(record.journal, "示例日报")
+        self.assertEqual(record.year, "2025")
+        self.assertEqual(record.publication_type, "Newspaper")
+        self.assertEqual(record.publication_status, PublicationStatus.OTHER.value)
+
+    def test_the_platform_online_time_is_never_read_as_a_publication_year(self) -> None:
+        # If this fails, 在线公开时间 -- which the page itself says "不代表文献的发表时间"
+        # -- became a year: it dated the newspaper's 2025-12-31 issue by its
+        # 2026-01-02 upload, or gave an undated page a date it never stated.
+        self.assertEqual(self.parse(fixture("cnki_article_newspaper_2026.html")).year, "2025")
+        undated = fixture("cnki_article_online_first_2026.html").replace(self.FIRST_PUBLISHED, "")
+        self.assertIn("在线公开时间", undated)
+        record = self.parse(undated)
+        self.assertEqual(record.year, UNKNOWN)
+
+    def test_the_top_tip_link_is_read_as_a_source_only_on_a_page_that_says_what_it_is(self) -> None:
+        # If this fails, any page without an issue citation has its first .top-tip
+        # link taken for a journal -- a dissertation's university or a
+        # conference would then be filed as a JournalArticle's journal.
+        undated = fixture("cnki_article_online_first_2026.html").replace(self.FIRST_PUBLISHED, "")
+        self.assertIn(self.NAME_LINK, undated)
+        self.assertEqual(self.parse(undated).journal, UNKNOWN)
+
+    def test_the_source_is_the_first_top_tip_link_to_cnki_navigation_or_nothing(self) -> None:
+        # If this fails, some other .top-tip link was read as the journal: with the
+        # name link gone, the next one reads 查看该刊数据库收录来源.
+        html = fixture("cnki_article_online_first_2026.html")
+        without_name = html.replace(self.NAME_LINK, "")
+        record = self.parse(without_name)
+        self.assertEqual(record.journal, UNKNOWN)
+        self.assertEqual(record.year, "2026")
+        self.assertEqual(record.publication_status, PublicationStatus.ONLINE_FIRST.value)
+        off_site = html.replace(
+            "https://navi.cnki.net/knavi/detail?p=fixture-journal&amp;uniplatform=NZKPT\">示例管理评论",
+            "https://example.org/journal\">示例管理评论",
+        )
+        self.assertEqual(self.parse(off_site).journal, UNKNOWN)
+        preceded = html.replace(self.NAME_LINK, '<a href="https://example.org/notice">通知</a>' + self.NAME_LINK)
+        self.assertEqual(self.parse(preceded).journal, UNKNOWN)
+
+    def test_a_page_stating_both_an_online_first_time_and_a_newspaper_date_is_left_unknown(self) -> None:
+        # If this fails, a page contradicting itself was resolved by a guess.
+        html = fixture("cnki_article_online_first_2026.html").replace(
+            '<div class="operate" id="DownLoadParts">',
+            '<div class="row"><span class="rowtit">报纸日期：</span><p>2026-04-10</p></div>'
+            '<div class="operate" id="DownLoadParts">',
+        )
+        record = self.parse(html)
+        self.assertEqual((record.journal, record.year), (UNKNOWN, UNKNOWN))
+
+    def test_online_first_times_in_two_different_years_leave_the_year_unknown(self) -> None:
+        # If this fails, one of two years the page gives was picked for it.
+        html = fixture("cnki_article_online_first_2026.html").replace(
+            self.FIRST_PUBLISHED,
+            self.FIRST_PUBLISHED + "<span>（排版定稿）网络首发时间：2025-12-30 09:00:00</span>",
+        )
+        record = self.parse(html)
+        self.assertEqual((record.journal, record.year), (UNKNOWN, UNKNOWN))
+
+    def test_a_page_with_an_issue_citation_is_read_exactly_as_before(self) -> None:
+        # If this fails, the new reading reached pages that already worked: an
+        # issue citation still decides journal, year, issue and pages, even beside
+        # an online-first time from another year.
+        url = "https://kns.cnki.net/kcms2/article/abstract?v=redacted"
+        plain = CNKIAdapter.parse_article_html(fixture("cnki_article_live_structure.html"), source_url=url)
+        stated = CNKIAdapter.parse_article_html(
+            fixture("cnki_article_live_structure.html").replace(
+                '<div class="doc-top">',
+                '<div class="head-time"><span>（排版定稿）网络首发时间：2025-12-30 09:00:00</span></div>'
+                '<div class="doc-top">',
+            ),
+            source_url=url,
+        )
+        fields = ("journal", "year", "issue", "pages_or_article_number", "publication_type", "publication_status")
+        self.assertEqual(
+            [getattr(stated, field) for field in fields],
+            [getattr(plain, field) for field in fields],
+        )
+        self.assertEqual((plain.journal, plain.year), ("财经科学", "2026"))
+
+    def test_an_unclosed_top_tip_link_does_not_cost_a_page_its_issue_citation(self) -> None:
+        # If this fails, reading the .top-tip links interferes with reading the
+        # .top-tip itself: markup that leaves the name link open lost the issue
+        # citation of a page that parsed before.
+        html = fixture("cnki_article_live_structure.html")
+        self.assertIn("<a>财经科学 .</a>", html)
+        record = CNKIAdapter.parse_article_html(
+            html.replace("<a>财经科学 .</a>", "<a>财经科学 ."),
+            source_url="https://kns.cnki.net/kcms2/article/abstract?v=redacted",
+        )
+        self.assertEqual((record.journal, record.year, record.issue), ("财经科学", "2026", "02"))
+
+    def test_exact_title_search_records_still_lock_to_online_first_and_newspaper_pages(self) -> None:
+        # If this fails, `acquire` and `acquire-batch` can no longer take an
+        # online-first or newspaper article: their search records carry no
+        # journal or year, so the lock still settles on the title.
+        cases = (
+            (ONLINE_FIRST_TITLE, "cnki_article_online_first_2026.html", "示例管理评论", "2026-04-11 15:03", "期刊"),
+            (NEWSPAPER_TITLE, "cnki_article_newspaper_2026.html", "示例日报", "2025-12-31", "报纸"),
+        )
+        for title, article, source, date, database in cases:
+            with self.subTest(title=title):
+                search = CNKIAdapter.parse_search_results_html(
+                    self.result_page(title, source=source, date=date, database=database),
+                    query=title,
+                )[0]
+                self.assertTrue(CNKIAdapter.identity_matches(search, self.parse(fixture(article)))[0])
+
+    def test_a_result_row_carrying_its_source_and_date_locks_to_its_own_page(self) -> None:
+        # If this fails, the journal or year now read from the page disagrees with
+        # CNKI's own result row for the same article; on every saved online-first
+        # and newspaper pair the two agreed.
+        cases = (
+            ("cnki_article_online_first_2026.html", ONLINE_FIRST_TITLE, "示例管理评论", "2026"),
+            ("cnki_article_newspaper_2026.html", NEWSPAPER_TITLE, "示例日报", "2025"),
+        )
+        for article, title, source, year in cases:
+            with self.subTest(source=source):
+                row = LiteratureRecord(paper_id="row", title=title, journal=source, year=year)
+                self.assertTrue(CNKIAdapter.identity_matches(row, self.parse(fixture(article)))[0])
+
+    def test_a_same_titled_article_from_another_newspaper_no_longer_locks(self) -> None:
+        # If this fails, the lock is back to title-only on newspaper pages.  The
+        # saved 2026-08 pages hold exactly this: one headline printed by two
+        # newspapers, three years apart.
+        detail = self.parse(fixture("cnki_article_newspaper_2026.html"))
+        other_year = LiteratureRecord(paper_id="row", title=NEWSPAPER_TITLE, journal="另一晚报", year="2023")
+        self.assertEqual(CNKIAdapter.identity_matches(other_year, detail), (False, "Year mismatch"))
+        same_year = LiteratureRecord(paper_id="row", title=NEWSPAPER_TITLE, journal="另一晚报", year="2025")
+        self.assertEqual(CNKIAdapter.identity_matches(same_year, detail), (False, "Journal mismatch"))
+
+    class _ArticleBrowser:
+        """Serve one kns8s result page and the kcms2 article page it links to."""
+
+        navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+        def __init__(self, result_html: str, article_html: str, article_url: str) -> None:
+            self.result_html = result_html
+            self.article_html = article_html
+            self.article_url = article_url
+            self.commands = []
+            self.current_url = "about:blank"
+            self.session = SessionHandle("uncited-source-page-test")
+            self.page_handle = PageHandle("main", session=self.session)
+
+        async def execute(self, command):
+            self.commands.append(command)
+            if isinstance(command, NavigateCommand):
+                self.current_url = command.url
+            elif isinstance(command, ClickCommand):
+                self.current_url = self.article_url
+            elif not isinstance(command, ObserveCommand):
+                raise AssertionError(type(command).__name__)
+            on_article = "/kcms2/article/abstract" in self.current_url
+            return BrowserObservation(
+                session=self.session,
+                page=self.page_handle,
+                generation=len(self.commands),
+                url=self.current_url,
+                title="中国知网" if on_article else "检索-中国知网",
+                html=self.article_html if on_article else self.result_html,
+            )
+
+    async def _exact_title_run(self, title: str, result_page: str, article: str):
+        browser = self._ArticleBrowser(result_page, fixture(article), self.DETAIL_URL)
+        request = LiteratureSearchRequest(
+            original_research_request=f"Find exact literature item: {title}",
+            exact_titles=(title,),
+            max_search_results=1,
+            max_results_per_source=1,
+            max_downloads=0,
+            max_downloads_per_run=0,
+            require_full_text=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = LiteratureAcquisitionWorkflow(
+                CNKIAdapter(browser),
+                run_root=Path(directory) / "run",
+                human_like_delay_seconds=0,
+                allow_outside_project_for_tests=True,
+            )
+            result = await workflow.run(request)
+            with (Path(directory) / "run" / "SEARCH_RESULTS.csv").open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        return result, rows
+
+    async def test_an_exact_title_run_over_an_online_first_article_records_its_journal_and_year(self) -> None:
+        # If this fails, an exact-title run over an online-first article either
+        # fails its identity lock or writes journal and year as "unknown" again.
+        page = self.result_page(ONLINE_FIRST_TITLE, source="示例管理评论", date="2026-04-11 15:03", database="期刊")
+        result, rows = await self._exact_title_run(ONLINE_FIRST_TITLE, page, "cnki_article_online_first_2026.html")
+        self.assertEqual(result.status, RunStatus.SUCCESS)
+        [record] = result.records
+        self.assertTrue(record.target_identity_confirmed)
+        # The year now feeds the page's own fallback PaperID; the run must still
+        # keep the identity-locked search PaperID (AGENTS.md Rule 52).
+        search = CNKIAdapter.parse_search_results_html(page, query=ONLINE_FIRST_TITLE)[0]
+        self.assertEqual(record.paper_id, search.paper_id)
+        self.assertEqual(
+            [(row["Title"], row["Journal"], row["Year"], row["PublicationStatus"]) for row in rows],
+            [(ONLINE_FIRST_TITLE, "示例管理评论", "2026", PublicationStatus.ONLINE_FIRST.value)],
+        )
+
+    async def test_an_exact_title_run_over_a_newspaper_article_records_its_newspaper_and_year(self) -> None:
+        # If this fails, an exact-title run over a newspaper article either fails
+        # its identity lock or writes source and year as "unknown" again.
+        page = self.result_page(NEWSPAPER_TITLE, source="示例日报", date="2025-12-31", database="报纸")
+        result, rows = await self._exact_title_run(NEWSPAPER_TITLE, page, "cnki_article_newspaper_2026.html")
+        self.assertEqual(result.status, RunStatus.SUCCESS)
+        [record] = result.records
+        self.assertTrue(record.target_identity_confirmed)
+        self.assertEqual(record.publication_type, "Newspaper")
+        search = CNKIAdapter.parse_search_results_html(page, query=NEWSPAPER_TITLE)[0]
+        self.assertEqual(record.paper_id, search.paper_id)
+        self.assertEqual(
+            [(row["Title"], row["Journal"], row["Year"]) for row in rows],
+            [(NEWSPAPER_TITLE, "示例日报", "2025")],
         )
 
 

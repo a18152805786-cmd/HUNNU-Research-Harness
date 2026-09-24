@@ -338,6 +338,81 @@ def _split_keywords(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(item.strip() for item in re.split(r"[;,；，]+", value) if item.strip()))
 
 
+# Online-first (CAPJ) and newspaper (CCND) article pages carry no issue
+# citation in ``.top-tip`` -- the saved 2026-08 pages show only
+# ``<a>科研管理 . </a>`` or ``<a title="解放日报">解放日报</a><span>地方级</span>``
+# there -- and each states its date under a label of its own instead:
+# ``（录用定稿）网络首发时间：2026-04-11 15:03:27`` in ``.head-time``, or a
+# ``报纸日期：2026-08-01`` row.  On those pages each label appeared once, and
+# only on pages of that kind.  ``在线公开时间`` is deliberately not one of them:
+# the page itself calls it "知网平台在线公开时间，不代表文献的发表时间".
+_CNKI_STATED_DATE_LABELS = {
+    "网络首发时间": ("JournalArticle", PublicationStatus.ONLINE_FIRST.value),
+    "报纸日期": ("Newspaper", PublicationStatus.OTHER.value),
+}
+_CNKI_STATED_YEAR = r"((?:18|19|20|21)\d{2})(?:[-/.]\d{1,2}){0,2}(?!\d)"
+
+
+@dataclasses.dataclass(frozen=True)
+class _CNKIStatedPublication:
+    publication_type: str
+    publication_status: str
+    source: str
+    year: str
+
+
+def _cnki_source_link_name(links: list[tuple[str, str]], *, source_url: str) -> str:
+    """The source an article page links from ``.top-tip``, or UNKNOWN.
+
+    Only the first labelled link counts, and only when it is CNKI's own link
+    to the journal or newspaper (``/knavi/detail``).  Anything else in that
+    place leaves the source unknown rather than reading on to a later link.
+    """
+
+    for text, href in links:
+        if not text:
+            continue
+        target = urlsplit(urljoin(source_url, href))
+        if not (_is_cnki_host(target.hostname) and "/knavi/detail" in target.path.casefold()):
+            return UNKNOWN
+        # "科研管理 . " -> "科研管理": one trailing citation separator only.
+        name = re.sub(r"\s*\.\s*$", "", text).strip()
+        if not name or "数据库收录" in name:
+            return UNKNOWN
+        return name
+    return UNKNOWN
+
+
+def _cnki_stated_publication(
+    visible_text: str,
+    source_links: list[tuple[str, str]],
+    *,
+    source_url: str,
+) -> _CNKIStatedPublication | None:
+    """What an article page without an issue citation says it is, or None.
+
+    A page stating both labels, or one label with dates in two different
+    years, is ambiguous and says nothing here: its journal and year stay
+    unknown.
+    """
+
+    stated = [
+        (label, years)
+        for label in _CNKI_STATED_DATE_LABELS
+        if (years := set(re.findall(rf"{re.escape(label)}\s*[：:]\s*{_CNKI_STATED_YEAR}", visible_text)))
+    ]
+    if len(stated) != 1 or len(stated[0][1]) != 1:
+        return None
+    label, years = stated[0]
+    publication_type, publication_status = _CNKI_STATED_DATE_LABELS[label]
+    return _CNKIStatedPublication(
+        publication_type=publication_type,
+        publication_status=publication_status,
+        source=_cnki_source_link_name(source_links, source_url=source_url),
+        year=next(iter(years)),
+    )
+
+
 def _snapshot_unquote(value: str | None) -> str:
     if value is None:
         return ""
@@ -526,6 +601,10 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         self.overlay_text_parts: list[str] = []
         self.document_title_parts: list[str] = []
         self.current_article_markers: set[str] = set()
+        # (visible text, href) of each link in the first ``.top-tip``.
+        self.source_links: list[tuple[str, str]] = []
+        self._source_blocks_opened = 0
+        self._source_link_captures: list[tuple[int, str, list[str]]] = []
         self._document_title_depth = 0
         self._capture_stack: list[tuple[str, str, list[str]]] = []
         # Subtree state is tracked by position in the open-element stack rather
@@ -600,6 +679,13 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         elif "top-tip" in classes:
             key = "source"
             self.current_article_markers.add("source")
+            self._source_blocks_opened += 1
+        elif (
+            lowered == "a"
+            and self._source_blocks_opened == 1
+            and any(open_key == "source" for _, open_key, _ in self._capture_stack)
+        ):
+            self._source_link_captures.append((len(self._open_tags), attributes.get("href", ""), []))
         if attributes.get("id", "").casefold() in _CNKI_2026_DOWNLOAD_CONTROL_IDS:
             self.current_article_markers.add("download")
         if key:
@@ -618,6 +704,8 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
                 self.overlay_text_parts.append(stripped)
         for _, parts in self._institution_label_captures:
             parts.append(data)
+        for _, _, parts in self._source_link_captures:
+            parts.append(data)
         for _, _, parts in self._capture_stack:
             parts.append(data)
 
@@ -633,6 +721,7 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         super().handle_endtag(tag)
         self._close_element(lowered)
         self._finish_institution_label_captures()
+        self._finish_source_link_captures()
         if self._capture_stack and self._capture_stack[-1][0] == lowered:
             _, key, parts = self._capture_stack.pop()
             value = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -674,6 +763,16 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
             if label and label not in self.authenticated_institution_labels:
                 self.authenticated_institution_labels.append(label)
         self._institution_label_captures = open_captures
+
+    def _finish_source_link_captures(self) -> None:
+        remaining = len(self._open_tags)
+        open_captures: list[tuple[int, str, list[str]]] = []
+        for depth, href, parts in self._source_link_captures:
+            if depth <= remaining:
+                open_captures.append((depth, href, parts))
+            else:
+                self.source_links.append((re.sub(r"\s+", " ", " ".join(parts)).strip(), href))
+        self._source_link_captures = open_captures
 
     def first_block(self, key: str) -> str:
         values = self.blocks.get(key, [])
@@ -1098,6 +1197,20 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 date = source_match.group(2)
             if parser.uses_2026_article_layout or year == UNKNOWN:
                 year = source_match.group(2)
+        stated = (
+            None
+            if source_match
+            else _cnki_stated_publication(
+                parser.visible_body_text,
+                parser.source_links,
+                source_url=source_url,
+            )
+        )
+        if stated is not None:
+            if stated.source != UNKNOWN:
+                journal = stated.source
+            if parser.uses_2026_article_layout or year == UNKNOWN:
+                year = stated.year
         doi = normalize_doi(_meta_first(parser, "citation_doi", "dc.identifier", "prism.doi"))
         if doi == UNKNOWN:
             doi = normalize_doi(_text_field(body, "DOI"))
@@ -1152,7 +1265,12 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 stable_identifier = _stable_identifier(urljoin(source_url, anchor.href))
                 if stable_identifier != UNKNOWN:
                     break
-        publication_type, publication_status = cls._publication_classification(body, journal)
+        if stated is not None:
+            # The page said what it is; navigation menus that mention 报纸 and
+            # 学位论文 must not outvote it.
+            publication_type, publication_status = stated.publication_type, stated.publication_status
+        else:
+            publication_type, publication_status = cls._publication_classification(body, journal)
         paper_id = stable_paper_id(doi=doi, title=title, year=year, authors=authors)
         return LiteratureRecord(
             paper_id=paper_id,
