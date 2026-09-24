@@ -17,6 +17,7 @@ from hunnu_harness.literature.models import (
 )
 from hunnu_harness.literature.normalization import sha256_file
 from hunnu_harness.literature.pdf import PDFValidator
+from hunnu_harness.paths import _logical_path
 
 from literature_test_support import write_minimal_pdf
 
@@ -65,11 +66,43 @@ class PDFValidationTests(unittest.TestCase):
 
 
 class LiteratureDownloadManagerTests(unittest.TestCase):
-    @staticmethod
-    def _long_download_root(root: Path, *, components: int = 6) -> Path:
-        current = root
-        for index in range(components):
+    # Length, in UTF-16 units, of the archive directory the long-path tests
+    # write into, whatever the temp root.  Each canonical name they archive
+    # (61 to 84 units) then overruns the 240-unit CANONICAL_PATH_SAFE_BUDGET
+    # by a fixed margin, and the 39 units left under the budget still hold a
+    # shortened name (a readable prefix, "__", a 12-hex digest and the
+    # suffix).  A literal rather than derived from the budget: with the
+    # budget disabled, the assertions must fail, not the fixture chase an
+    # unbounded path.
+    LONG_ARCHIVE_DIR_UNITS = 200
+
+    def _long_download_root(self, root: Path) -> Path:
+        """Return a download root whose archive directory is LONG_ARCHIVE_DIR_UNITS long.
+
+        The depth follows the resolved temp root, which is what the manager
+        measures: a fixed depth left nothing to shorten under Linux's 16-unit
+        /tmp and no room for a shortened name under a long TMPDIR.
+        """
+
+        base = _logical_path(root)
+        units = LiteratureDownloadManager._windows_path_units
+        shortfall = self.LONG_ARCHIVE_DIR_UNITS - units(base / "downloads" / "archive")
+        if shortfall < 2:
+            self.fail(
+                f"temp root {base} ({units(base)} UTF-16 units) is too long to place an "
+                f"archive directory {self.LONG_ARCHIVE_DIR_UNITS} units deep; "
+                "point TMPDIR at a shorter directory"
+            )
+        # Whole "managed-segment-NN" directories (19 units with a separator)
+        # while more than 20 units remain, then one of 1-19 characters that
+        # lands the archive directory exactly.
+        current = base
+        index = 0
+        while shortfall > 20:
             current /= f"managed-segment-{index:02d}"
+            shortfall -= 19
+            index += 1
+        current /= f"managed-segment-{index:02d}-"[: shortfall - 1]
         return current / "downloads"
 
     @staticmethod
