@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-from urllib.parse import parse_qs, quote_plus, urlsplit
+from urllib.parse import parse_qs, quote, quote_plus, urlsplit
 
 from hunnu_harness.agent_entrypoint import AgentRequestRouter
 from hunnu_harness.browser.commands import (
@@ -505,7 +505,9 @@ class RestrictedSearchUrlTests(unittest.TestCase):
         self.assertEqual(plain.term, "示例学刊")
 
     def test_unrestricted_search_urls_are_unchanged(self) -> None:
-        # If this fails, the exact-title acquisition path changed its request.
+        # If this fails, the exact-title acquisition path changed its request.  The one
+        # deliberate change is the kw space fix: a space goes as %20 on every search path,
+        # because CNKI reads a "+" as OR.
         origin = "https://kns.cnki.net/kns8s/defaultresult/index"
         self.assertEqual(
             CNKIAdapter.build_search_url("人工智能漂洗、审计监督与盈余管理", mode="exact_title"),
@@ -513,7 +515,7 @@ class RestrictedSearchUrlTests(unittest.TestCase):
         )
         self.assertEqual(
             CNKIAdapter.build_search_url("盈余管理 审计", mode="keyword"),
-            f"{origin}?korder=SU&kw={quote_plus('盈余管理 审计')}",
+            f"{origin}?korder=SU&kw={quote('盈余管理 审计', safe='')}",
         )
         self.assertEqual(
             CNKIAdapter.build_search_url("张三", mode="author"),
