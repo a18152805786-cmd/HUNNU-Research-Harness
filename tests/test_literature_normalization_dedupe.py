@@ -1,7 +1,7 @@
 import unittest
 
 from hunnu_harness.literature.dedupe import LiteratureDeduplicator
-from hunnu_harness.literature.models import LiteratureRecord, PublicationStatus
+from hunnu_harness.literature.models import UNKNOWN, LiteratureRecord, PublicationStatus
 from hunnu_harness.literature.normalization import (
     normalize_doi,
     normalize_title,
@@ -98,6 +98,81 @@ class LiteratureDeduplicationTests(unittest.TestCase):
         self.assertEqual(preprint.canonical_paper_id, "FINAL")
         self.assertTrue(preprint.same_work_different_version)
         self.assertTrue(preprint.archived_as_alternate_version)
+
+    @staticmethod
+    def _newspaper_article(paper_id: str, doi: str, **fields) -> LiteratureRecord:
+        return LiteratureRecord(
+            paper_id=paper_id,
+            title="春耕生产正当时",
+            year="2026",
+            doi=doi,
+            publication_status=PublicationStatus.OTHER.value,
+            **fields,
+        )
+
+    def test_one_headline_under_two_dois_of_one_status_is_two_works(self):
+        # If this fails, two newspaper articles printed under one headline on the same day
+        # are merged again, and the second can never be downloaded: it is a "duplicate".
+        daily = self._newspaper_article("DAILY", "10.99999/n.cnki.fixture.2026.000011")
+        evening = self._newspaper_article("EVENING", "10.99999/n.cnki.fixture.2026.000012")
+        LiteratureDeduplicator().deduplicate([daily, evening])
+        self.assertEqual([record.duplicate_detected for record in (daily, evening)], [False, False])
+        self.assertEqual((daily.canonical_paper_id, evening.canonical_paper_id), ("DAILY", "EVENING"))
+
+    def test_a_shared_first_author_does_not_join_two_dois_of_one_status_either(self):
+        # If this fails, the title + first author key merges what the DOIs keep apart.
+        first = self._newspaper_article("FIRST", "10.1000/one", authors=("作者甲",))
+        second = self._newspaper_article("SECOND", "10.1000/two", authors=("作者甲",))
+        second.year = "2025"
+        LiteratureDeduplicator().deduplicate([first, second])
+        self.assertFalse(second.duplicate_detected)
+
+    def test_a_record_without_a_doi_cannot_link_two_different_dois_into_one_work(self):
+        # If this fails, whether two different works stay apart depends on the order in
+        # which a third record with the same title but no DOI was found.
+        orders = {
+            "no DOI first": ("NONE", "ONE", "TWO"),
+            "no DOI between": ("ONE", "NONE", "TWO"),
+            "no DOI last": ("ONE", "TWO", "NONE"),
+        }
+        for label, order in orders.items():
+            with self.subTest(order=label):
+                records = {
+                    "NONE": self._newspaper_article("NONE", UNKNOWN),
+                    "ONE": self._newspaper_article("ONE", "10.1000/one"),
+                    "TWO": self._newspaper_article("TWO", "10.1000/two"),
+                }
+                LiteratureDeduplicator().deduplicate([records[paper_id] for paper_id in order])
+                self.assertNotEqual(records["ONE"].canonical_paper_id, records["TWO"].canonical_paper_id)
+                self.assertEqual(
+                    sum(record.duplicate_detected for record in records.values()),
+                    1,
+                    "the record without a DOI still joins one of them by title and year",
+                )
+
+    def test_a_preprint_and_its_journal_version_stay_one_work_under_different_dois(self):
+        # If this fails, the DOI rule reached past one publication status and split a
+        # preprint from its journal version, which routinely carry different DOIs.
+        preprint = LiteratureRecord(
+            paper_id="PRE",
+            title="Same Work",
+            authors=("A. Smith",),
+            year="2025",
+            doi="10.1000/preprint.1",
+            publication_status=PublicationStatus.PREPRINT.value,
+        )
+        final = LiteratureRecord(
+            paper_id="FINAL",
+            title="Same Work",
+            authors=("A. Smith",),
+            year="2025",
+            doi="10.1000/journal.1",
+            publication_status=PublicationStatus.PEER_REVIEWED_JOURNAL_ARTICLE.value,
+        )
+        LiteratureDeduplicator().deduplicate([preprint, final])
+        self.assertFalse(final.duplicate_detected)
+        self.assertEqual(preprint.canonical_paper_id, "FINAL")
+        self.assertTrue(preprint.same_work_different_version)
 
 
 if __name__ == "__main__":

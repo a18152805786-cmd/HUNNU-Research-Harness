@@ -51,6 +51,30 @@ def _keys(record: LiteratureRecord) -> list[tuple[str, str]]:
     return keys
 
 
+# Keys that recognise one work by its title; a conflicting DOI overrules them.
+_TITLE_KEYS = frozenset({"normalized title + year", "title + first author"})
+
+
+def _known_dois(record: LiteratureRecord) -> dict[str, set[str]]:
+    doi = normalize_doi(record.doi)
+    return {record.publication_status: {doi}} if doi != UNKNOWN else {}
+
+
+def _different_works(left: dict[str, set[str]], right: dict[str, set[str]]) -> bool:
+    """Whether two groups carry different DOIs under one publication status.
+
+    A shared title and year (or first author) is how one work is recognised
+    across searches, but two newspapers can print one headline on the same
+    day, and CNKI gives each article its own DOI.  Records whose known DOIs
+    differ while their publication status is the same are different works,
+    whatever their titles say.  A different status is the exception: a
+    preprint and its journal version often carry different DOIs and are still
+    one work (``same_work_different_version``).
+    """
+
+    return any(status in right and not dois & right[status] for status, dois in left.items())
+
+
 def _canonical_score(record: LiteratureRecord) -> tuple[int, int, int, int]:
     return (
         _STATUS_RANK.get(record.publication_status, 0),
@@ -64,14 +88,25 @@ class LiteratureDeduplicator:
     def deduplicate(self, records: list[LiteratureRecord]) -> list[LiteratureRecord]:
         union_find = _UnionFind(len(records))
         first_by_key: dict[tuple[str, str], int] = {}
+        # group root -> publication status -> the known DOIs of the group.  The
+        # DOI check runs on whole groups, so a record without a DOI cannot link
+        # two different works together, whatever order they were found in.
+        group_dois = {index: _known_dois(record) for index, record in enumerate(records)}
         for index, record in enumerate(records):
             if record.canonical_paper_id == UNKNOWN:
                 record.canonical_paper_id = record.paper_id
             for key in _keys(record):
-                if key in first_by_key:
-                    union_find.union(index, first_by_key[key])
-                else:
+                if key not in first_by_key:
                     first_by_key[key] = index
+                    continue
+                root, other_root = union_find.find(index), union_find.find(first_by_key[key])
+                if root == other_root:
+                    continue
+                if key[0] in _TITLE_KEYS and _different_works(group_dois[root], group_dois[other_root]):
+                    continue
+                union_find.union(index, first_by_key[key])
+                for status, dois in group_dois.pop(other_root).items():
+                    group_dois[root].setdefault(status, set()).update(dois)
 
         groups: dict[int, list[int]] = defaultdict(list)
         for index in range(len(records)):
