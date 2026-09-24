@@ -49,7 +49,7 @@
 | 36 | Output 不是第二仓库 | 仅散文 | 反向复制无检查（见"建议提升"） |
 | 37 | 适配器解析先于导航 | 代码强制 | Broker/Registry 链；裸端口 fail-closed |
 | 38 | 采集前先跑 agent-route | 部分 | 工具存在且稳定；"先跑"这个动作靠散文 |
-| 39 | 请求 schema 与来源白名单 | 代码强制 | `LiteratureSearchRequest` 校验；registry 限四源。受限检索字段（`ResourceType`/`SourceJournals`/年份）：未知取值、年份两种写法冲突、与精确题名/DOI/作者同用一律拒绝；不支持 `supports_restricted_search` 的来源在路由、`acquire` 与 workflow 三处都在检索前拒绝；CNKI 只在结果页自己的 `briefRequest` 证实"只检学术期刊、执行的正是这条检索式"且每行都标「期刊」时才返回结果，否则停止本次运行的后续检索（`test_cnki_restricted_search.py`，19 处改坏即红核验） |
+| 39 | 请求 schema 与来源白名单 | 代码强制 | `LiteratureSearchRequest` 校验；registry 限四源。受限检索字段（`ResourceType`/`SourceJournals`/年份）：未知取值、年份两种写法冲突、与精确题名/DOI/作者同用一律拒绝；不支持 `supports_restricted_search` 的来源在路由、`acquire` 与 workflow 三处都在检索前拒绝；CNKI 只在结果页自己的 `briefRequest` 证实"只检学术期刊、执行的正是这条检索式"且每行都标「期刊」时才返回结果，否则停止本次运行的后续检索（`test_cnki_restricted_search.py`，19 处改坏即红核验）。`ListingOnly` 只能用于受限检索且 `MaxDownloads=0`，否则拒绝；只读列表的记录不经身份锁、不能成为下载候选，只有它们带结果行上的作者（另 3 处改坏即红核验） |
 | 40 | 执行边界：注册表解析、身份精确匹配 | 代码强制 | `type(adapter) is expected_type`（子类替换被拒，有测试）；缺端口 fail-closed |
 | 41 | auto 分源与预算门 | 代码强制 | 阈值超限 → `PlanningAndBudgetGate=true`（测试钉住） |
 | 42 | 能力缺失明确报告 | 代码强制 | `HarnessCapabilityAvailable=false`＋`MissingCapability`；3.4 后另有 `capabilities`/`doctor` |

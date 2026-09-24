@@ -221,6 +221,11 @@ class LiteratureSearchRequest:
     # instead of only weighing them in screening.
     resource_type: str | None = None
     source_journals: tuple[str, ...] = ()
+    # Read a restricted search's result rows as the confirmed page states them
+    # (title, journal, year, authors) and open no article: a candidate list,
+    # not an acquisition.  A candidate is fetched later by exact title, which
+    # opens, locks and checks it then.
+    listing_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.original_research_request.strip():
@@ -252,6 +257,18 @@ class LiteratureSearchRequest:
                 "(ExactTitles may also come from quoted text in the request -- pass ExactTitles: [] "
                 "to clear them)"
             )
+        if self.listing_only:
+            if not self.restricted_search:
+                raise ValueError(
+                    "ListingOnly reads the rows of a restricted search (ResourceType or SourceJournals), "
+                    "whose page confirms each row's journal and year; an unrestricted result row "
+                    "states neither"
+                )
+            if self.max_downloads or self.require_full_text:
+                raise ValueError(
+                    "ListingOnly opens no article, so it downloads nothing: set MaxDownloads to 0 "
+                    "and leave RequireFullText off"
+                )
 
     @property
     def restricted_search(self) -> bool:
@@ -329,6 +346,7 @@ class LiteratureSearchRequest:
             ),
             resource_type=_value(mapping, "ResourceType", "resource_type"),
             source_journals=_journal_names(_value(mapping, "SourceJournals", "source_journals")),
+            listing_only=bool(_value(mapping, "ListingOnly", "listing_only", default=False)),
         )
 
     @classmethod
@@ -447,6 +465,7 @@ class LiteratureSearchRequest:
             "AI_ASSISTED": self.ai_assisted_screening,
             "ResourceType": self.resource_type or UNKNOWN,
             "SourceJournals": list(self.source_journals),
+            "ListingOnly": self.listing_only,
         }
 
 

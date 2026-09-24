@@ -1061,6 +1061,7 @@ class _CNKIListingRow:
     products: tuple[str, ...]
     resources: tuple[str, ...]
     online_first: bool
+    authors: tuple[str, ...] = ()
 
     def is_journal_article(self) -> bool | None:
         """Whether the row says it is an academic journal article.
@@ -1135,6 +1136,7 @@ class _CNKIRestrictedSearchSpec:
     year_start: int | None
     year_end: int | None
     result_limit: int
+    listing_only: bool = False
 
     def describe(self) -> str:
         return f"{self.field}={self.term} within 学术期刊 ({_CNKI_JOURNAL_CLASSID})"
@@ -1674,6 +1676,15 @@ class CNKIAdapter(LiteratureSourceAdapter):
             date = re.sub(r"\s+", " ", " ".join(cells.get("date", []))).strip() or UNKNOWN
             year_match = re.search(r"(?:18|19|20|21)\d{2}", date) if date != UNKNOWN else None
             products = tuple(dict.fromkeys(raw["products"]))
+            authors = tuple(
+                dict.fromkeys(
+                    name
+                    for name in (
+                        part.strip() for part in re.split(r"[;；,，]", ";".join(cells.get("author", [])))
+                    )
+                    if name
+                )
+            )
             rows.append(
                 _CNKIListingRow(
                     title=title,
@@ -1689,6 +1700,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
                         any("网络首发" in mark for mark in raw["marks"])
                         or _CNKI_ONLINE_FIRST_PRODUCT in products
                     ),
+                    authors=authors,
                 )
             )
         total_match = _CNKI_REPORTED_TOTAL_RE.search(re.sub(r"\s+", "", parser.visible_body_text))
@@ -2439,6 +2451,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 year_start=request.year_start,
                 year_end=request.year_end,
                 result_limit=limit,
+                listing_only=request.listing_only,
             )
         if request.source_journals:
             raise ValueError("A request that names SourceJournals is searched by source only")
@@ -2453,6 +2466,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             year_start=request.year_start,
             year_end=request.year_end,
             result_limit=base_limit,
+            listing_only=request.listing_only,
         )
 
     def _restriction_report(
@@ -2690,6 +2704,11 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 LiteratureRecord(
                     paper_id=paper_id,
                     title=row.title,
+                    # Only a listing-only record keeps the row's authors: it is
+                    # never opened.  An inspected record is locked against its
+                    # article page, where a row's shortened author list ("等")
+                    # would read as another paper's.
+                    authors=row.authors if spec.listing_only else (),
                     year=row.year,
                     journal=row.source,
                     language="zh" if re.search(r"[㐀-鿿]", row.title) else UNKNOWN,

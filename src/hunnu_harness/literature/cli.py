@@ -382,6 +382,8 @@ async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[i
             "SourceJournals": list(request.source_journals),
             "YearStart": request.year_start,
             "YearEnd": request.year_end,
+            # Rows as the confirmed page states them, no article opened.
+            "ListingOnly": request.listing_only,
         }
         outcomes = adapter.search_restriction_reports() if adapter is not None else []
         report.put(

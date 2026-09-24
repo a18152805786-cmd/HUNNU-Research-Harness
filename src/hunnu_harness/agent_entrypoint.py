@@ -715,6 +715,9 @@ class AgentRequestRouter:
                     "MaxDownloadsPerRun": effective_downloads,
                     "RequireFullText": effective_downloads > 0,
                     "AI_ASSISTED": _boolean(_field(payload, "AI_ASSISTED", default=False), default=False),
+                    "ListingOnly": _boolean(
+                        _field(payload, "ListingOnly", "listing_only", default=False), default=False
+                    ),
                 }
             )
             passthrough = {

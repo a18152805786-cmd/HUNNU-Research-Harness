@@ -432,6 +432,25 @@ class RestrictedRequestTests(unittest.TestCase):
             with self.subTest(lookup=lookup), self.assertRaisesRegex(ValueError, "cannot be restricted"):
                 LiteratureSearchRequest(original_research_request=ORIGINAL, resource_type="JournalArticle", **lookup)
 
+    def test_listing_only_reads_a_restricted_list_and_downloads_nothing(self) -> None:
+        # If this fails, ListingOnly lets through a request it cannot honour: an unrestricted
+        # list, whose rows state no journal or year, or one that asks for a download although
+        # no article is ever opened, locked or checked.
+        parsed = LiteratureSearchRequest.from_mapping(
+            {"OriginalResearchRequest": ORIGINAL, "SourceJournals": ["示例学刊"], "MaxDownloads": 0, "ListingOnly": True}
+        )
+        self.assertTrue(parsed.listing_only)
+        self.assertTrue(parsed.as_dict()["ListingOnly"])
+        self.assertFalse(request().listing_only)
+        for label, overrides in (
+            ("unrestricted", {"source_journals": (), "keywords_cn": ("示例议题",)}),
+            ("a download", {"max_downloads": 1, "max_downloads_per_run": 1}),
+            ("required full text", {"require_full_text": True}),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(ValueError, "ListingOnly"):
+                    request(listing_only=True, **overrides)
+
     def test_an_unrestricted_request_stays_unrestricted_through_its_record(self) -> None:
         plain = LiteratureSearchRequest(original_research_request=ORIGINAL, exact_titles=("某篇论文的精确题名",))
         self.assertFalse(plain.restricted_search)
@@ -592,6 +611,20 @@ class RestrictedSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["RowsDroppedOutsideYears"], 1)
         self.assertEqual(report["PageYears"], "2018-2026")
         self.assertIn("CrossIds=YSTT4HG0", report["ScopeEvidence"])
+
+    async def test_only_a_listing_only_record_keeps_the_authors_its_row_states(self) -> None:
+        # If this fails, either a listing-only record loses the authors its row states, or an
+        # inspected record carries them into the identity lock, where a row's shortened author
+        # list ("等") would read as another paper's.
+        with patch(SETTLE, 0):
+            listed = await CNKIAdapter(source_site()).search('source:"示例学刊"', request(listing_only=True))
+            inspected = await CNKIAdapter(source_site()).search('source:"示例学刊"', request())
+        self.assertEqual([record.title for record in listed], [record.title for record in inspected])
+        self.assertEqual(
+            [record.authors for record in listed],
+            [("作者甲", "作者乙"), ("作者丙",), ("作者丁", "作者戊")],
+        )
+        self.assertEqual([record.authors for record in inspected], [()] * len(inspected))
 
     async def test_the_candidate_cap_is_shared_across_named_journals(self) -> None:
         # If this fails, the first named journal can take every candidate slot.
@@ -955,6 +988,46 @@ class RestrictedRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(checked), 1)
         self.assertEqual(checked[0]["RowsKept"], 3)
 
+    async def test_a_listing_only_run_reads_the_rows_and_opens_no_article(self) -> None:
+        # If this fails, a candidate list costs two CNKI page loads per row again -- an
+        # exact-title relock search and an article page -- as on 2026-09-24, when three
+        # 15-row journal searches took 17 minutes and ended at a verification page.
+        site = source_site()
+        result, query_log, results, events = await self._run(CNKIAdapter(site), request(listing_only=True))
+        self.assertEqual(site.navigations, site.scoped_navigations)
+        self.assertEqual(len(site.navigations), 1)
+        # Titles as the result row prints them: its "：" reads as ":" once normalized.
+        self.assertEqual(
+            sorted((item["Title"], item["Journal"], item["Year"]) for item in results),
+            sorted(
+                [
+                    ("示例技术的规范问题:一个分析框架", "示例学刊", "2026"),
+                    ("示例系统中的规则设计与责任分配", "示例学刊", "2026"),
+                    ("示例议题治理的比较进路", "示例学刊", "2025"),
+                ]
+            ),
+        )
+        self.assertTrue(all(record.authors for record in result.records))
+        self.assertFalse(any(record.target_identity_confirmed for record in result.records))
+        self.assertEqual(result.downloads, [])
+        self.assertIs(result.status, RunStatus.SUCCESS)
+        self.assertEqual((query_log[0]["ResultsReturned"], query_log[0]["ResultsInspected"]), ("3", "0"))
+        self.assertTrue(json.loads(query_log[0]["Filters"])["RestrictionOutcome"]["ScopeConfirmed"])
+        actions = [event.get("action") for event in events]
+        self.assertEqual(actions.count("literature_result_listed"), 3)
+        self.assertNotIn("literature_result_inspected", actions)
+
+    async def test_without_listing_only_a_restricted_run_still_opens_and_locks_every_row(self) -> None:
+        # If this fails, a restricted run skips the article pages without being asked to,
+        # and its results reach screening -- and the download step -- unlocked.
+        site = source_site()
+        result, _query_log, _results, events = await self._run(CNKIAdapter(site), request())
+        self.assertEqual(len([url for url in site.navigations if "/kcms2/article/abstract" in url]), 3)
+        self.assertTrue(all(record.target_identity_confirmed for record in result.records))
+        actions = [event.get("action") for event in events]
+        self.assertEqual(actions.count("literature_result_inspected"), 3)
+        self.assertNotIn("literature_result_listed", actions)
+
 
 # -- the entry points -----------------------------------------------------------
 
@@ -994,6 +1067,23 @@ class RestrictedRoutingTests(unittest.TestCase):
         decision = self.router.route(self.payload(PreferredSources=["CNKI"], ResourceType="Dissertation"))
         self.assertEqual(decision.status, "INVALID_REQUEST")
         self.assertIn("ResourceType", decision.missing_request_details)
+
+    def test_the_router_carries_listing_only_into_the_cnki_plan(self) -> None:
+        # If this fails, an Agent that asked for a candidate list gets a run that opens
+        # every row, or one that could download.
+        decision = self.router.route(
+            self.payload(PreferredSources=["CNKI"], SourceJournals=["示例学刊"], MaxDownloads=0, ListingOnly=True)
+        )
+        self.assertTrue(decision.is_routable, decision.as_dict())
+        planned = decision.literature_plans[0].request
+        self.assertTrue(planned.listing_only)
+        self.assertEqual(planned.max_downloads, 0)
+        self.assertTrue(decision.as_dict()["LiteraturePlans"][0]["Request"]["ListingOnly"])
+        refused = self.router.route(
+            self.payload(PreferredSources=["CNKI"], SourceJournals=["示例学刊"], MaxDownloads=1, ListingOnly=True)
+        )
+        self.assertEqual(refused.status, "INVALID_REQUEST")
+        self.assertIn("ListingOnly", refused.missing_request_details)
 
     def test_the_router_refuses_year_spellings_that_disagree(self) -> None:
         decision = self.router.route(self.payload(PreferredSources=["CNKI"], YearStart=2019, YearFrom=2021))
@@ -1067,6 +1157,30 @@ class RestrictedCommandLineTests(unittest.TestCase):
         self.assertTrue(outcome["ScopeConfirmed"])
         self.assertEqual(outcome["RowsKept"], 3)
         self.assertEqual(outcome["RowsDroppedOutsideYears"], 1)
+
+    def test_acquire_reports_a_listing_only_search_as_listing_only(self) -> None:
+        # If this fails, an acquire report no longer says that its results were read off the
+        # result page and never opened, so they would pass for inspected, locked records.
+        exit_code, result, report = self._run_live(
+            "live-cnki",
+            {
+                "OriginalResearchRequest": ORIGINAL,
+                "SourceJournals": ["示例学刊"],
+                "YearStart": 2019,
+                "YearEnd": 2026,
+                "MaxSearchResults": 10,
+                "MaxResultsPerSource": 10,
+                "MaxDownloads": 0,
+                "MaxDownloadsPerRun": 0,
+                "ListingOnly": True,
+            },
+            browser=_ResearchChrome,
+        )
+        self.assertEqual(exit_code, 0, report)
+        self.assertTrue(report["SearchRestriction"]["ListingOnly"])
+        self.assertEqual(report["Results"], 3)
+        self.assertEqual(report["Downloads"], 0)
+        self.assertFalse(any(record.target_identity_confirmed for record in result.records))
 
     def test_acquire_refuses_a_restricted_request_for_a_source_without_it_before_chrome_starts(self) -> None:
         exit_code, result, report = self._run_live(

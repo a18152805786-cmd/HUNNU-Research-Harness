@@ -343,6 +343,23 @@ class LiteratureAcquisitionWorkflow:
                 remaining = request.max_search_results - len(records)
                 query_results = query_results[:remaining]
                 for search_record in query_results:
+                    if request.listing_only:
+                        # A listing-only run keeps what the confirmed result
+                        # page states and opens nothing: no exact-title relock
+                        # search, no article page, no access check -- per row,
+                        # the two page loads that made a 15-row journal search
+                        # take five minutes.  Nothing is identity-confirmed, so
+                        # nothing here can become a download candidate.
+                        records.append(search_record)
+                        self.logger.log(
+                            "literature_result_listed",
+                            status=RunStatus.SUCCESS.value,
+                            paper_id=search_record.paper_id,
+                            source=search_record.source_database,
+                            journal=search_record.journal,
+                            year=search_record.year,
+                        )
+                        continue
                     try:
                         await self.adapter.open_result(search_record)
                         extracted = await self.adapter.extract_metadata(search_query=plan.query)

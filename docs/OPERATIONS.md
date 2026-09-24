@@ -99,6 +99,8 @@ v0.1 的端到端验收（`HarnessV01CNRDSTestPassed=true`）：在用户人工�
 
 CNKI 的一框式检索一次只检一个字段，所以指定刊名时按「文献来源」逐刊检索（每刊一次，照常经检索限速台账排队），主题词交给筛选打分，不塞进检索式；只给 `ResourceType` 时按「主题」检索。每次检索都带 `crossids=YSTT4HG0`（只检学术期刊），并且只读第一页结果。结果返回前，页面自己的 `briefRequest` 必须写明 CNKI 确实只检了学术期刊、执行的正是这条检索式，每条结果的「数据库」栏也必须是「期刊」；做不到就以 `CNKI_RESTRICTION_UNCONFIRMED` / `CNKI_RESTRICTION_NOT_APPLIED` 结束这一条，不把该页任何结果当作受限结果返回，本次运行也不再发出后续检索。其他刊物、年份范围外的条目会被丢弃并计数。`acquire` 输出里的 `SearchRestrictionOutcome`、run 目录下 `SEARCH_QUERY_LOG.csv` 的 `RestrictionOutcome` 与 `audit\LITERATURE_EVENTS.jsonl` 逐条记录确认依据、保留与丢弃数量和本页覆盖的年份。CNKI 默认按发表时间倒序，第一页够不到的年份会返回 0 条并在备注里说明——这不能当作「该刊没有这类文章」的证据。受限请求不能与 `ExactTitles`、`DOIs`、`Authors` 同用；其他来源遇到受限请求在启动浏览器前就拒绝（`UNSUPPORTED_CAPABILITY`，退出码 1）。
 
+**只读列表（`ListingOnly`）。** 只想先拉一份候选清单时，在受限请求里加 `"ListingOnly": true`，并把 `MaxDownloads` 设为 0（不满足就判为无效请求）。每条已确认的结果行按页面所写原样保留——题名、刊名、年份、作者——不再逐条打开文章：不做精确题名重锁检索，不开详情页，不查全文权限。一次 15 条的期刊检索由约 30 次页面访问降到 1 次。这些记录没有经过身份锁，永远不会成为下载候选；选中的文章之后按精确题名下载（`acquire --title` 或 `acquire-batch` 的条目），那一步照常打开、锁定、核对。`acquire` 输出的 `SearchRestriction` 里会写 `"ListingOnly": true`，检索日志的 `ResultsInspected` 为 0。
+
 **批量队列（`acquire-batch`，规则 75）。** 多篇论文写进一个队列文件，由一个进程一篇接一篇地跑完，每篇走的都是上面 `acquire` 的同一条路径（限速、写前记账、身份锁、校验、SHA-256、manifest、归档、分类都不变）：
 
 ```powershell
