@@ -190,7 +190,55 @@ class CNKIParserTests(unittest.TestCase):
             _canonicalize_cnki_title_identity(literal),
             _canonicalize_cnki_title_identity(without_plus),
         )
-        self.assertIn("%2B%2B", CNKIAdapter.build_search_url(literal, mode="exact_title").upper())
+        # Only the search box stops carrying it: CNKI reads "+" as OR, so a title search sends
+        # each "+" as a space (see the plus tests below), while the identity above keeps it.
+        url = CNKIAdapter.build_search_url(literal, mode="exact_title")
+        self.assertEqual(kw_as_cnki_reads_it(url), "C 相关研究")
+
+    def test_a_plus_in_an_exact_title_reaches_cnki_as_a_space_not_as_or(self) -> None:
+        # If this fails, CNKI's search box again reads the title's "+" as OR.  Both spellings
+        # below were searched that way on 2026-09-22, and with the relocks before download
+        # eight title requests for this 2018 paper came back without it: "“互联网" OR
+        # "”为什么加出了业绩", newest first, is a page of newer 互联网 titles.
+        cases = (
+            ("“互联网+”为什么加出了业绩", "“互联网 ”为什么加出了业绩"),
+            ("互联网+为什么加出了业绩", "互联网 为什么加出了业绩"),
+        )
+        for mode in ("exact_title", "title"):
+            for title, sent in cases:
+                with self.subTest(mode=mode, title=title):
+                    url = CNKIAdapter.build_search_url(title, mode=mode)
+                    self.assertIn("korder=TI", url)
+                    self.assertEqual(kw_as_cnki_reads_it(url), sent)
+
+    def test_a_fullwidth_plus_in_an_exact_title_does_not_reach_cnki_as_or_either(self) -> None:
+        # If this fails, a title written with a full-width "＋" still reaches CNKI as OR: the
+        # exact-title canonicalization (NFKC) turns it into "+" before the query is sent.
+        url = CNKIAdapter.build_search_url("“互联网＋”为什么加出了业绩", mode="exact_title")
+        self.assertEqual(kw_as_cnki_reads_it(url), "“互联网 ”为什么加出了业绩")
+
+    def test_a_spaced_plus_in_an_exact_title_leaves_a_single_space(self) -> None:
+        # If this fails, "A + B" reaches CNKI as a run of spaces, a form no saved search shows.
+        url = CNKIAdapter.build_search_url("Rail transit + land use in Chinese cities", mode="exact_title")
+        self.assertEqual(kw_as_cnki_reads_it(url), "Rail transit land use in Chinese cities")
+
+    def test_author_and_keyword_searches_still_send_a_plus_as_typed(self) -> None:
+        # If this fails, sending a "+" as a space has spread past title searches.  On 2026-09-24
+        # the user chose to change title searches only, as for the hyphen; in an author or a
+        # keyword search a typed "+" may be the OR that was meant.
+        for mode, query in (("author", "张三+李四"), ("keyword", "城市轨道交通+高速铁路")):
+            with self.subTest(mode=mode):
+                self.assertEqual(kw_as_cnki_reads_it(CNKIAdapter.build_search_url(query, mode=mode)), query)
+
+    def test_the_identity_lock_still_compares_the_real_title_with_its_plus(self) -> None:
+        # If this fails, the search form leaked into the identity lock: a record whose title has
+        # a space where the requested title has "+" would pass as the same paper.
+        title = "“互联网+”为什么加出了业绩"
+        requested = LiteratureRecord(paper_id="requested", title=title)
+        same = LiteratureRecord(paper_id="same", title=title)
+        spaced = LiteratureRecord(paper_id="spaced", title=title.replace("+", " "))
+        self.assertTrue(CNKIAdapter.identity_matches(requested, same)[0])
+        self.assertEqual(CNKIAdapter.identity_matches(requested, spaced), (False, "Target title mismatch"))
 
     def test_a_space_in_a_keyword_search_reaches_cnki_as_a_space_not_a_plus(self) -> None:
         # If this fails, CNKI again runs "城市轨道交通+客流+预测": it keeps a "+" sent for a
@@ -220,16 +268,18 @@ class CNKIParserTests(unittest.TestCase):
         self.assertIn("korder=AU", url)
         self.assertEqual(kw_as_cnki_reads_it(url), "John A. Smith")
 
-    def test_a_search_without_a_space_sends_the_same_url_as_before(self) -> None:
-        # If this fails, the change reached past spaces, and searches that already worked --
-        # exact titles, author names and keywords alike -- now send CNKI a different request.
+    def test_a_search_without_a_space_or_a_title_plus_sends_the_same_url_as_before(self) -> None:
+        # If this fails, the change reached past spaces and title "+" signs, and searches that
+        # already worked -- exact titles, author names and keywords alike -- now send CNKI a
+        # different request.  (A "+" in a title search is the other deliberate change; the
+        # 互联网+ title that used to sit here never found its paper, see the plus tests above.)
         cases = (
             ("keyword", "SU", "城市轨道交通"),
             ("keyword", "SU", "A/B?C&D=E#F%G：H"),
             ("author", "AU", "张三"),
             ("exact_title", "TI", "城市轨道交通客流预测——基于深度学习的方法"),
             ("exact_title", "TI", "高速铁路:网络演化与区域可达性"),
-            ("exact_title", "TI", "“互联网+”为什么加出了业绩"),
+            ("exact_title", "TI", "“十四五”时期高速铁路网络规划研究"),
             ("exact_title", "TI", "HIF-1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制"),
         )
         for mode, order, query in cases:
@@ -1098,7 +1148,8 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refresh_falls_back_to_the_search_that_found_a_title_exact_search_cannot_reach(self) -> None:
         # If this fails, a paper that CNKI's keyword search finds but its exact-title
-        # search cannot (nested quotes around "+") is again undownloadable.
+        # search does not bring up (this one, while its "+" still reached CNKI as OR)
+        # is again undownloadable.
         browser = self._RoutedBrowser({"SU": [self._one_hit(self._PLUS_TITLE)], "TI": [self._NO_HITS]})
         adapter = CNKIAdapter(browser)
         records = await adapter.search("为什么加出了业绩", self._plus_request())
@@ -1137,6 +1188,64 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SourceLayoutChanged, "could not relock"):
             await adapter.open_result(records[0])
         self.assertEqual(self._korders(browser), ["SU", "TI", "SU"])
+
+    _PLUS_TITLE_SENT = "“互联网 ”为什么加出了业绩"
+    _PLUS_NEIGHBOUR = "“互联网+”行动计划下的城市轨道交通运营"
+    _PLUS_NEIGHBOUR_ROW = (
+        '<a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=GTYS202601001">'
+        f"{_PLUS_NEIGHBOUR}</a>"
+    )
+
+    def _title_searches(self, browser) -> list[str]:
+        return [
+            kw_as_cnki_reads_it(command.url)
+            for command in browser.commands
+            if isinstance(command, NavigateCommand) and "korder=TI" in command.url
+        ]
+
+    async def test_an_exact_title_with_a_plus_is_searched_and_relocked_without_an_or(self) -> None:
+        # If this fails, acquire / acquire-batch or the relock before download again send CNKI
+        # "“互联网" OR "”为什么加出了业绩": on 2026-09-22 eight such title requests missed this
+        # paper.  The result rows are still read, filtered and clicked by the real title, "+"
+        # included, so a neighbour that shares the words is not taken for it.
+        page = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 2 条结果</div>
+            {self._PLUS_NEIGHBOUR_ROW}
+            <a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=GGYY201805005">{self._PLUS_TITLE}</a>
+          </main>
+        </body></html>
+        """
+        browser = self._RoutedBrowser({"TI": [page]})
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search(f'"{self._PLUS_TITLE}"', self._request(self._PLUS_TITLE))
+        self.assertEqual([record.title for record in records], [self._PLUS_TITLE])
+        with patch("hunnu_harness.literature.adapters.cnki._CNKI_CLICK_RETRY_DELAY_SECONDS", 0):
+            await adapter.open_result(records[0])
+        self.assertEqual(self._korders(browser), ["TI", "TI"])
+        self.assertEqual(self._title_searches(browser), [self._PLUS_TITLE_SENT, self._PLUS_TITLE_SENT])
+        click = next(command for command in reversed(browser.commands) if isinstance(command, ClickCommand))
+        self.assertEqual(click.target.text, self._PLUS_TITLE)
+
+    async def test_a_plus_title_found_by_keyword_is_refreshed_without_an_or_before_the_fallback(self) -> None:
+        # If this fails, relocking a paper found by keyword search -- the route this one took on
+        # 2026-09-22 -- refreshes its exact title with "+" as OR again, or no longer falls back
+        # to the search that found it when the title search shows other papers only.
+        other_papers = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 1 条结果</div>
+            {self._PLUS_NEIGHBOUR_ROW}
+          </main>
+        </body></html>
+        """
+        browser = self._RoutedBrowser({"SU": [self._one_hit(self._PLUS_TITLE)], "TI": [other_papers]})
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search("为什么加出了业绩", self._plus_request())
+        await adapter.open_result(records[0])
+        self.assertEqual(self._korders(browser), ["SU", "TI", "SU"])
+        self.assertEqual(self._title_searches(browser), [self._PLUS_TITLE_SENT])
+        last_navigation = [command.url for command in browser.commands if isinstance(command, NavigateCommand)][-1]
+        self.assertIn("GGYY201805005", last_navigation)
 
     async def test_a_planned_chinese_keyword_pair_reaches_cnki_as_both_words(self) -> None:
         # If this fails, the planner's "primary secondary" pairing is sent as

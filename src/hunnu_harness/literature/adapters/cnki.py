@@ -185,6 +185,30 @@ def _canonicalize_cnki_exact_query(value: str) -> str:
     return _normalize_cnki_plain_title_spacing(value)
 
 
+def _cnki_title_search_term(title: str) -> str:
+    """Return the ``kw`` term for a CNKI title search, with no ``+`` in it.
+
+    CNKI's search box reads ``+`` as OR whether or not spaces surround it; its
+    own update notice on the result page lists ``*（与）、+（或）、-（非）``.  A
+    title search for "“互联网+”为什么加出了业绩" therefore runs as "“互联网"
+    OR "”为什么加出了业绩", newest first: on 2026-09-22 all eight title
+    requests for that 2018 paper came back without it, and none of them on
+    CNKI's empty page.  Each ``+`` -- a full-width "＋" too, which the NFKC in
+    canonicalization folds into ``+`` -- is sent as a space instead.  A space
+    in a one-box search requires every word (adding one to a spaced full-text
+    search on 2026-08-17 cut its hits), though no title search has been sent
+    that way yet.  This is the query only: the identity lock, the result
+    filter and the text clicked on the result page keep the real title.  The
+    ``+`` goes after canonicalization, whose CJK rule would otherwise delete
+    the space again ("互联网+为什么" must not become "互联网为什么").
+    """
+
+    term = _canonicalize_cnki_exact_query(title)
+    if "+" not in term:
+        return term
+    return " ".join(term.replace("+", " ").split())
+
+
 def _canonicalize_cnki_title_identity(value: str) -> str:
     """Normalize a page-observed bibliographic title without fuzzy matching.
 
@@ -927,7 +951,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
     @classmethod
     def build_search_url(cls, query: str, *, mode: str = "keyword") -> str:
         order = {"exact_title": "TI", "title": "TI", "author": "AU", "keyword": "SU"}.get(mode, "SU")
-        query_value = _canonicalize_cnki_exact_query(query) if mode in {"exact_title", "title"} else query
+        query_value = _cnki_title_search_term(query) if mode in {"exact_title", "title"} else query
         return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={_encode_cnki_kw_value(query_value)}"
 
     @classmethod
@@ -1732,9 +1756,10 @@ class CNKIAdapter(LiteratureSourceAdapter):
         original_search = self._search_inputs.get(record.search_query)
         if fresh_record is None and original_search is not None and original_search[0] != "exact_title":
             # Some CNKI titles are unreachable by an exact-title query even though
-            # the record exists -- e.g. "“互联网+”为什么加出了业绩", where the
-            # nested quotes around "+" return zero hits.  When the record was
-            # found by a different search, refresh once with that same search.
+            # the record exists -- e.g. "“互联网+”为什么加出了业绩" while its "+"
+            # still reached CNKI as OR: the page filled with newer 互联网 titles
+            # (not zero hits, as first thought).  When the record was found by a
+            # different search, refresh once with that same search.
             # The relock rule is unchanged: identity_matches must still hold.
             mode, term = original_search
             await self.browser.execute(NavigateCommand(self.build_search_url(term, mode=mode)))
