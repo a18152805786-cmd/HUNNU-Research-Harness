@@ -241,25 +241,33 @@ def _canonicalize_cnki_exact_query(value: str) -> str:
 
 
 def _cnki_title_search_term(title: str) -> str:
-    """Return the ``kw`` term for a CNKI title search, with no hyphen in it.
+    """Return the ``kw`` term for a CNKI title search, with no ``-`` or ``+`` in it.
 
-    CNKI's search box reads ``-`` as NOT whether or not spaces surround it; its
-    own update notice on the result page lists ``*（与）、+（或）、-（非）``.  A
-    title search for "HIF-1α对缺血性结肠炎…" therefore runs as "HIF" NOT
-    "1α对缺血性结肠炎…" and can never return the paper, whose own title holds
-    the excluded words.  On 2026-08-20 all four saved title searches with a
-    hyphen missed their paper; the one for "基于全二维气相色谱-飞行时间质谱…"
-    left out a paper newer than every row it showed.  Each hyphen is sent as a
-    space instead, so both sides stay words of the one search.  This is the
-    query only: the identity lock and the text clicked on the result page keep
-    the real title.  The hyphen goes after canonicalization, whose CJK rule
-    would otherwise delete the space again ("山-水" must not become "山水").
+    CNKI's search box reads ``-`` as NOT and ``+`` as OR whether or not spaces
+    surround them; its own update notice on the result page lists
+    ``*（与）、+（或）、-（非）``.  A title search for "HIF-1α对缺血性结肠炎…"
+    therefore runs as "HIF" NOT "1α对缺血性结肠炎…" and can never return the
+    paper, whose own title holds the excluded words: on 2026-08-20 all four
+    saved title searches with a hyphen missed their paper, and the one for
+    "基于全二维气相色谱-飞行时间质谱…" left out a paper newer than every row it
+    showed.  One for "“互联网+”为什么加出了业绩" runs as "“互联网" OR
+    "”为什么加出了业绩", newest first: on 2026-09-22 all eight title requests
+    for that 2018 paper came back without it, and none of them on CNKI's empty
+    page.  Each hyphen and each ``+`` -- a full-width "－" or "＋" too, which the
+    NFKC in canonicalization folds into ASCII -- is sent as a space instead, so
+    both sides stay words of the one search.  A space in a one-box search
+    requires every word (adding one to a spaced full-text search on 2026-08-17
+    cut its hits), though no title search has been sent that way yet.  This is
+    the query only: the identity lock, the result filter and the text clicked
+    on the result page keep the real title.  Both go after canonicalization,
+    whose CJK rule would otherwise delete the space again ("山-水" must not
+    become "山水", nor "互联网+为什么" "互联网为什么").
     """
 
     term = _canonicalize_cnki_exact_query(title)
-    if "-" not in term:
+    if "-" not in term and "+" not in term:
         return term
-    return " ".join(term.replace("-", " ").split())
+    return " ".join(term.replace("-", " ").replace("+", " ").split())
 
 
 def _canonicalize_cnki_title_identity(value: str) -> str:
@@ -2738,9 +2746,10 @@ class CNKIAdapter(LiteratureSourceAdapter):
         original_search = self._search_inputs.get(record.search_query)
         if fresh_record is None and original_search is not None and original_search[0] != "exact_title":
             # Some CNKI titles are unreachable by an exact-title query even though
-            # the record exists -- e.g. "“互联网+”为什么加出了业绩", where the
-            # nested quotes around "+" return zero hits.  When the record was
-            # found by a different search, refresh once with that same search.
+            # the record exists -- e.g. "“互联网+”为什么加出了业绩" while its "+"
+            # still reached CNKI as OR: the page filled with newer 互联网 titles
+            # (not zero hits, as first thought).  When the record was found by a
+            # different search, refresh once with that same search.
             # The relock rule is unchanged: identity_matches must still hold.
             mode, term = original_search
             await self.browser.execute(NavigateCommand(self.build_search_url(term, mode=mode)))
