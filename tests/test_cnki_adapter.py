@@ -220,9 +220,11 @@ class CNKIParserTests(unittest.TestCase):
         self.assertIn("korder=AU", url)
         self.assertEqual(kw_as_cnki_reads_it(url), "John A. Smith")
 
-    def test_a_search_without_a_space_sends_the_same_url_as_before(self) -> None:
-        # If this fails, the change reached past spaces, and searches that already worked --
-        # exact titles, author names and keywords alike -- now send CNKI a different request.
+    def test_a_search_without_a_space_or_a_title_hyphen_sends_the_same_url_as_before(self) -> None:
+        # If this fails, the change reached past spaces and title hyphens, and searches that
+        # already worked -- exact titles, author names and keywords alike -- now send CNKI a
+        # different request.  (A hyphen in a title search is the other deliberate change; the
+        # HIF-1α title that used to sit here never found its paper, see the hyphen tests below.)
         cases = (
             ("keyword", "SU", "城市轨道交通"),
             ("keyword", "SU", "A/B?C&D=E#F%G：H"),
@@ -230,7 +232,7 @@ class CNKIParserTests(unittest.TestCase):
             ("exact_title", "TI", "城市轨道交通客流预测——基于深度学习的方法"),
             ("exact_title", "TI", "高速铁路:网络演化与区域可达性"),
             ("exact_title", "TI", "“互联网+”为什么加出了业绩"),
-            ("exact_title", "TI", "HIF-1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制"),
+            ("exact_title", "TI", "云南省德宏州2014—2025年间日疟复发趋势分析"),
         )
         for mode, order, query in cases:
             with self.subTest(mode=mode, query=query):
@@ -238,6 +240,63 @@ class CNKIParserTests(unittest.TestCase):
                     CNKIAdapter.build_search_url(query, mode=mode),
                     f"https://kns.cnki.net/kns8s/defaultresult/index?korder={order}&kw={quote_plus(query)}",
                 )
+
+    def test_a_hyphen_in_an_exact_title_reaches_cnki_as_a_space_not_as_not(self) -> None:
+        # If this fails, CNKI's search box again reads the hyphen as NOT.  Each of these four
+        # titles was searched that way on 2026-08-20 and none returned its paper -- which it
+        # never can, because the paper's own title holds the excluded words.  "山-水" came back
+        # as 1,960,998 records that all contain 山 and none 池 or 湖, as "山 NOT 池 NOT 湖" would.
+        cases = (
+            (
+                "“山-水”“山-池-宅”“山-湖-城”——空性、气韵之于绘画、园林与城市",
+                "“山 水”“山 池 宅”“山 湖 城”——空性、气韵之于绘画、园林与城市",
+            ),
+            (
+                "HIF-1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制",
+                "HIF 1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制",
+            ),
+            (
+                "基于全二维气相色谱-飞行时间质谱的不同质量等级浓酱兼香型白酒挥发性风味物质差异分析",
+                "基于全二维气相色谱 飞行时间质谱的不同质量等级浓酱兼香型白酒挥发性风味物质差异分析",
+            ),
+            (
+                "基于脊髓背角TSP-4/α2δ-1表达变化探讨电针缓解神经病理性疼痛的机制",
+                "基于脊髓背角TSP 4/α2δ 1表达变化探讨电针缓解神经病理性疼痛的机制",
+            ),
+        )
+        for title, sent in cases:
+            with self.subTest(title=title):
+                url = CNKIAdapter.build_search_url(title, mode="exact_title")
+                self.assertIn("korder=TI", url)
+                self.assertEqual(kw_as_cnki_reads_it(url), sent)
+
+    def test_a_fullwidth_hyphen_in_an_exact_title_does_not_reach_cnki_as_not_either(self) -> None:
+        # If this fails, a title written with a full-width "－" still reaches CNKI as NOT: the
+        # exact-title canonicalization (NFKC) turns it into "-" before the query is sent.
+        url = CNKIAdapter.build_search_url("山东典型丘陵区土壤－玉米系统重金属迁移富集规律", mode="exact_title")
+        self.assertEqual(kw_as_cnki_reads_it(url), "山东典型丘陵区土壤 玉米系统重金属迁移富集规律")
+
+    def test_a_spaced_hyphen_in_an_exact_title_leaves_a_single_space(self) -> None:
+        # If this fails, "A - B" reaches CNKI as a run of spaces, a form no saved search shows.
+        url = CNKIAdapter.build_search_url("Urban rail transit - Evidence from Chinese cities", mode="exact_title")
+        self.assertEqual(kw_as_cnki_reads_it(url), "Urban rail transit Evidence from Chinese cities")
+
+    def test_author_and_keyword_searches_still_send_a_hyphen_as_typed(self) -> None:
+        # If this fails, sending a hyphen as a space has spread past title searches.  On
+        # 2026-09-24 the user chose to change title searches only; widening it is their call.
+        for mode, query in (("author", "Jean-Pierre Dupont"), ("keyword", "COVID-19 城市轨道交通客流")):
+            with self.subTest(mode=mode):
+                self.assertEqual(kw_as_cnki_reads_it(CNKIAdapter.build_search_url(query, mode=mode)), query)
+
+    def test_the_identity_lock_still_compares_the_real_hyphenated_title(self) -> None:
+        # If this fails, the search form leaked into the identity lock: a record whose title has
+        # a space where the requested title has a hyphen would pass as the same paper.
+        title = "HIF-1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制"
+        requested = LiteratureRecord(paper_id="requested", title=title)
+        same = LiteratureRecord(paper_id="same", title=title)
+        spaced = LiteratureRecord(paper_id="spaced", title=title.replace("-", " "))
+        self.assertTrue(CNKIAdapter.identity_matches(requested, same)[0])
+        self.assertEqual(CNKIAdapter.identity_matches(requested, spaced), (False, "Target title mismatch"))
 
     def test_exact_title_relock_rejects_subtitle_mismatch(self) -> None:
         left = LiteratureRecord(paper_id="left", title="A——基于中国上市公司的研究")
@@ -1205,6 +1264,38 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(command, NavigateCommand) and "korder=TI" in command.url
         ]
         self.assertEqual([kw_as_cnki_reads_it(url) for url in searches], [title, title])
+
+    async def test_an_exact_title_with_a_hyphen_is_searched_and_relocked_without_a_not(self) -> None:
+        # If this fails, acquire / acquire-batch or the relock before download again send CNKI
+        # "基于全二维气相色谱" NOT "飞行时间质谱的...": on 2026-08-20 that search left out this very
+        # paper although it was newer than every row CNKI showed.  The result rows are still
+        # read, filtered and clicked by the real title, hyphen included.
+        title = "基于全二维气相色谱-飞行时间质谱的不同质量等级浓酱兼香型白酒挥发性风味物质差异分析"
+        neighbour = "基于全二维气相色谱-飞行时间质谱联用技术的聚乙烯热解油分子结构表征"
+        page = f"""
+        <html><head><title>检索-中国知网</title></head><body>
+          <main><div>共找到 2 条结果</div>
+            <a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=SYLH202606011">{neighbour}</a>
+            <a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=ZGNZ202607012">{title}</a>
+          </main>
+        </body></html>
+        """
+        browser = self._RoutedBrowser({"TI": [page]})
+        adapter = CNKIAdapter(browser)
+        records = await adapter.search(f'"{title}"', self._request(title))
+        self.assertEqual([record.title for record in records], [title])
+        with patch("hunnu_harness.literature.adapters.cnki._CNKI_CLICK_RETRY_DELAY_SECONDS", 0):
+            await adapter.open_result(records[0])
+        self.assertEqual(self._korders(browser), ["TI", "TI"])
+        searches = [
+            command.url
+            for command in browser.commands
+            if isinstance(command, NavigateCommand) and "korder=TI" in command.url
+        ]
+        sent = "基于全二维气相色谱 飞行时间质谱的不同质量等级浓酱兼香型白酒挥发性风味物质差异分析"
+        self.assertEqual([kw_as_cnki_reads_it(url) for url in searches], [sent, sent])
+        click = next(command for command in reversed(browser.commands) if isinstance(command, ClickCommand))
+        self.assertEqual(click.target.text, title)
 
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):

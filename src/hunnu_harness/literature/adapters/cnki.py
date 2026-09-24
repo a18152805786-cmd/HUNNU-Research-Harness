@@ -185,6 +185,28 @@ def _canonicalize_cnki_exact_query(value: str) -> str:
     return _normalize_cnki_plain_title_spacing(value)
 
 
+def _cnki_title_search_term(title: str) -> str:
+    """Return the ``kw`` term for a CNKI title search, with no hyphen in it.
+
+    CNKI's search box reads ``-`` as NOT whether or not spaces surround it; its
+    own update notice on the result page lists ``*（与）、+（或）、-（非）``.  A
+    title search for "HIF-1α对缺血性结肠炎…" therefore runs as "HIF" NOT
+    "1α对缺血性结肠炎…" and can never return the paper, whose own title holds
+    the excluded words.  On 2026-08-20 all four saved title searches with a
+    hyphen missed their paper; the one for "基于全二维气相色谱-飞行时间质谱…"
+    left out a paper newer than every row it showed.  Each hyphen is sent as a
+    space instead, so both sides stay words of the one search.  This is the
+    query only: the identity lock and the text clicked on the result page keep
+    the real title.  The hyphen goes after canonicalization, whose CJK rule
+    would otherwise delete the space again ("山-水" must not become "山水").
+    """
+
+    term = _canonicalize_cnki_exact_query(title)
+    if "-" not in term:
+        return term
+    return " ".join(term.replace("-", " ").split())
+
+
 def _canonicalize_cnki_title_identity(value: str) -> str:
     """Normalize a page-observed bibliographic title without fuzzy matching.
 
@@ -927,7 +949,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
     @classmethod
     def build_search_url(cls, query: str, *, mode: str = "keyword") -> str:
         order = {"exact_title": "TI", "title": "TI", "author": "AU", "keyword": "SU"}.get(mode, "SU")
-        query_value = _canonicalize_cnki_exact_query(query) if mode in {"exact_title", "title"} else query
+        query_value = _cnki_title_search_term(query) if mode in {"exact_title", "title"} else query
         return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={_encode_cnki_kw_value(query_value)}"
 
     @classmethod
