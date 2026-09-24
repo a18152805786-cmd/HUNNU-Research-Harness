@@ -1467,15 +1467,16 @@ class CNKIAdapter(LiteratureSourceAdapter):
         """One kns8s search over academic journals only, in one field.
 
         ``crossids`` is the resource set CNKI's home page sends; ``YSTT4HG0``
-        alone is 学术期刊.  The term goes through ``quote``, not ``quote_plus``:
-        CNKI keeps a ``+`` in ``kw`` literally (the saved result pages show
-        ``A+B`` as the executed query for a title sent as ``A B``), so a space
-        must arrive as ``%20`` to reach the search box as a space.
+        alone is 学术期刊.  The term is encoded like every other ``kw``, by
+        ``_encode_cnki_kw_value``: CNKI keeps a ``+`` in ``kw`` literally (the
+        saved result pages show ``A+B`` as the executed query for a title sent
+        as ``A B``), so a space must arrive as ``%20`` to reach the search box
+        as a space.
         """
 
         return (
             f"{cls.search_origin}/kns8s/defaultresult/index?crossids={_CNKI_JOURNAL_CLASSID}"
-            f"&korder={field}&kw={quote(term, safe='')}"
+            f"&korder={field}&kw={_encode_cnki_kw_value(term)}"
         )
 
     @classmethod
