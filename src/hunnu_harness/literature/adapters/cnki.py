@@ -9,7 +9,7 @@ import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote_plus, urljoin, urlsplit
 
 from ...browser.commands import (
     BrowserCommandError,
@@ -139,6 +139,21 @@ def _decode_cnki_form_query_value(value: str) -> str:
     return html_lib.unescape(unquote_plus(str(value)))
 
 
+def _encode_cnki_kw_value(value: str) -> str:
+    """Percent-encode a search term for CNKI's ``kw`` URL parameter.
+
+    CNKI does not form-decode ``kw``: a ``+`` sent for a space reaches the
+    executed query as a literal ``+`` (its own record of the query on a saved
+    result page reads ``广集众智+广谋良策+广聚共识``), and CNKI's query syntax
+    treats that ``+`` as OR -- a Latin-name title sent that way matched 29,918
+    unrelated records.  A space therefore goes as ``%20``.  Every other
+    character encodes exactly as it did under ``quote_plus``, so a term without
+    a space still produces the same URL.
+    """
+
+    return quote(value, safe="")
+
+
 def _normalize_cnki_plain_title_spacing(value: str) -> str:
     """Remove only nonsemantic spacing introduced around CNKI title markup."""
 
@@ -163,9 +178,8 @@ def _canonicalize_cnki_exact_query(value: str) -> str:
 
     This is deliberately a query-input operation, not a URL decoder. It
     removes only nonsemantic whitespace observed around nested highlighted
-    fragments, enumeration commas, and dash forms in CNKI titles, so
-    ``quote_plus`` cannot turn those layout differences into literal ``+``
-    characters in CNKI's search box.
+    fragments, enumeration commas, and dash forms in CNKI titles, so those
+    layout differences never reach CNKI's search box as part of the title.
     """
 
     return _normalize_cnki_plain_title_spacing(value)
@@ -914,7 +928,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
     def build_search_url(cls, query: str, *, mode: str = "keyword") -> str:
         order = {"exact_title": "TI", "title": "TI", "author": "AU", "keyword": "SU"}.get(mode, "SU")
         query_value = _canonicalize_cnki_exact_query(query) if mode in {"exact_title", "title"} else query
-        return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={quote_plus(query_value)}"
+        return f"{cls.search_origin}/kns8s/defaultresult/index?korder={order}&kw={_encode_cnki_kw_value(query_value)}"
 
     @classmethod
     def parse_search_results_html(
