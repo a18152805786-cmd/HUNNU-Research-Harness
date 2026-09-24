@@ -29,14 +29,25 @@ class CliReport:
     def note(self, text: str) -> None:
         self._emissions.append((None, text, text))
 
+    def payload(self) -> dict[str, Any]:
+        """The JSON-mode document, built without printing anything.
+
+        A caller that runs a command in-process (``acquire-batch`` running
+        each item through the single-paper path) reads the item's report here
+        instead of parsing captured stdout.
+        """
+
+        payload: dict[str, Any] = {
+            key: value for key, value, _plain in self._emissions if key is not None
+        }
+        payload["HumanNotes"] = [
+            value for key, value, _plain in self._emissions if key is None
+        ]
+        return payload
+
     def flush(self) -> None:
         if self.as_json:
-            payload: dict[str, Any] = {
-                key: value for key, value, _plain in self._emissions if key is not None
-            }
-            payload["HumanNotes"] = [
-                value for key, value, _plain in self._emissions if key is None
-            ]
+            payload = self.payload()
             for key, value, _plain in self._emissions:
                 if key is None:
                     print(value, file=sys.stderr)

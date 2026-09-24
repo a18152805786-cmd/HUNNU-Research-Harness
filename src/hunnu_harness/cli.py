@@ -18,6 +18,16 @@ def _bool_plain(value: object) -> object:
     return str(value).lower() if isinstance(value, bool) else value
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {raw!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {raw!r}")
+    return value
+
+
 def _audit_report(args: argparse.Namespace, audit_items: dict) -> CliReport:
     report = CliReport(bool(getattr(args, "json", False)))
     for key, value in audit_items.items():
@@ -232,6 +242,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to hold the page for a person to clear a challenge (springerlink only)",
     )
 
+    acquire_batch = sub.add_parser(
+        "acquire-batch",
+        help=(
+            "Run a queue of up to 25 papers through `acquire`, one after another, in the "
+            "running Research Chrome; stops at the first manual gate and resumes when rerun"
+        ),
+    )
+    acquire_batch.add_argument(
+        "--queue",
+        type=Path,
+        required=True,
+        help='Queue JSON: {"BatchName": "...", "Items": [{"Source": "cnki", "Title": "..."}, '
+        '{"Source": "springerlink", "DOI": "..."}]}',
+    )
+    acquire_batch.add_argument(
+        "--batch-root",
+        type=Path,
+        default=None,
+        help="State and per-item runs (default: Output Root/runs/AcquireBatch/<BatchName>)",
+    )
+    acquire_batch.add_argument(
+        "--confirm-budget",
+        action="store_true",
+        help=(
+            "The user has confirmed fetching more than 10 papers from this queue "
+            "(AGENTS.md Rule 41); never pass it on your own judgement"
+        ),
+    )
+    acquire_batch.add_argument(
+        "--daily-limit",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Override the daily publisher fetch total for every item (default 15; also "
+            "HUNNU_HARNESS_DAILY_FETCH_LIMIT); this is your account's quota knob"
+        ),
+    )
+    acquire_batch.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan only: validate the queue, check the library and budget; no browser, no files",
+    )
+
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
@@ -406,6 +459,10 @@ def main(argv: list[str] | None = None) -> int:
         from .literature.cli import main as literature_main
 
         return literature_main(_acquire_to_literature_argv(args))
+    if args.command == "acquire-batch":
+        from .literature.acquire_batch import run_batch_cli
+
+        return run_batch_cli(args)
     if args.command == "agent-route":
         from .agent_entrypoint import route_from_cli_args
 

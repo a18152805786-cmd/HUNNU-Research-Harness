@@ -6,13 +6,16 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from ..browser.playwright_backend import (
     PlaywrightBrowser,
     PlaywrightUnavailable,
     ProfileLockedError,
+    ResearchChromeNotRunning,
     discover_chrome_executable,
 )
+from ..browser.research_chrome_lock import ResearchChromeBusy
 from ..cli_output import CliReport, attach_json_flag
 from ..exit_codes import (
     EXIT_BUDGET_EXHAUSTED,
@@ -42,6 +45,16 @@ from .workflow import (
 
 
 DEFAULT_PROFILE = Path.home() / "ResearchHarness" / "chrome-profile"
+
+
+def _live_adapter_type(command: str) -> Any:
+    # Resolved when called, so the module's adapter names stay the one seam.
+    return {
+        "live-cnki": CNKIAdapter,
+        "live-springerlink": SpringerLinkAdapter,
+        "live-sciencedirect": ScienceDirectAdapter,
+        "live-oxfordacademic": OxfordAcademicAdapter,
+    }[command]
 
 
 def _default_profile() -> Path:
@@ -232,7 +245,40 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _run_live(args: argparse.Namespace) -> int:
     report = CliReport(bool(getattr(args, "json", False)))
-    request = _request_from_args(args)
+    exit_code, _result = await _run_live_into(args, report)
+    report.flush()
+    return exit_code
+
+
+async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[int, Any]:
+    """Run one live acquisition, reporting into ``report`` without printing it.
+
+    Returns the graded exit code and the workflow result (``None`` when the
+    run stopped before the workflow produced one).  ``acquire-batch`` runs
+    every queue item through here, so an item gets exactly the single-paper
+    path -- the same pacing, fetch ledger, identity lock, validation, archive
+    and exit ladder -- rather than a second implementation of it.
+    """
+
+    try:
+        request = _request_from_args(args)
+    except (TypeError, ValueError) as exc:
+        # A request that fails validation (an unknown ResourceType, say) is a
+        # graded refusal like any other, never a traceback.  No browser yet.
+        report.put("Status", "INVALID_REQUEST")
+        report.put("Reason", str(exc))
+        return EXIT_RUN_FAILED, None
+    adapter_type = _live_adapter_type(args.command)
+    if request.restricted_search and not getattr(adapter_type, "supports_restricted_search", False):
+        # Searching anyway would return unrestricted results under a restricted
+        # request.  Refused before the Research Chrome is touched.
+        report.put("Status", "UNSUPPORTED_CAPABILITY")
+        report.put(
+            "MissingCapability",
+            f"{adapter_type.name} cannot confine a search to ResourceType/SourceJournals; "
+            "restricted search is implemented for CNKI only",
+        )
+        return EXIT_RUN_FAILED, None
     staging = Path(args.run_root) / "downloads" / "staging"
     browser = PlaywrightBrowser(
         profile_dir=args.profile,
@@ -240,15 +286,11 @@ async def _run_live(args: argparse.Namespace) -> int:
         executable_path=args.chrome,
         headless=args.headless,
         human_wait_seconds=float(getattr(args, "human_wait", 0.0) or 0.0),
+        require_attach=bool(getattr(args, "require_attached_browser", False)),
     )
+    adapter = None
     try:
         await browser.start()
-        adapter_type = {
-            "live-cnki": CNKIAdapter,
-            "live-springerlink": SpringerLinkAdapter,
-            "live-sciencedirect": ScienceDirectAdapter,
-            "live-oxfordacademic": OxfordAcademicAdapter,
-        }[args.command]
         adapter = adapter_type(browser)
         # The write-ahead fetch budget refuses a repeat by default; the flag is
         # the explicit, per-run override and is recorded on the attempt row.
@@ -276,13 +318,17 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", str(exc))
         report.put("ProfileModified", False, plain="false")
-        report.flush()
-        return EXIT_ENV_NOT_READY
+        return EXIT_ENV_NOT_READY, None
+    except (ResearchChromeBusy, ResearchChromeNotRunning) as exc:
+        # Nothing touched the browser: the lock is taken, and the attach-only
+        # check made, before the first browser command.
+        report.put("Status", "SOURCE_UNAVAILABLE")
+        report.put("Reason", str(exc))
+        return EXIT_ENV_NOT_READY, None
     except PlaywrightUnavailable as exc:
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", str(exc))
-        report.flush()
-        return EXIT_CAPABILITY_MISSING
+        return EXIT_CAPABILITY_MISSING, None
     except LiteratureSourceError as exc:
         # Setup-phase source errors (an unresolved institutional route, a
         # source-side stop before the workflow loop) must honor the same
@@ -292,16 +338,14 @@ async def _run_live(args: argparse.Namespace) -> int:
         status = getattr(exc, "status", RunStatus.SOURCE_UNAVAILABLE)
         report.put("Status", status.value)
         report.put("Reason", str(exc))
-        report.flush()
         if status in {RunStatus.ACTION_REQUIRED_USER_LOGIN, RunStatus.ACTION_REQUIRED_USER_DOWNLOAD}:
-            return EXIT_HUMAN_ACTION_REQUIRED
-        return EXIT_ENV_NOT_READY
+            return EXIT_HUMAN_ACTION_REQUIRED, None
+        return EXIT_ENV_NOT_READY, None
     except Exception as exc:
         reason = f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:300]
         report.put("Status", "SOURCE_UNAVAILABLE")
         report.put("Reason", reason)
-        report.flush()
-        return EXIT_ENV_NOT_READY
+        return EXIT_ENV_NOT_READY, None
     finally:
         # Read the browser's own account of what it did before tearing it down.
         # An Agent that has to infer this from missing output gets it wrong:
@@ -329,6 +373,27 @@ async def _run_live(args: argparse.Namespace) -> int:
     report.put("Status", result.status.value)
     report.put("Results", len(result.records))
     report.put("Downloads", len(result.downloads))
+    if request.restricted_search:
+        # Whether CNKI demonstrably searched what was asked, per query, and
+        # what was discarded -- so "Results" is never read as filtered when
+        # the page could not confirm it.
+        requested = {
+            "ResourceType": request.resource_type,
+            "SourceJournals": list(request.source_journals),
+            "YearStart": request.year_start,
+            "YearEnd": request.year_end,
+        }
+        outcomes = adapter.search_restriction_reports() if adapter is not None else []
+        report.put(
+            "SearchRestriction",
+            requested,
+            plain=json.dumps(requested, ensure_ascii=False, sort_keys=True),
+        )
+        report.put(
+            "SearchRestrictionOutcome",
+            outcomes,
+            plain=json.dumps(outcomes, ensure_ascii=False, sort_keys=True),
+        )
     budget_refusals = sum(
         1
         for record in result.records
@@ -354,8 +419,7 @@ async def _run_live(args: argparse.Namespace) -> int:
         report.note(
             "Click the Chrome PDF Viewer native Download button once; Harness will ingest the new file."
         )
-    report.flush()
-    return _live_exit_code(result, budget_refusals)
+    return _live_exit_code(result, budget_refusals), result
 
 
 def _live_exit_code(result: Any, budget_refusals: int) -> int:

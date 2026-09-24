@@ -77,6 +77,40 @@ v0.1 的端到端验收（`HarnessV01CNRDSTestPassed=true`）：在用户人工�
 
 `--source` 可选 `sciencedirect`、`springerlink`、`cnki`、`oxfordacademic`；目标用 `--title`、`--doi` 或 `--request-json` 指定。退出码 2 表示需要人（登录、人工下载或人工判断），这时停下交还用户（AGENTS.md 规则 72），不要转去同一机构会话的另一个来源。
 
+**受限检索（只找学术期刊、只找指定刊物、只找指定年份；目前仅 CNKI，规则 39）。** 在请求 JSON 里加可选字段：`ResourceType`（只接受 `JournalArticle`，其他值直接判为无效请求）、`SourceJournals`（最多 8 个刊名，给了刊名即视为 `JournalArticle`）、`YearStart`/`YearEnd`（也可写 `YearFrom`/`YearTo`，两种写法数值不一致则拒绝）。受限请求里的年份对每条结果强制生效，不再只是筛选时扣分：
+
+```powershell
+.venv\Scripts\hunnu-harness.exe acquire --source cnki --request-json restricted.json --json
+```
+
+```json
+{
+  "OriginalResearchRequest": "2019-2026年《示例学刊》《样本评论》中的示例议题研究（写法样本）",
+  "SourceJournals": ["示例学刊", "样本评论"],
+  "YearStart": 2019,
+  "YearEnd": 2026,
+  "KeywordsCN": ["示例议题", "示例概念"],
+  "MaxSearchResults": 20,
+  "MaxResultsPerSource": 20,
+  "MaxDownloads": 0,
+  "MaxDownloadsPerRun": 0
+}
+```
+
+CNKI 的一框式检索一次只检一个字段，所以指定刊名时按「文献来源」逐刊检索（每刊一次，照常经检索限速台账排队），主题词交给筛选打分，不塞进检索式；只给 `ResourceType` 时按「主题」检索。每次检索都带 `crossids=YSTT4HG0`（只检学术期刊），并且只读第一页结果。结果返回前，页面自己的 `briefRequest` 必须写明 CNKI 确实只检了学术期刊、执行的正是这条检索式，每条结果的「数据库」栏也必须是「期刊」；做不到就以 `CNKI_RESTRICTION_UNCONFIRMED` / `CNKI_RESTRICTION_NOT_APPLIED` 结束这一条，不把该页任何结果当作受限结果返回，本次运行也不再发出后续检索。其他刊物、年份范围外的条目会被丢弃并计数。`acquire` 输出里的 `SearchRestrictionOutcome`、run 目录下 `SEARCH_QUERY_LOG.csv` 的 `RestrictionOutcome` 与 `audit\LITERATURE_EVENTS.jsonl` 逐条记录确认依据、保留与丢弃数量和本页覆盖的年份。CNKI 默认按发表时间倒序，第一页够不到的年份会返回 0 条并在备注里说明——这不能当作「该刊没有这类文章」的证据。受限请求不能与 `ExactTitles`、`DOIs`、`Authors` 同用；其他来源遇到受限请求在启动浏览器前就拒绝（`UNSUPPORTED_CAPABILITY`，退出码 1）。
+
+**批量队列（`acquire-batch`，规则 75）。** 多篇论文写进一个队列文件，由一个进程一篇接一篇地跑完，每篇走的都是上面 `acquire` 的同一条路径（限速、写前记账、身份锁、校验、SHA-256、manifest、归档、分类都不变）：
+
+```powershell
+.venv\Scripts\hunnu-harness.exe browser-start                                   # 批量只附着已运行的 Research Chrome，绝不自启
+.venv\Scripts\hunnu-harness.exe acquire-batch --queue queue.json --dry-run      # 先规划：校验队列、跳过库里已有的、看额度
+.venv\Scripts\hunnu-harness.exe acquire-batch --queue queue.json                # 真跑；停下后原样再跑一次即续跑
+```
+
+队列文件格式：`{"BatchName": "Example_Batch_01", "Items": [{"Source": "cnki", "Title": "..."}, {"Source": "springerlink", "DOI": "10.1007/..."}]}`，每项只给 `Title` 或 `DOI` 之一，可选 `ItemID`、`Note`。一个队列最多 25 篇（规则 62）；待下载超过 10 篇须在用户确认后加 `--confirm-budget`（规则 41）。遇到第一个人工闸门、出版商拒绝、当日总额用尽或环境失败，整队停下（退出码与单篇 `acquire` 相同）；连续 3 篇到了出版商却没拿到文件也停（退出码 1）。状态记在 `Output Root\runs\AcquireBatch\<BatchName>\BATCH_STATE.jsonl`，每篇的运行证据在同目录 `items\` 下；重跑时已有最终结果的条目（包括下载失败的，规则 71）一律跳过，被闸门挡住的那篇最先跑。批量从不传 `--allow-refetch`。
+
+**同一时间只允许一个采集进程。** 任何驱动 Research Chrome 的运行（`acquire`、批量队列、脚本里交给路由器的 `PlaywrightBrowser`）从浏览器启动到关闭都持有 `Output Root\audit\research_chrome.lock`，第二个进程会被拒绝（退出码 5）。原因：并行运行会共用同一个标签页、整个浏览器共用的下载目录，以及全局的限速台账。实测表明慢在 agent 每篇之间的来回（2026-09-23：63 分钟里 harness 只跑了约 9 分钟），不在单篇本身；已接近限速上限的脚本批量（2026-09-22：每篇中位数 104 秒）再加并发也快不了。并行的 agent 应该用在下载之后：读本地全文、抽证据、筛摘要。
+
 **多来源预检。** 显式无人值守的多来源请求先动态扫查全部计划来源、批量汇总人工认证闸门，并要求每个来源完成一次本会话授权下载、文件验证与目标身份锁定后，才签发 `UnattendedRunClearance=true`。
 
 **Agent 接入。** `agent-route` 为 agent 提供稳定的结构化请求路由与无网络 dry-run，详见 [AGENT_INTEGRATION.md](AGENT_INTEGRATION.md)。live 执行必须经 `AdapterExecutionBroker`，不能用裸 MCP 浏览器操作替代适配器。

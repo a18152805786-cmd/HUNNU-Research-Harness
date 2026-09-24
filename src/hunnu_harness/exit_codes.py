@@ -18,7 +18,9 @@ its way around a login wall or a spent budget.  These codes are that channel:
          Retrying without changing the environment will not help.
 
 Scope: ``hunnu-harness acquire`` (and the underlying ``live-*`` commands),
-``doctor`` and ``capabilities``.  Two older command families keep their
+``acquire-batch`` (the code of the item that stopped the batch; 1 also when it
+stopped after three items in a row without a file), ``doctor`` and
+``capabilities``.  Two older command families keep their
 documented, command-local codes: ``agent-route`` (0 routable / 2 needs a
 human decision -- compatible with this ladder's reading of 2) and the
 Navigator ``paper-*`` commands (their codes answer retrieval questions and

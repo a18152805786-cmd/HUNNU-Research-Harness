@@ -52,6 +52,32 @@ The result reports intent detection, selected existing sources, exact per-source
 }
 ```
 
+## Restricted literature search (CNKI)
+
+Three optional fields confine a literature search to "academic journal articles, from these named journals, published in these years":
+
+```json
+{
+  "TaskType": "literature_search",
+  "Query": "2019-2026 年《示例学刊》《样本评论》中的示例议题研究",
+  "PreferredSources": ["CNKI"],
+  "ResourceType": "JournalArticle",
+  "SourceJournals": ["示例学刊", "样本评论"],
+  "YearStart": 2019,
+  "YearEnd": 2026,
+  "KeywordsCN": ["示例议题", "示例概念"],
+  "MaxCandidates": 20
+}
+```
+
+- `ResourceType` accepts only `JournalArticle` (also `journal_article`, `学术期刊`); any other value is an `INVALID_REQUEST`, never an unrestricted search.
+- `SourceJournals` names at most 8 journals and implies `ResourceType=JournalArticle`. Names are searched as written (surrounding 《》 are removed); a name containing a quote or a control character is refused.
+- `YearStart`/`YearEnd` may also be spelled `YearFrom`/`YearTo`; two spellings with different years are refused. In a restricted request the years are enforced on every result; in an unrestricted one they remain a screening preference, as before.
+- A restriction cannot be combined with `ExactTitles`, `DOIs`, or `Authors` -- those lookups already name their target. `ExactTitles` can also come from quoted text in `Query`; pass `"ExactTitles": []` to clear them.
+- Only sources with `supports_restricted_search` (see `hunnu-harness capabilities`; today CNKI alone) can honour it. The router returns `UNSUPPORTED_CAPABILITY` when any selected source cannot, including sources chosen by `PreferredSources=auto`.
+
+How CNKI honours it: every query is one kns8s search with `crossids=YSTT4HG0` (学术期刊 only), in the 文献来源 field (`korder=LY`, one query per named journal) or, without named journals, the 主题 field (`korder=SU`). CNKI's one-box search takes one field per query, so topic terms in a `SourceJournals` request are left to screening rather than searched. Before any result is returned, the page's own hidden `briefRequest` must state that CNKI searched academic journals only and executed exactly that query, and every result row must be labelled 期刊. Otherwise the query ends with `CNKI_RESTRICTION_UNCONFIRMED` or `CNKI_RESTRICTION_NOT_APPLIED`, nothing from that page is returned, and no further search is sent in the run. Rows from another journal or outside the years are dropped and counted. Each query's `RestrictionOutcome` (scope evidence, rows kept and dropped, the years the page covered) is written to the run's `SEARCH_QUERY_LOG.csv` and `audit/LITERATURE_EVENTS.jsonl`, and `acquire` reports it as `SearchRestrictionOutcome`. Only the first result page is read, and CNKI's default order is newest first (`SortedBy` records the order the page used): a year range the first page never reaches returns no rows, and the note says so -- that is no evidence that the journal has no such articles.
+
 ## Public Official Web source
 
 `TaskType=official_web` routes to the separate registered chain

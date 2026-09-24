@@ -96,6 +96,10 @@ class ProfileLockedError(RuntimeError):
     pass
 
 
+class ResearchChromeNotRunning(RuntimeError):
+    """An attach-only run found no dedicated Research Chrome to attach to."""
+
+
 class PlaywrightBrowser:
     """Optional Playwright backend using a dedicated persistent profile."""
 
@@ -111,11 +115,18 @@ class PlaywrightBrowser:
         human_wait_seconds: float = 0.0,
         human_wait_poll_seconds: float = DEFAULT_HUMAN_WAIT_POLL_SECONDS,
         human_clear_confirmations: int = DEFAULT_HUMAN_CLEAR_CONFIRMATIONS,
+        require_attach: bool = False,
     ):
         self.profile_dir = _logical_path(profile_dir)
         self.downloads_dir = _logical_path(downloads_dir)
         self.executable_path = _logical_path(executable_path) if executable_path else None
         self.headless = headless
+        # A batch item must use the signed-in Research Chrome or not run at
+        # all: launching a fresh browser per item would start each one signed
+        # in to nothing, and relaunch Chrome once per paper.
+        self.require_attach = require_attach
+        # The Research Chrome lock this run holds between start() and close().
+        self._lock_path: Path | None = None
         self.interstitial_wait_seconds = interstitial_wait_seconds
         self.interstitial_poll_seconds = interstitial_poll_seconds
         self.human_wait_seconds = human_wait_seconds
@@ -167,6 +178,40 @@ class PlaywrightBrowser:
         _windows_io_path(self.profile_dir).mkdir(parents=True, exist_ok=True)
         _windows_io_path(self.downloads_dir).mkdir(parents=True, exist_ok=True)
 
+        # Taken before anything touches the browser: attaching alone points the
+        # browser-wide download directory at this run, which would already
+        # redirect the PDF of a run in flight (see research_chrome_lock).
+        from . import research_chrome_lock
+
+        self._lock_path = research_chrome_lock.acquire(self._lock_purpose())
+        try:
+            await self._start_holding_lock(async_playwright)
+        except BaseException:
+            self._release_research_chrome()
+            raise
+
+    def _lock_purpose(self) -> str:
+        """Which run holds the lock, without a user name or an absolute path."""
+
+        from ..paths import OUTPUT_ROOT, is_within
+
+        if is_within(self.downloads_dir, OUTPUT_ROOT):
+            try:
+                relative = self.downloads_dir.relative_to(_logical_path(OUTPUT_ROOT)).as_posix()
+                return f"browser run staging into Output Root/{relative}"
+            except ValueError:
+                pass
+        return f"browser run staging into {self.downloads_dir.name}"
+
+    def _release_research_chrome(self) -> None:
+        if self._lock_path is None:
+            return
+        from . import research_chrome_lock
+
+        lock_path, self._lock_path = self._lock_path, None
+        research_chrome_lock.release(lock_path)
+
+    async def _start_holding_lock(self, async_playwright: Any) -> None:
         # A persistent Research Chrome, if one is running, is preferred over a
         # fresh browser: it is holding the institutional session, and launching
         # a second browser on the same profile would both fail on the lock and
@@ -183,6 +228,13 @@ class PlaywrightBrowser:
             self.attached = True
             await self._direct_downloads_here()
             return
+
+        if self.require_attach:
+            raise ResearchChromeNotRunning(
+                "The dedicated Research Chrome is not running, and this run may only "
+                "attach to it. Start it with `hunnu-harness browser-start` (sign in "
+                "there if the institution asks), then run again."
+            )
 
         lock_files = tuple(_windows_io_path(self.profile_dir).glob("Singleton*"))
         if lock_files:
@@ -488,19 +540,22 @@ class PlaywrightBrowser:
         the Playwright driver, and Chrome carries on.
         """
 
-        if self.attached:
-            if self._playwright:
-                await self._playwright.stop()
-        else:
-            if self.context:
-                await self.context.close()
-            if self._playwright:
-                await self._playwright.stop()
-        self.context = None
-        self.page = None
-        self._playwright = None
-        self._browser = None
-        self.attached = False
+        try:
+            if self.attached:
+                if self._playwright:
+                    await self._playwright.stop()
+            else:
+                if self.context:
+                    await self.context.close()
+                if self._playwright:
+                    await self._playwright.stop()
+            self.context = None
+            self.page = None
+            self._playwright = None
+            self._browser = None
+            self.attached = False
+        finally:
+            self._release_research_chrome()
 
     async def click_text(self, text: str, *, exact: bool = True) -> None:
         if not self.page:
