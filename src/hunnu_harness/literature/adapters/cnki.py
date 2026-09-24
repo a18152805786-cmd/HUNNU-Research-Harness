@@ -1223,7 +1223,9 @@ def _carry_listing_metadata(listed: LiteratureRecord, detail: LiteratureRecord) 
     exact-title path never does, so it is untouched.  The identity lock has
     already compared both wherever the article page states its own (and on the
     saved 2026-08 pages they always agreed); the row fills only what the page
-    left unknown: online-first (CAPJ) article pages state neither.
+    left unknown.  Online-first (CAPJ) and newspaper pages state both through
+    their own date label (``_cnki_stated_publication``); a page with no issue
+    citation and no single stated date states neither.
     """
 
     if _cnki_known(listed.journal) and not _cnki_known(detail.journal):
