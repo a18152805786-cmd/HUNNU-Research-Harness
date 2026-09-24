@@ -358,6 +358,52 @@ class CNKIParserTests(unittest.TestCase):
         self.assertTrue(CNKIAdapter.identity_matches(requested, same)[0])
         self.assertEqual(CNKIAdapter.identity_matches(requested, spaced), (False, "Target title mismatch"))
 
+    @staticmethod
+    def _rows(*anchors: str) -> str:
+        links = "".join(
+            f'<a class="fz14" href="/kcms2/article/abstract?dbcode=CJFD&amp;filename=SLTX2026040{index:02d}">{text}</a>'
+            for index, text in enumerate(anchors, 1)
+        )
+        return (
+            f"<html><head><title>检索-中国知网</title></head><body><main>"
+            f"<div>共找到 {len(anchors)} 条结果</div>{links}</main></body></html>"
+        )
+
+    def test_a_result_row_split_at_its_hyphen_or_plus_by_highlighting_reads_the_real_title(self) -> None:
+        # If this fails, a title search's own highlighting makes the result row read "站 - 城",
+        # "HIF - 1α" or "交通 +": the search sends the hyphen or plus as a space, so CNKI marks
+        # the words on either side separately, while the article page reads "站-城".  On
+        # 2026-09-24 the identity lock refused, as "Target title mismatch", a paper the
+        # search had found.
+        cases = (
+            (
+                '高速铁路“<font class="highlight">站</font>-<font class="highlight">城</font>”协同发展的空间效应研究',
+                "高速铁路“站-城”协同发展的空间效应研究",
+            ),
+            (
+                '<font class="highlight">HIF</font>-<font class="highlight">1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制</font>',
+                "HIF-1α对缺血性结肠炎小鼠巨噬细胞极化的影响机制",
+            ),
+            (
+                '“<font class="highlight">交通</font>+”<font class="highlight">旅游融合发展的路径研究</font>',
+                "“交通+”旅游融合发展的路径研究",
+            ),
+        )
+        records = CNKIAdapter.parse_search_results_html(self._rows(*(markup for markup, _ in cases)), query="x")
+        self.assertEqual([record.title for record in records], [title for _, title in cases])
+        for _, title in cases:
+            with self.subTest(title=title):
+                row = LiteratureRecord(paper_id="row", title=title.replace("-", " - ").replace("+", " +"))
+                article = LiteratureRecord(paper_id="article", title=title)
+                self.assertEqual(CNKIAdapter.identity_matches(row, article), (True, "Normalized title match"))
+
+    def test_spacing_around_a_hyphen_or_plus_in_a_title_with_no_chinese_is_kept(self) -> None:
+        # If this fails, the highlighting rule reached titles with no Chinese in them and
+        # joins a suspended hyphen ("Pre- and post-crisis") or a spaced "+" to the next word.
+        titles = ("Pre- and post-crisis lending in urban rail", "COVID - 19 and urban rail ridership", "A + B testing of rail fares")
+        records = CNKIAdapter.parse_search_results_html(self._rows(*titles), query="x")
+        self.assertEqual([record.title for record in records], list(titles))
+
     def test_exact_title_relock_rejects_subtitle_mismatch(self) -> None:
         left = LiteratureRecord(paper_id="left", title="A——基于中国上市公司的研究")
         right = LiteratureRecord(paper_id="right", title="A——基于中国制造业企业的研究")
@@ -1803,6 +1849,24 @@ class CNKISpacedNewspaperHeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record.full_text_accessible)
         self.assertTrue(_is_fulltext_acquisition_candidate(record))
 
+    async def test_an_exact_title_request_for_a_hyphenated_title_reaches_the_download_step(self) -> None:
+        # If this fails, `acquire --title` and every acquire-batch item for a title with a
+        # hyphen stop at "CNKI target identity lock failed: Target title mismatch", as one
+        # did on 2026-09-24: the search sends the hyphen as a space, and the result row,
+        # highlighted word by word, reads "站 - 城" where the article page reads "站-城".
+        title = "高速铁路“站-城”协同发展的空间效应研究"
+        highlighted = '高速铁路“<font class="highlight">站</font>-<font class="highlight">城</font>”协同发展的空间效应研究'
+        result = await self._run(
+            self._request(exact_titles=(title,)),
+            search_title=highlighted,
+            article_title=title,
+        )
+        self.assertEqual(result.errors, [])
+        [record] = result.records
+        self.assertEqual(record.title, title)
+        self.assertTrue(record.target_identity_confirmed)
+        self.assertTrue(_is_fulltext_acquisition_candidate(record))
+
     async def test_the_workflow_lock_by_itself_still_refuses_a_different_title(self) -> None:
         # If this fails, the workflow's own search/detail lock accepts a different paper
         # once the adapter's identity check is out of the way -- it no longer backs that
@@ -2454,7 +2518,10 @@ class CNKICitationCountLinkTests(unittest.IsolatedAsyncioTestCase):
             "5G与高速铁路通信研究",
         ]
         html = self._results_page(*((title, f"row-{index}", "") for index, title in enumerate(titles)))
-        self.assertEqual(self._titles(html), titles)
+        # The locant row is copied as a saved page printed it; the space before its hyphen is
+        # highlight layout, which the parser drops in a title with Chinese in it.
+        expected = [title.replace("4 -丁二醇", "4-丁二醇") for title in titles]
+        self.assertEqual(self._titles(html), expected)
 
     def test_a_citnet_link_is_rejected_even_when_its_text_is_not_a_bare_number(self) -> None:
         # If this fails, a citation link is recognised only by its text being a number, so

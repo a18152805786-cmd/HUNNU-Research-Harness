@@ -167,6 +167,14 @@ _CNKI_DASH_CHARS = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d"
 _CNKI_DASH_SPACE_RE = re.compile(rf"\s*([{_CNKI_DASH_CHARS}])\s*")
 _CNKI_CJK_JOIN_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 _CNKI_ENUMERATION_SPACE_RE = re.compile(r"\s*([、])\s*")
+# A title search sends "-" and "+" as spaces (``_cnki_title_search_term``), so
+# CNKI highlights the words on either side of one separately, and the result
+# row reads "站 - 城", "HIF - 1α" or "交通 +" where the article page reads
+# "站-城", "HIF-1α" and "交通+".  In a title with Chinese in it, spacing around
+# an ASCII hyphen or plus is layout; a title with no Chinese keeps it ("Pre-
+# and post-crisis").
+_CNKI_IDEOGRAPH_RE = re.compile(r"[㐀-鿿]")
+_CNKI_OPERATOR_SPACE_RE = re.compile(r"\s*([-+])\s*")
 _CNKI_MARKUP_PUNCT_SPACE_RE = re.compile(r'\s*([?!:：“”‘’「」『』《》〈〉【】〔〕（）])\s*')
 _CNKI_SUBTITLE_SEPARATOR_RE = re.compile(r"[:：](?=(?:基于|来自|关于|对))")
 
@@ -216,6 +224,8 @@ def _normalize_cnki_plain_title_spacing(value: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = _CNKI_CJK_JOIN_SPACE_RE.sub("", text)
     text = _CNKI_ENUMERATION_SPACE_RE.sub(r"\1", text)
+    if _CNKI_IDEOGRAPH_RE.search(text):
+        text = _CNKI_OPERATOR_SPACE_RE.sub(r"\1", text)
     return _CNKI_DASH_SPACE_RE.sub(r"\1", text)
 
 
