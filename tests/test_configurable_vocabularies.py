@@ -20,10 +20,16 @@ class ConfigurableVocabularyTests(unittest.TestCase):
     def test_packaged_defaults_are_loaded_and_keep_the_canary_match(self) -> None:
         # 20 -> 22 on 2026-09-23: macro_inflation and cultural_industry added so
         # works titled on inflation / the film market raise a confirmable topic.
-        self.assertEqual(len(lexicon.CONCEPTS), 22)
-        self.assertEqual(lexicon.CONCEPTS_BY_KEY["ai_washing"].terms[0], "ai washing")
+        # The packaged files themselves are read: an Output Root override replaces
+        # them by design, and a machine that has one must not turn this red.
+        with tempfile.TemporaryDirectory() as raw:
+            absent = Path(raw) / "no-override.json"
+            concepts = lexicon.load_concepts(override_path=absent)
+            aliases = taxonomy_aliases.load_taxonomy_aliases(override_path=absent)
+        self.assertEqual(len(concepts), 22)
+        self.assertEqual({concept.key: concept for concept in concepts}["ai_washing"].terms[0], "ai washing")
         self.assertTrue(any(match.key == "ai_washing" for match in lexicon.match_concepts("AI washing")))
-        self.assertIn("AI漂洗", taxonomy_aliases.ENGLISH_SUBTOPIC_ALIASES)
+        self.assertIn("AI漂洗", aliases)
 
     def test_a_single_user_lexicon_override_replaces_the_default(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
