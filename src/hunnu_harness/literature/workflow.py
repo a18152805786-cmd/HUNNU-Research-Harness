@@ -5,7 +5,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from ..paths import TEMP_DIR, _windows_io_path, is_within
 from .adapters.base import (
@@ -117,18 +117,24 @@ def _search_pacer_for_run(
 def _lock_search_result_to_detail(
     found: Iterable[LiteratureRecord],
     detail: LiteratureRecord,
+    *,
+    title_key: Callable[[str], str] = normalize_title,
 ) -> LiteratureRecord | None:
-    """Return one auditable search/detail identity match, preferring DOI."""
+    """Return one auditable search/detail identity match, preferring DOI.
+
+    ``title_key`` is ``normalize_title`` unless the live run's adapter is one
+    whose own parsers spell one title two ways (see ``_search_detail_title_key``).
+    """
 
     detail_doi = normalize_doi(detail.doi)
-    detail_title = normalize_title(detail.title)
+    detail_title = title_key(detail.title)
     for candidate in found:
         candidate_doi = normalize_doi(candidate.doi)
         if detail_doi != UNKNOWN and candidate_doi != UNKNOWN:
             if candidate_doi == detail_doi:
                 return candidate
             continue
-        if detail_title != UNKNOWN and normalize_title(candidate.title) == detail_title:
+        if detail_title != UNKNOWN and title_key(candidate.title) == detail_title:
             if (
                 candidate.year == UNKNOWN
                 or detail.year == UNKNOWN
@@ -136,6 +142,21 @@ def _lock_search_result_to_detail(
             ):
                 return candidate
     return None
+
+
+def _search_detail_title_key(adapter: LiteratureSourceAdapter) -> Callable[[str], str]:
+    """The title comparison the search/detail lock uses for ``adapter``.
+
+    Only the registered CNKI adapter -- by exact type, as the registry checks
+    it -- compares through its own result-page spacing rule.  Every other
+    adapter, a CNKIAdapter subclass included, keeps plain ``normalize_title``.
+    """
+
+    from .adapters.cnki import CNKIAdapter
+
+    if type(adapter) is CNKIAdapter:
+        return CNKIAdapter.search_detail_title_key
+    return normalize_title
 
 
 def _matches_requested_target_identity(
@@ -308,7 +329,11 @@ class LiteratureAcquisitionWorkflow:
                     try:
                         await self.adapter.open_result(search_record)
                         extracted = await self.adapter.extract_metadata(search_query=plan.query)
-                        if _lock_search_result_to_detail((search_record,), extracted) is None:
+                        if _lock_search_result_to_detail(
+                            (search_record,),
+                            extracted,
+                            title_key=_search_detail_title_key(self.adapter),
+                        ) is None:
                             raise SourceLayoutChanged(
                                 "Search/detail target identity lock failed before acquisition"
                             )

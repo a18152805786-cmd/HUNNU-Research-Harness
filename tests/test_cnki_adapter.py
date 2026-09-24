@@ -43,10 +43,16 @@ from hunnu_harness.literature.models import (
     LiteratureSearchRequest,
     PublicationStatus,
     RunStatus,
+    ScreeningDecision,
     UNKNOWN,
 )
 from hunnu_harness.literature.normalization import normalize_title, sha256_file
-from hunnu_harness.literature.workflow import finalize_captured_cnki_acceptance
+from hunnu_harness.literature.workflow import (
+    LiteratureAcquisitionWorkflow,
+    _is_fulltext_acquisition_candidate,
+    _search_detail_title_key,
+    finalize_captured_cnki_acceptance,
+)
 
 from literature_test_support import isolated_fetch_ledger, write_minimal_pdf
 
@@ -1077,6 +1083,145 @@ class CNKISearchSettlingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SourceLayoutChanged, "could not relock"):
             await adapter.open_result(records[0])
         self.assertEqual(self._korders(browser), ["SU", "TI", "SU"])
+
+
+class CNKISpacedNewspaperHeadlineTests(unittest.IsolatedAsyncioTestCase):
+    """Newspaper headlines that CNKI prints with spaces between their phrases.
+
+    The result-page parser drops whitespace between two CJK ideographs, while
+    the article parser keeps the h1's spacing, so one record reaches the
+    workflow's search/detail lock in two spellings.  Both fixtures are
+    synthetic; they mirror the structure of saved kns8s result rows and kcms2
+    CCND article pages.
+    """
+
+    HEADLINE = "凝聚发展共识  汇聚各方智慧  共谋开放新局"
+
+    class _SearchThenArticleBrowser:
+        """Serve the result page to every search and the article page to a detail URL."""
+
+        navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+        def __init__(self, search_html: str, article_html: str) -> None:
+            self.search_html = search_html
+            self.article_html = article_html
+            self.commands: list[object] = []
+            self.current_url = "about:blank"
+            self.session = SessionHandle("cnki-spaced-headline-test")
+            self.page_handle = PageHandle("main", session=self.session)
+
+        async def execute(self, command):
+            self.commands.append(command)
+            if isinstance(command, NavigateCommand):
+                self.current_url = command.url
+            elif not isinstance(command, ObserveCommand):
+                raise AssertionError(type(command).__name__)
+            on_article = "/kcms2/article/abstract" in self.current_url
+            return BrowserObservation(
+                session=self.session,
+                page=self.page_handle,
+                generation=len(self.commands),
+                url=self.current_url,
+                title="中国知网" if on_article else "检索-中国知网",
+                html=self.article_html if on_article else self.search_html,
+            )
+
+    @staticmethod
+    def _request(**identity) -> LiteratureSearchRequest:
+        return LiteratureSearchRequest(
+            original_research_request="CNKI newspaper headline printed with spaces",
+            max_search_results=1,
+            max_results_per_source=1,
+            max_downloads=0,
+            max_downloads_per_run=0,
+            **identity,
+        )
+
+    async def _run(
+        self,
+        request: LiteratureSearchRequest,
+        *,
+        search_title: str | None = None,
+        article_title: str | None = None,
+    ):
+        search_html = fixture("cnki_search_newspaper_spaced_headline.html")
+        article_html = fixture("cnki_article_newspaper_spaced_headline.html")
+        if search_title is not None:
+            search_html = search_html.replace(self.HEADLINE, search_title)
+        if article_title is not None:
+            article_html = article_html.replace(self.HEADLINE, article_title)
+        browser = self._SearchThenArticleBrowser(search_html, article_html)
+        with tempfile.TemporaryDirectory() as directory:
+            return await LiteratureAcquisitionWorkflow(
+                CNKIAdapter(browser),
+                run_root=Path(directory) / "run",
+                human_like_delay_seconds=0,
+                allow_outside_project_for_tests=True,
+            ).run(request)
+
+    async def test_a_headline_printed_with_spaces_between_its_phrases_passes_the_search_detail_lock(self) -> None:
+        # If this fails, every CNKI headline printed with spaces between its phrases
+        # stops at "Search/detail target identity lock failed before acquisition" --
+        # found by an author or keyword search as much as by its own exact title.
+        result = await self._run(self._request(authors=("作者甲",)))
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.status, RunStatus.SUCCESS)
+        [record] = result.records
+        self.assertEqual(record.error_status, UNKNOWN)
+        self.assertTrue(record.target_identity_confirmed)
+
+    async def test_an_exact_title_request_for_a_spaced_headline_as_cnki_prints_it_reaches_the_download_step(self) -> None:
+        # If this fails, `acquire --title` (and every acquire-batch item) cannot fetch a
+        # newspaper headline copied as CNKI prints it: the run ends before the access check.
+        result = await self._run(self._request(exact_titles=(self.HEADLINE,)))
+        self.assertEqual(result.errors, [])
+        [record] = result.records
+        self.assertTrue(record.target_identity_confirmed)
+        self.assertEqual(record.screening_decision, ScreeningDecision.KEEP.value)
+        self.assertTrue(record.full_text_accessible)
+        self.assertTrue(_is_fulltext_acquisition_candidate(record))
+
+    async def test_the_workflow_lock_by_itself_still_refuses_a_different_title(self) -> None:
+        # If this fails, the workflow's own search/detail lock accepts a different paper
+        # once the adapter's identity check is out of the way -- it no longer backs that
+        # check up, and a word, a subtitle, or Latin word spacing slips through it.
+        def adapter_check_always_agrees(_search_record, _detail_record):
+            return True, "patched: only the workflow lock is left"
+
+        cases = {
+            "one character": (None, "凝聚发展共识  汇聚各方智慧  共谋开放大局"),
+            "an added subtitle": (None, "凝聚发展共识  汇聚各方智慧  共谋开放新局——访示例专家"),
+            "a missing phrase": (None, "凝聚发展共识  汇聚各方智慧"),
+            "Latin word spacing": ("Open markets and on line trade", "Open markets and online trade"),
+        }
+        for label, (search_title, article_title) in cases.items():
+            with self.subTest(difference=label):
+                with patch.object(
+                    CNKIAdapter,
+                    "identity_matches",
+                    staticmethod(adapter_check_always_agrees),
+                ):
+                    result = await self._run(
+                        self._request(authors=("作者甲",)),
+                        search_title=search_title,
+                        article_title=article_title,
+                    )
+                [record] = result.records
+                self.assertFalse(record.target_identity_confirmed)
+                self.assertEqual(record.error_status, RunStatus.SOURCE_LAYOUT_CHANGED.value)
+                self.assertIn("Search/detail target identity lock failed", record.error_reason)
+
+    def test_only_the_registered_cnki_adapter_compares_titles_through_the_cnki_spacing_rule(self) -> None:
+        # If this fails, a substitute adapter -- a CNKIAdapter subclass included -- has its
+        # search/detail lock relaxed by CNKI's spacing rule instead of plain normalize_title.
+        class _Substitute(CNKIAdapter):
+            pass
+
+        cnki_key = _search_detail_title_key(CNKIAdapter(None))
+        self.assertEqual(cnki_key(self.HEADLINE), cnki_key(self.HEADLINE.replace(" ", "")))
+        for adapter in (_Substitute(None), ScienceDirectAdapter(None)):
+            with self.subTest(adapter=type(adapter).__name__):
+                self.assertIs(_search_detail_title_key(adapter), normalize_title)
 
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):

@@ -1545,6 +1545,20 @@ class CNKIAdapter(LiteratureSourceAdapter):
         return True, "Normalized title match"
 
     @staticmethod
+    def search_detail_title_key(title: str) -> str:
+        """The title the workflow's search/detail lock compares for CNKI.
+
+        The result parser drops whitespace between two CJK ideographs, which
+        newspaper headlines use to separate phrases (``甲乙  丙丁``), while the
+        article parser keeps the h1's spacing, so one record reaches the lock
+        in two spellings.  Both sides pass through the result parser's own
+        spacing rule before ``normalize_title``; a different character, a
+        subtitle, or the spacing between Latin words still has to match.
+        """
+
+        return normalize_title(_normalize_cnki_observed_title_spacing(title or ""))
+
+    @staticmethod
     def _search_input(query: str, request: LiteratureSearchRequest) -> tuple[str, str]:
         raw = query.strip()
         author_match = re.fullmatch(r'author:\s*"(.+?)"', raw, flags=re.IGNORECASE)
