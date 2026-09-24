@@ -28,6 +28,20 @@ from hunnu_harness.paths import (
 
 # The sealed audit numbers this corpus is frozen at.
 #
+# Resealed at 255/268/437 with 42 unique topics on 2026-09-24, from
+# 221/234/402 and 39, at the user's instruction.  Thirty-four works entered the
+# corpus for a reviewer's reading pack: thirty-three acquired through the
+# harness's publisher adapters on 2026-09-23/24 and one through library-import.
+# Six were auto-classified under one topic each (+6); twenty-eight carried no
+# topic and the user chose theirs, confirmed through library-confirm-topics
+# (HUMAN_CONFIRMED, +29).  Twenty-five of those fit no existing subtopic, so the
+# user added one domain of three subtopics to the taxonomy, with an Output Root
+# lexicon override whose terms let their titles raise it; that taxonomy change,
+# and nothing else, takes unique topics from 39 to 42.  One more work was filed
+# under a new subtopic its classification had not raised, through
+# --allow-taxonomy-override.  Nested variants stay 13.  The numbers are read from
+# LibraryFingerprinter().capture(), not derived.
+#
 # Resealed at 221/234/402 on 2026-09-23, from 198/211/364, at the user's
 # instruction.  Twenty-three works entered the corpus, all from 中国工业经济.
 # Twenty-two are the rest of a 2017-2023 mediation-analysis reading list the
@@ -106,12 +120,13 @@ from hunnu_harness.paths import (
 # any *further* drift fails, and moving them is a deliberate act rather than a
 # way to get a green suite.
 #
-# Unique topics stays 39 on purpose: every acquisition was filed under a topic
-# that already existed, and nothing here may create a fortieth.
-EXPECTED_WORKS = 221
-EXPECTED_VERSIONS = 234
-EXPECTED_TOPIC_ASSIGNMENTS = 402
-EXPECTED_UNIQUE_TOPICS = 39
+# Unique topics moves only when the user changes the taxonomy (39 until
+# 2026-09-24, 42 since): an acquisition is filed under a topic that already
+# exists, and nothing here may create one.
+EXPECTED_WORKS = 255
+EXPECTED_VERSIONS = 268
+EXPECTED_TOPIC_ASSIGNMENTS = 437
+EXPECTED_UNIQUE_TOPICS = 42
 
 # Known fixtures in the real corpus, verified during discovery.
 CAJ_WORK = "P23C61576ADCE"           # PDF + CAJ, and its files are named P6B4B9A7DE3F3.*
