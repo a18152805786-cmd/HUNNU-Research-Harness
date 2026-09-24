@@ -566,6 +566,17 @@ class CanonicalLibraryBacktestTests(unittest.TestCase):
         those numbers the same way the global precision floor does, and the
         run is repeated to prove the backtest is deterministic -- the numbers
         an alias edit is judged by must not wobble between runs.
+
+        The coverage floors were recalibrated on 2026-09-24, from 0.60 and
+        0.75, at the user's decision.  Over the 255-work corpus Chinese
+        coverage measured 0.590 (128/217) and English 0.684 (26/38), with
+        precision still 1.000 in both.  The classifier did not change: the
+        works held before that date measure exactly as they did (0.610 and
+        0.765).  Twenty-eight works had entered with a title and no keywords
+        and had their topics confirmed by a person; from the title alone the
+        classifier auto-files eight of them and sends the other twenty to
+        review, as designed.  Like the corpus seal, moving a floor is a
+        deliberate act recorded here, not a way to get a green suite.
         """
 
         from hunnu_harness.navigator.tokenize import contains_cjk
@@ -599,7 +610,7 @@ class CanonicalLibraryBacktestTests(unittest.TestCase):
         first = measure()
         self.assertEqual(first, measure(), "the backtest must be deterministic")
 
-        for lang, coverage_floor in (("cjk", 0.60), ("latin", 0.75)):
+        for lang, coverage_floor in (("cjk", 0.55), ("latin", 0.65)):
             bucket = first[lang]
             self.assertGreaterEqual(
                 bucket["auto"] / bucket["works"], coverage_floor, (lang, bucket)
