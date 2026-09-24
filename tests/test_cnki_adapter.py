@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from hunnu_harness.browser.commands import (
     BrowserCommandError,
@@ -21,7 +23,11 @@ from hunnu_harness.browser.commands import (
     PageHandle,
     SessionHandle,
 )
-from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceUnavailable
+from hunnu_harness.literature.adapters.base import (
+    SourceActionRequired,
+    SourceLayoutChanged,
+    SourceUnavailable,
+)
 from hunnu_harness.literature.adapters.cnki import (
     CNKIAdapter,
     _ACCESS_SETTLE_MAX_OBSERVATIONS,
@@ -1222,6 +1228,309 @@ class CNKISpacedNewspaperHeadlineTests(unittest.IsolatedAsyncioTestCase):
         for adapter in (_Substitute(None), ScienceDirectAdapter(None)):
             with self.subTest(adapter=type(adapter).__name__):
                 self.assertIs(_search_detail_title_key(adapter), normalize_title)
+
+
+class CNKISharedHeadlineRowTests(unittest.IsolatedAsyncioTestCase):
+    """Different newspaper articles that CNKI lists under one headline.
+
+    A 2026 kns8s result link is signed and names no dbcode/filename, so the
+    result parser keyed each row by its title and merged same-headline rows
+    into the first.  Each row names its own record on its collect control
+    (``a.icon-collect[data-dbname][data-filename]``).  The fixtures are
+    synthetic; they mirror the structure of saved kns8s result rows and kcms2
+    CCND article pages.
+    """
+
+    HEADLINE = "春耕生产正当时"
+    JOURNAL_TITLE = "春季田间管理技术要点"
+    DAILY_URL = (
+        "https://kns.cnki.net/kcms2/article/abstract?v=fixture-shared-headline-daily"
+        "&uniplatform=NZKPT&language=CHS"
+    )
+    EVENING_URL = (
+        "https://kns.cnki.net/kcms2/article/abstract?v=fixture-shared-headline-evening"
+        "&uniplatform=NZKPT&language=CHS"
+    )
+    JOURNAL_URL = (
+        "https://kns.cnki.net/kcms2/article/abstract?v=fixture-journal-row"
+        "&uniplatform=NZKPT&language=CHS"
+    )
+    DAILY_COLLECT = (
+        '<a class="icon-collect" title="收藏" data-dbname="CCND" data-resource="NEWSPAPER" '
+        'data-filename="SLRB202603180001"><i></i></a>'
+    )
+    EVENING_COLLECT = (
+        '<a class="icon-collect" title="收藏" data-dbname="CCND" data-resource="NEWSPAPER" '
+        'data-filename="SLWB202603180003"><i></i></a>'
+    )
+
+    class _CNKIBrowser:
+        """Serve result pages by search field (korder) and article pages by their link.
+
+        Each field's pages are served in order, the last one repeating.  Like
+        CNKI, every render signs its result links afresh, so a link read from
+        one search never reappears in the next.
+        """
+
+        navigation_provenance = ("HUNNU Official Portal", "HUNNU Library", "CNKI")
+
+        def __init__(self, searches: dict[str, list[str]], *, downloads_dir: Path | None = None) -> None:
+            self.searches = {order: list(pages) for order, pages in searches.items()}
+            self.articles = {
+                "daily": fixture("cnki_article_newspaper_shared_headline_daily.html"),
+                "evening": fixture("cnki_article_newspaper_shared_headline_evening.html"),
+            }
+            self.downloads_dir = downloads_dir
+            self.renders = 0
+            self.commands: list[object] = []
+            self.current_url = "about:blank"
+            self.current_html = ""
+            self.session = SessionHandle("cnki-shared-headline-test")
+            self.page_handle = PageHandle("main", session=self.session)
+
+        @staticmethod
+        def article_name(url: str) -> str:
+            """``daily`` or ``evening`` for a shared-headline article link, whatever its signature."""
+
+            return parse_qs(urlsplit(url).query)["v"][0].split(".")[0].removeprefix("fixture-shared-headline-")
+
+        async def execute(self, command):
+            self.commands.append(command)
+            if isinstance(command, NavigateCommand):
+                self.current_url = command.url
+                query = parse_qs(urlsplit(command.url).query)
+                if "/kcms2/article/abstract" in command.url:
+                    self.current_html = self.articles[self.article_name(command.url)]
+                else:
+                    pages = self.searches[query["korder"][0]]
+                    self.renders += 1
+                    self.current_html = re.sub(
+                        r"(v=fixture-[a-z-]+)",
+                        rf"\g<1>.{self.renders}",
+                        pages.pop(0) if len(pages) > 1 else pages[0],
+                    )
+            elif isinstance(command, DownloadCommand):
+                downloaded = write_minimal_pdf(self.downloads_dir / f"download-{len(self.commands)}.pdf")
+                return DownloadArtifact.from_path(
+                    downloaded,
+                    suggested_filename=command.suggested_filename,
+                    page=self.page_handle,
+                )
+            elif not isinstance(command, ObserveCommand):
+                raise AssertionError(type(command).__name__)
+            return BrowserObservation(
+                session=self.session,
+                page=self.page_handle,
+                generation=len(self.commands),
+                url=self.current_url,
+                title="检索-中国知网",
+                html=self.current_html,
+            )
+
+        def opened_articles(self) -> list[str]:
+            return [
+                self.article_name(command.url)
+                for command in self.commands
+                if isinstance(command, NavigateCommand) and "/kcms2/article/abstract" in command.url
+            ]
+
+        def search_fields(self) -> list[str]:
+            return [
+                parse_qs(urlsplit(command.url).query)["korder"][0]
+                for command in self.commands
+                if isinstance(command, NavigateCommand) and "korder=" in command.url
+            ]
+
+    @staticmethod
+    def _page() -> str:
+        return fixture("cnki_search_newspaper_shared_headline.html")
+
+    @classmethod
+    def _page_with_rows(cls, *names: str) -> str:
+        """The result page keeping only the rows that mention one of ``names``."""
+
+        return re.sub(
+            r"\s*<tr>.*?</tr>",
+            lambda row: row.group(0) if any(name in row.group(0) for name in names) else "",
+            cls._page(),
+            flags=re.S,
+        )
+
+    @staticmethod
+    def _request(**identity) -> LiteratureSearchRequest:
+        return LiteratureSearchRequest(
+            original_research_request="CNKI newspaper articles printed under one headline",
+            max_search_results=3,
+            max_results_per_source=3,
+            max_downloads=0,
+            max_downloads_per_run=0,
+            **identity,
+        )
+
+    def _titles(self, html: str, *, max_results: int = 30) -> list[str]:
+        return [
+            record.title
+            for record in CNKIAdapter.parse_search_results_html(html, query=self.HEADLINE, max_results=max_results)
+        ]
+
+    def test_rows_that_share_a_headline_but_name_different_records_stay_separate_results(self) -> None:
+        # If this fails, the second of two same-headline newspaper articles vanishes from
+        # CNKI's results again: its signed link names no filename, so the row is keyed by
+        # its title and merged into the first one.
+        expected = [
+            (self.HEADLINE, self.DAILY_URL),
+            (self.HEADLINE, self.EVENING_URL),
+            (self.JOURNAL_TITLE, self.JOURNAL_URL),
+        ]
+        for max_results in (1, 2, 3, 30):
+            with self.subTest(max_results=max_results):
+                records = CNKIAdapter.parse_search_results_html(
+                    self._page(), query=self.HEADLINE, max_results=max_results
+                )
+                self.assertEqual(
+                    [(record.title, record.navigation_url) for record in records],
+                    expected[:max_results],
+                )
+                # The row key stays inside the adapter: identity_matches, the fetch
+                # ledger and the manifest see the same identifier as before.
+                self.assertEqual({record.stable_identifier for record in records}, {UNKNOWN})
+
+    def test_one_record_listed_twice_under_its_own_key_is_still_one_result(self) -> None:
+        # If this fails, a row key split one CNKI record into two results.
+        page = self._page().replace(self.EVENING_COLLECT, self.DAILY_COLLECT)
+        self.assertEqual(self._titles(page), [self.HEADLINE, self.JOURNAL_TITLE])
+
+    def test_rows_without_a_key_of_their_own_still_merge_by_title(self) -> None:
+        # If this fails, rows are told apart by something other than their own collect
+        # control naming one record -- position, half a key, one of two keys, or a key
+        # that sits in another row -- and a merge the title rule made quietly changes.
+        page = self._page()
+        variants = {
+            "the first row names no record": page.replace(self.DAILY_COLLECT, ""),
+            "the second row names no record": page.replace(self.EVENING_COLLECT, ""),
+            "a collect control without data-dbname": page.replace(
+                self.EVENING_COLLECT, self.EVENING_COLLECT.replace(' data-dbname="CCND"', "")
+            ),
+            "one row naming two records": page.replace(
+                self.EVENING_COLLECT,
+                self.EVENING_COLLECT + self.EVENING_COLLECT.replace("SLWB202603180003", "SLWB202603180009"),
+            ),
+            "the key sitting in a row of its own": re.sub(
+                r'<tr>\s*<td class="seq">3</td>',
+                lambda row: f'<tr><td class="operat">{self.EVENING_COLLECT}</td></tr>{row.group(0)}',
+                page.replace(self.EVENING_COLLECT, ""),
+            ),
+        }
+        for label, variant in variants.items():
+            with self.subTest(variant=label):
+                self.assertEqual(self._titles(variant), [self.HEADLINE, self.JOURNAL_TITLE])
+
+    def test_a_row_key_never_splits_the_other_links_in_its_row(self) -> None:
+        # If this fails, a row's key reaches links that are not its title -- a citation
+        # count, say -- and every page listing two rows with the same count gains a result.
+        page = self._page().replace(
+            'fixture-shared-headline-evening&amp;uniplatform=NZKPT&amp;language=CHS">春耕生产正当时',
+            'fixture-shared-headline-evening&amp;uniplatform=NZKPT&amp;language=CHS">春耕备耕两不误',
+        )
+        rows = iter(range(1, 4))
+        cited = page.replace('<td class="operat">', "{citation}<td class=\"operat\">")
+        while "{citation}" in cited:
+            cited = cited.replace(
+                "{citation}",
+                '<td class="quote"><a target="_blank" href="https://kns.cnki.net/kcms2/article/abstract?'
+                f'v=fixture-citing-{next(rows)}&amp;uniplatform=NZKPT&amp;language=CHS">3</a></td>',
+                1,
+            )
+        keyless = re.sub(r'<a class="icon-collect"[^>]*><i></i></a>', "", cited)
+        self.assertEqual(self._titles(cited), self._titles(keyless))
+
+    async def test_each_same_headline_row_relocks_onto_its_own_article(self) -> None:
+        # If this fails, opening the second row lands on the first row's article: the
+        # exact-title refresh lists both, and identity_matches sees nothing but a title.
+        browser = self._CNKIBrowser({"TI": [self._page()]})
+        adapter = CNKIAdapter(browser)
+        daily, evening = await adapter.search(
+            f'"{self.HEADLINE}"', self._request(exact_titles=(self.HEADLINE,))
+        )
+        await adapter.open_result(evening)
+        await adapter.open_result(daily)
+        self.assertEqual(browser.opened_articles(), ["evening", "daily"])
+
+    async def test_a_row_found_by_an_author_search_relocks_onto_its_own_article(self) -> None:
+        # If this fails, an author search finds the evening paper's article and the
+        # exact-title refresh then swaps in the daily paper's article under the same headline.
+        browser = self._CNKIBrowser({"AU": [self._page_with_rows("作者乙")], "TI": [self._page()]})
+        adapter = CNKIAdapter(browser)
+        [evening] = await adapter.search('author:"作者乙"', self._request(authors=("作者乙",)))
+        await adapter.open_result(evening)
+        self.assertEqual(browser.search_fields(), ["AU", "TI"])
+        self.assertEqual(browser.opened_articles(), ["evening"])
+
+    async def test_a_row_missing_from_the_refresh_is_never_relocked_onto_another_row_with_its_headline(self) -> None:
+        # If this fails, the relock substitutes a different CNKI record for the one that was
+        # screened, only because the two share a headline.
+        browser = self._CNKIBrowser({"TI": [self._page(), self._page_with_rows("作者甲")]})
+        adapter = CNKIAdapter(browser)
+        _daily, evening = await adapter.search(
+            f'"{self.HEADLINE}"', self._request(exact_titles=(self.HEADLINE,))
+        )
+        with self.assertRaisesRegex(SourceLayoutChanged, "could not relock"):
+            await adapter.open_result(evening)
+        self.assertEqual(browser.opened_articles(), [])
+
+    async def test_a_refresh_page_whose_rows_carry_no_key_relocks_by_identity_as_before(self) -> None:
+        # If this fails, a result page without collect controls -- an older layout, or one
+        # read as a structured snapshot -- no longer relocks at all.  A row without a key is
+        # judged by identity_matches alone, exactly as before.
+        keyless = self._page().replace(self.DAILY_COLLECT, "").replace(self.EVENING_COLLECT, "")
+        browser = self._CNKIBrowser({"TI": [self._page(), keyless]})
+        adapter = CNKIAdapter(browser)
+        daily, _evening = await adapter.search(
+            f'"{self.HEADLINE}"', self._request(exact_titles=(self.HEADLINE,))
+        )
+        await adapter.open_result(daily)
+        self.assertEqual(browser.opened_articles(), ["daily"])
+
+    async def test_an_exact_title_and_author_request_reaches_and_downloads_the_second_same_headline_article(self) -> None:
+        # If this fails, the second of two different newspaper articles printed under one
+        # headline is unreachable again: its row is merged into the first, or a relock --
+        # while screening, or again before the download -- lands on the first paper's
+        # article, where the requested-author check or the identity lock refuses it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            browser = self._CNKIBrowser(
+                {"TI": [self._page()], "AU": [self._page_with_rows("作者乙")]},
+                downloads_dir=root,
+            )
+            adapter = CNKIAdapter(browser)
+            with isolated_fetch_ledger() as ledger:
+                adapter.fetch_ledger = ledger
+                result = await LiteratureAcquisitionWorkflow(
+                    adapter,
+                    run_root=root / "run",
+                    human_like_delay_seconds=0,
+                    allow_outside_project_for_tests=True,
+                ).run(
+                    LiteratureSearchRequest(
+                        original_research_request="The evening paper's article under a shared headline",
+                        exact_titles=(self.HEADLINE,),
+                        authors=("作者乙",),
+                        max_search_results=2,
+                        max_results_per_source=2,
+                        max_downloads=1,
+                        max_downloads_per_run=1,
+                    )
+                )
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.status, RunStatus.SUCCESS)
+        self.assertEqual(
+            [(record.authors, record.target_identity_confirmed) for record in result.records],
+            [(("作者甲",), False), (("作者乙",), True)],
+        )
+        [download] = result.downloads
+        self.assertEqual(download.doi, "10.99999/n.cnki.fixture.2026.000012")
+        # Screening opened each row's own article once; the download reopened the evening one.
+        self.assertEqual(browser.opened_articles(), ["daily", "evening", "evening"])
 
 
 class CNKIStructuredFallbackTests(unittest.IsolatedAsyncioTestCase):

@@ -60,6 +60,12 @@ _REJECT_DOWNLOAD_LABELS = ("批量下载", "多篇下载", "相关推荐", "参�
 _DOWNLOAD_ACTIONS = ("pdf下载", "caj下载", "全文下载", "下载全文", "download pdf", "download caj")
 _CNKI_RESOURCE_ORDER_PATH = "/bar/download/order"
 _CNKI_2026_RESULT_CLASSES = frozenset({"fz14", "inline"})
+# A kns8s result row (``table.result-table-list tr``) names its own record on
+# its collect control, ``a.icon-collect[data-dbname][data-filename]``; the
+# row's title link is ``a.fz14``.
+_CNKI_RESULT_TABLE_CLASS = "result-table-list"
+_CNKI_RESULT_ROW_KEY_CLASS = "icon-collect"
+_CNKI_RESULT_TITLE_CLASS = "fz14"
 _CNKI_2026_DOWNLOAD_CONTROL_IDS = frozenset({"pdfdown", "cajdown"})
 _CNKI_INSTITUTION_LABEL_CLASSES = frozenset({"ecp_header_unitname", "ecp_unitaccountname"})
 _CNKI_GENERIC_LOGIN_LABELS = frozenset(
@@ -586,6 +592,13 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
         self._overlay_depths: list[int] = []
         self._institution_header_depths: list[int] = []
         self._institution_label_captures: list[tuple[int, list[str]]] = []
+        # kns8s result rows.  ``_anchor_result_rows`` runs parallel to
+        # ``anchors`` and holds the row each anchor closed in; each row keeps
+        # the (dbname, filename) pairs its own collect controls carry.
+        self._anchor_result_rows: list[int | None] = []
+        self._result_row_pairs: list[set[tuple[str, str]]] = []
+        self._result_table_depths: list[int] = []
+        self._result_row: tuple[int, int] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         super().handle_starttag(tag, attrs)
@@ -616,6 +629,16 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
                 self._document_title_depth += 1
             if "ecp_header_login_area" in classes:
                 self._institution_header_depths.append(depth)
+            if lowered == "table" and _CNKI_RESULT_TABLE_CLASS in classes:
+                self._result_table_depths.append(depth)
+            elif lowered == "tr" and self._result_table_depths:
+                self._result_row = (len(self._result_row_pairs), depth)
+                self._result_row_pairs.append(set())
+        if self._result_row is not None and _CNKI_RESULT_ROW_KEY_CLASS in classes:
+            dbname = attributes.get("data-dbname", "").strip()
+            filename = attributes.get("data-filename", "").strip()
+            if dbname and filename:
+                self._result_row_pairs[self._result_row[0]].add((dbname.casefold(), filename))
         if "ecp_header_login_status1" in classes:
             self.institution_login_status = True
         elif (
@@ -679,7 +702,10 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
                 author = re.sub(r"\s+", " ", " ".join(self._anchor_stack[-1][2])).strip()
                 if author:
                     self.author_links.append(author)
+        anchor_count = len(self.anchors)
         super().handle_endtag(tag)
+        if len(self.anchors) > anchor_count:
+            self._anchor_result_rows.append(self._result_row[0] if self._result_row is not None else None)
         self._close_element(lowered)
         self._finish_institution_label_captures()
         if self._capture_stack and self._capture_stack[-1][0] == lowered:
@@ -710,6 +736,9 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
             self._institution_header_depths = [
                 depth for depth in self._institution_header_depths if depth <= remaining
             ]
+            self._result_table_depths = [depth for depth in self._result_table_depths if depth <= remaining]
+            if self._result_row is not None and self._result_row[1] > remaining:
+                self._result_row = None
             return
 
     def _finish_institution_label_captures(self) -> None:
@@ -727,6 +756,23 @@ class _CNKIHTMLParser(_ScienceDirectHTMLParser):
     def first_block(self, key: str) -> str:
         values = self.blocks.get(key, [])
         return values[0] if values else UNKNOWN
+
+    def result_row_key(self, anchor_index: int) -> str:
+        """The CNKI key of the result row titled by ``anchors[anchor_index]``, or ``""``.
+
+        The key is ``dbname:filename`` from that row's own collect control, and
+        only a row carrying exactly one such pair has one.  Only the row's title
+        link (``a.fz14``) takes it: another link in the row -- a citation
+        count, say -- and an anchor outside ``table.result-table-list`` rows
+        have none.
+        """
+
+        row = self._anchor_result_rows[anchor_index]
+        classes = self.anchors[anchor_index].attributes.get("class", "").casefold().split()
+        if row is None or _CNKI_RESULT_TITLE_CLASS not in classes or len(self._result_row_pairs[row]) != 1:
+            return ""
+        dbname, filename = next(iter(self._result_row_pairs[row]))
+        return f"{dbname}:{filename}"
 
     @property
     def visible_body_text(self) -> str:
@@ -1073,6 +1119,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
         self._search_inputs: dict[str, tuple[str, str]] = {}
         # query string -> what a restricted search confirmed and discarded.
         self._restriction_reports: dict[str, dict[str, Any]] = {}
+        # result title link -> the CNKI key of the kns8s row it titles, so a
+        # result relocks onto its own row, not the first row with its title.
+        self._result_row_keys: dict[str, str] = {}
 
     @staticmethod
     def _parser(html: str) -> _CNKIHTMLParser:
@@ -1299,7 +1348,9 @@ class CNKIAdapter(LiteratureSourceAdapter):
         cls.detect_interruption(html, url=source_url, challenge_state=challenge_state)
         parser = cls._parser(html)
         records: list[LiteratureRecord] = []
-        seen: set[str] = set()
+        # identity -> the row keys already recorded under it; "" stands for an
+        # anchor without one.
+        seen: dict[str, set[str]] = {}
         ranked_anchors: list[tuple[int, int, _Anchor, str]] = []
         for index, anchor in enumerate(parser.anchors):
             absolute = urljoin(source_url, anchor.href)
@@ -1307,7 +1358,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
             if layout_priority is None:
                 continue
             ranked_anchors.append((layout_priority, index, anchor, absolute))
-        for _layout_priority, _index, anchor, absolute in sorted(ranked_anchors):
+        for _layout_priority, index, anchor, absolute in sorted(ranked_anchors):
             title = _normalize_cnki_observed_title_spacing(anchor.text)
             # A row's citation count (td.quote) links to the same detail page
             # with ``anchor=citnet``.  Its 2026 ``v=`` URL has no stable
@@ -1322,9 +1373,17 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 continue
             stable_identifier = _stable_identifier(absolute)
             identity = stable_identifier if stable_identifier != UNKNOWN else normalize_title(title)
-            if identity in seen:
+            # A signed 2026 result link names no dbcode/filename, so its identity
+            # is the title, and one newspaper headline can head several different
+            # articles.  Anchors sharing an identity stay one record, except that
+            # the title links of two rows whose own CNKI keys differ never merge.
+            row_key = parser.result_row_key(index)
+            recorded_row_keys = seen.setdefault(identity, set())
+            if recorded_row_keys and (
+                not row_key or "" in recorded_row_keys or row_key in recorded_row_keys
+            ):
                 continue
-            seen.add(identity)
+            recorded_row_keys.add(row_key)
             records.append(
                 LiteratureRecord(
                     paper_id=stable_paper_id(title=title),
@@ -2100,10 +2159,14 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 if records or self._search_outcome_is_stable(content_kind, content):
                     same_page_navigation_urls: set[str] = set()
                     if content_kind == "html":
-                        for anchor in self._parser(content).anchors:
+                        page = self._parser(content)
+                        for index, anchor in enumerate(page.anchors):
                             absolute = urljoin(current_url, anchor.href)
                             if _cnki_result_opens_new_tab(anchor, absolute):
                                 same_page_navigation_urls.add(absolute)
+                            row_key = page.result_row_key(index)
+                            if row_key and _is_cnki_detail_url(absolute):
+                                self._result_row_keys[absolute] = row_key
                     return records, current_url, frozenset(same_page_navigation_urls)
             if observation_number + 1 < _SEARCH_SETTLE_MAX_OBSERVATIONS:
                 await asyncio.sleep(_SEARCH_SETTLE_DELAY_SECONDS)
@@ -2471,6 +2534,33 @@ class CNKIAdapter(LiteratureSourceAdapter):
             )
         return records
 
+    def _relock_candidate(
+        self,
+        record: LiteratureRecord,
+        fresh_records: list[LiteratureRecord],
+        row_key: str,
+    ) -> LiteratureRecord | None:
+        """The fresh result ``record`` relocks onto, or ``None``.
+
+        ``identity_matches`` decides, as before.  When ``record`` was read from a
+        kns8s row with its own CNKI key, a fresh row carrying a different key is
+        a different record under the same title -- one newspaper headline can
+        head several articles -- so it is never chosen, and the row carrying the
+        same key is.  A fresh row without a key is judged by identity alone.
+        """
+
+        matches = [candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]]
+        if row_key:
+            keyed = [
+                (candidate, self._result_row_keys.get(candidate.navigation_url, ""))
+                for candidate in matches
+            ]
+            same_row = [candidate for candidate, key in keyed if key == row_key]
+            if same_row:
+                return same_row[0]
+            matches = [candidate for candidate, key in keyed if not key]
+        return matches[0] if matches else None
+
     async def open_result(self, record: LiteratureRecord) -> None:
         target_url = record.navigation_url if record.navigation_url != UNKNOWN else record.source_page
         if not _is_cnki_detail_url(target_url):
@@ -2483,16 +2573,14 @@ class CNKIAdapter(LiteratureSourceAdapter):
         # Reusing one after screening can return a genuine CNKI 404 even though
         # the record still exists.  Refresh the exact-title result page and use
         # only the newly observed link instead of replaying the stale URL.
+        row_key = self._result_row_keys.get(record.navigation_url, "")
         exact_title_query = _canonicalize_cnki_exact_query(record.title)
         await self.browser.execute(NavigateCommand(self.build_search_url(exact_title_query, mode="exact_title")))
         fresh_records, _current_url, same_page_navigation_urls = await self._settled_search_records(
             query=record.search_query if record.search_query != UNKNOWN else record.title,
             max_results=30,
         )
-        fresh_record = next(
-            (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),
-            None,
-        )
+        fresh_record = self._relock_candidate(record, fresh_records, row_key)
         original_search = self._search_inputs.get(record.search_query)
         if fresh_record is None and original_search is not None and original_search[0] != "exact_title":
             # Some CNKI titles are unreachable by an exact-title query even though
@@ -2506,10 +2594,7 @@ class CNKIAdapter(LiteratureSourceAdapter):
                 query=record.search_query,
                 max_results=30,
             )
-            fresh_record = next(
-                (candidate for candidate in fresh_records if self.identity_matches(record, candidate)[0]),
-                None,
-            )
+            fresh_record = self._relock_candidate(record, fresh_records, row_key)
             if (
                 fresh_record is not None
                 and _is_cnki_detail_url(fresh_record.navigation_url)
@@ -2610,6 +2695,13 @@ class CNKIAdapter(LiteratureSourceAdapter):
             record.canonical_paper_id = self._expected_record.paper_id
             record.target_identity_confirmed = True
             _carry_listing_metadata(self._expected_record, record)
+            if (
+                record.navigation_url == UNKNOWN
+                and self._expected_record.navigation_url in self._result_row_keys
+            ):
+                # Keep the result link that reached this page, so reopening this
+                # record for its download relocks the same result row.
+                record.navigation_url = self._expected_record.navigation_url
         self._detail_record = record
         return record
 
