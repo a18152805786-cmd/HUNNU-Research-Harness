@@ -26,6 +26,21 @@ from hunnu_harness.paths import (
     PAPERS_BY_TOPIC_DIR,
 )
 
+# Resealed at 272/285/463 on 2026-09-27, from 255/268/437, at the user's
+# instruction. Seventeen works entered the corpus: seven Chinese papers on
+# corporate financialization came through the CNKI adapter on 2026-09-26 for
+# citation verification during review of the first paper, and ten Chinese
+# papers on executive perks, earnings management, and shareholder structure
+# came through acquire-batch on 2026-09-27 for the second paper's literature.
+# One CNKI paper and three batch papers were auto-classified; the other six
+# CNKI papers were confirmed by the user's choice on 2026-09-27 with
+# --allow-taxonomy-override, and the other seven batch papers were confirmed
+# that day. To make two works with no candidates confirmable, the Output
+# Root's navigator_lexicon.json gained the concepts investor_recognition and
+# financialization. No topic was created; unique topics stay 42 and nested
+# variants stay 13. These are the values reported from
+# LibraryFingerprinter().capture(), not derived.
+#
 # The sealed audit numbers this corpus is frozen at.
 #
 # Resealed at 255/268/437 with 42 unique topics on 2026-09-24, from
@@ -123,9 +138,9 @@ from hunnu_harness.paths import (
 # Unique topics moves only when the user changes the taxonomy (39 until
 # 2026-09-24, 42 since): an acquisition is filed under a topic that already
 # exists, and nothing here may create one.
-EXPECTED_WORKS = 255
-EXPECTED_VERSIONS = 268
-EXPECTED_TOPIC_ASSIGNMENTS = 437
+EXPECTED_WORKS = 272
+EXPECTED_VERSIONS = 285
+EXPECTED_TOPIC_ASSIGNMENTS = 463
 EXPECTED_UNIQUE_TOPICS = 42
 
 # Known fixtures in the real corpus, verified during discovery.
