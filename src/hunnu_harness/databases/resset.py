@@ -28,16 +28,18 @@ from .resset_catalog import (
 
 RESSET_TABLE_BASE = "https://db.resset.com/db/table/"
 
-# Press one download-centre row's own 下载 button, found by the row id that is
-# the first argument of its ``downloadtask(id, token, path, this)`` call (with
-# any quoting), or by created time and name when the id is not known yet.
-# Returns 1 when exactly one button was pressed, else how many matched.
-_PRESS_ROW_BUTTON_JS = r"""([id, created, name]) => {
+# Find one download-centre row's own 下载 button, by the row id that is the
+# first argument of its ``downloadtask(id, token, path, this)`` call (with any
+# quoting), or by created time and name when the id is not known yet.  The
+# button found is marked ``data-harness-row="press"`` so a real mouse click can
+# be aimed at it.  Returns how many buttons matched.
+_MARK_ROW_BUTTON_JS = r"""([id, created, name]) => {
   const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
   const firstArg = (b) => {
     const m = (b.getAttribute('onclick') || '').match(/downloadtask\(\s*['"]?([^,'"]+)['"]?\s*,/);
     return m ? m[1].trim() : null;
   };
+  document.querySelectorAll('[data-harness-row]').forEach(b => b.removeAttribute('data-harness-row'));
   let buttons = [...document.querySelectorAll('[onclick*="downloadtask"]')];
   if (id && !id.startsWith('row:')) {
     buttons = buttons.filter((b) => firstArg(b) === id);
@@ -48,9 +50,8 @@ _PRESS_ROW_BUTTON_JS = r"""([id, created, name]) => {
       return c.length >= 8 && norm(c[1].innerText) === norm(created) && norm(c[2].innerText) === norm(name);
     });
   }
-  if (buttons.length !== 1) return buttons.length;
-  buttons[0].click();
-  return 1;
+  if (buttons.length === 1) buttons[0].setAttribute('data-harness-row', 'press');
+  return buttons.length;
 }"""
 HUNNU_LIBRARY_RESSET_DETAIL_URL = (
     "http://wisdom.chaoxing.com/newwisdom/doordatabase/databasedetail.html?wfwfid=125449&pageId=36761&id=27560"
@@ -355,32 +356,80 @@ class RESSETAdapter(DatabaseAdapter):
             raise RESSETQueueError("RESSET_NOT_WHOLE_TABLE", f"task {chosen.task_id} is not the whole table: {problem}")
         return chosen
 
-    async def fetch_task_file(self, task: RessetTask) -> None:
-        """Open the download centre and press this row's own 下载 button.
+    async def fetch_task_file(self, task: RessetTask, *, start_seconds: float = 60.0) -> None:
+        """Open the download centre, press this row's own 下载 button, and see a download begin.
 
         The page fills its list by polling every three seconds, and its cell
         text can differ from the list endpoint's in spacing, so the button is
         found by the row id its own ``downloadtask(id, ...)`` call carries.
+
+        The button starts the download from a hidden iframe
+        (``/verifyDownload?token=...``).  It is pressed with a real mouse
+        click, as a person presses it: on 2026-09-29 the PURANDSALE row, the
+        second RESSET file of the day, was pressed by a script ``click()`` and
+        no download began.  If none begins within ``start_seconds`` the run
+        says so at once instead of waiting out the download timeout.
         """
 
+        dialogs: list[str] = []
+
+        def on_dialog(dialog: Any) -> None:
+            # The button reports a missing path or a failed record with alert().
+            dialogs.append(f"{getattr(dialog, 'type', '')}: {getattr(dialog, 'message', '')}"[:200])
+            asyncio.ensure_future(dialog.dismiss())
+
+        self.page.on("dialog", on_dialog)
         await self.page.goto(RESSET_DOWNLOAD_CENTRE_URL, wait_until="domcontentloaded")
+        events_before = len(getattr(self.browser, "download_events", None) or [])
         deadline = time.monotonic() + max(self.page_ready_seconds, 30.0)
-        while True:
+        pressed = False
+        while not pressed:
             # The list is drawn in a frame (downloadTaskUser.action?browserId=...)
             # inside the download-centre page; the top document holds no rows
             # (found live on 2026-09-29).  Every frame is searched.
-            found = []
+            found = 0
             for frame in list(self.page.frames):
                 try:
-                    found.append(await frame.evaluate(_PRESS_ROW_BUTTON_JS, [task.task_id, task.created, task.name]))
+                    # A row's button can be drawn before the frame's own script
+                    # defines downloadtask(); pressed then, it does nothing.  The
+                    # PURANDSALE collection of 2026-09-29 pressed that early twice
+                    # and no download began; pressed later, the same row worked.
+                    if not await frame.evaluate(
+                        "() => typeof downloadtask === 'function' && typeof jQuery !== 'undefined'"
+                    ):
+                        continue
+                    count = await frame.evaluate(_MARK_ROW_BUTTON_JS, [task.task_id, task.created, task.name])
                 except Exception:
                     continue
-            clicked = 1 if 1 in found else sum(n for n in found if isinstance(n, int) and n > 0)
-            if clicked == 1:
-                return
+                found += count if isinstance(count, int) else 0
+                if count == 1:
+                    try:
+                        await self._pause(1.0)
+                        await frame.locator("[data-harness-row='press']").first.click(timeout=5000)
+                        pressed = True
+                    except Exception:
+                        pass  # the list redrew under the click; find the row again
+                    break
+            if pressed:
+                break
             if time.monotonic() >= deadline:
                 raise RESSETQueueError(
                     "RESSET_DOWNLOAD_ROW_NOT_UNIQUE",
-                    f"expected one ready download-centre row for {task.name!r} at {task.created}, found {clicked}",
+                    f"expected one ready download-centre row for {task.name!r} at {task.created}, found {found}",
                 )
             await self._pause(1.0)
+        if getattr(self.browser, "download_events", None) is None:
+            return  # a browser that reports no download events: the file wait decides
+        started = time.monotonic() + start_seconds
+        while time.monotonic() < started:
+            new = self.browser.download_events[events_before:]
+            if any(event.get("state") == "begin" for event in new):
+                return
+            await self._pause(1.0)
+        said = f" The page said: {'; '.join(dialogs)}." if dialogs else ""
+        raise RESSETQueueError(
+            "RESSET_DOWNLOAD_NOT_STARTED",
+            f"the 下载 button of {task.name!r} ({task.created}) was pressed but the browser began no download in "
+            f"{int(start_seconds)} s.{said} Look at the Research Chrome's download-centre tab, then collect it with "
+            f"--collect-task {task.task_id}",
+        )

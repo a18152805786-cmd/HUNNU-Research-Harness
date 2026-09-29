@@ -270,3 +270,11 @@ class LiveFindingsTests(unittest.TestCase):
         self.assertIn("3,912", whole_table_problem(short, 939736, "stata17"))
         whole = RessetTask("9fd", "RESSET 股票_员工构成信息", "09-29 07:40:00", "100%", "stata17", "40", "939736")
         self.assertIsNone(whole_table_problem(whole, 939736, "stata17"))
+
+    def test_the_download_button_is_marked_for_a_real_click_not_clicked_by_script(self) -> None:
+        # 2026-09-29: a script click() on the PURANDSALE row at first draw started no download, twice;
+        # a real click once the frame's downloadtask() was defined started it at once.
+        from hunnu_harness.databases.resset import _MARK_ROW_BUTTON_JS
+
+        self.assertIn("data-harness-row", _MARK_ROW_BUTTON_JS)
+        self.assertNotIn(".click()", _MARK_ROW_BUTTON_JS)
