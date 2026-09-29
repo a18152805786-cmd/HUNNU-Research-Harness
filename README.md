@@ -16,7 +16,9 @@ Python 3.11+ · Playwright · Windows + Chrome · 1300+ 项自动化测试 · GP
 
 | 类别 | 接口 | 能力 |
 |---|---|---|
-| 金融数据库 | **CNRDS** 中国研究数据服务平台 · CNFS 财务报表 | 资产负债表、利润表、现金流量表；操作前校验数据库 / 模块 / 表状态，原始文件留档并计算 SHA-256 |
+| 金融数据库 | **CNRDS** 中国研究数据服务平台 · 学校账号订阅的 29 个基础库 | `data-acquire` 整表下载（财务报表、股价、股权、治理、宏观与区域经济等）；操作前校验库 / 表 / 订阅状态，经共用下载队列按任务认领，原始文件留档并计算 SHA-256；入口与权限见 [docs/INSTITUTIONAL_DATA_ACCESS.md](docs/INSTITUTIONAL_DATA_ACCESS.md) |
+| 金融数据库 | **RESSET** 金融研究数据库 · 图书馆机构账户的 16 个库 | `data-acquire --database RESSET` 整表下载；从图书馆链接进入即以机构账户登录，不输凭据；表单由 Harness 准备并回读核对，验证码由人输入；按行数与格式核对后留档 |
+| 统计数据库 | **EPS** 数据平台 · 校园网 IP 机构账户（719 个库表可下载） | `data-acquire --database EPS` 一次一个查询（指标 × 地区 × 年份）；Harness 勾选成员并核对计数、填好下载对话框，“确认提交”由人点；按独有任务名认领后留档 |
 | 中文文献 | **CNKI** 中国知网 | 检索、全文权限判断、授权下载；兼容 2026 年新版与旧版两套页面 |
 | 英文文献 | **ScienceDirect**（Elsevier）· **SpringerLink** · **Oxford Academic** | 检索、全文权限判断、授权下载、多来源预检、无人值守下载；ScienceDirect 能识别出版商的拒绝页并停下 |
 | 机构访问 | 湖南师范大学图书馆数据库导航 | 从图书馆入口解析到出版商的机构访问路由，带身份锁定；校外 CARSI 登录入口不作为自动路由 |
@@ -101,7 +103,9 @@ flowchart LR
 ## 局限
 
 - 机构访问路由针对湖南师范大学图书馆；换学校需要适配入口与身份校验。
-- CNRDS 目前覆盖 CNFS 三张财务报表；万方、RESSET、EPS 等来源尚未实现，未实现的来源不会静默退回临时脚本。
+- CNRDS 覆盖学校账号订阅的 29 个基础库，RESSET 覆盖机构账户的 16 个库，都只支持整表下载；RESSET 下载前的验证码由人输入；CNRDS 特色库需用户本人注册个人账号。
+- EPS 一次一个查询，只接指标、地区、时间三种维度，预估 5 万行以上（平台会排队）的请求拒绝；“确认提交”由人点，平台对自动化提交会清空页面并判任务无效，Harness 不绕过。
+- 万方等来源尚未实现，未实现的来源不会静默退回临时脚本。
 - 开发与验证环境为 Windows + Chrome。
 - 真实采集依赖出版商页面结构，改版后需要更新适配器；Harness 会报告页面无法识别，而不是猜。
 
@@ -174,6 +178,7 @@ python -m venv .venv
 | [AGENTS.md](AGENTS.md) | 给 agent 的操作契约（75 条规则） |
 | [docs/AGENTS_ENFORCEMENT_AUDIT.md](docs/AGENTS_ENFORCEMENT_AUDIT.md) | 每条规则由什么守住：代码强制还是只靠约定 |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 运行细节：路径边界、浏览器生命周期、CNRDS 用法、OfficialWeb、分批预算 |
+| [docs/INSTITUTIONAL_DATA_ACCESS.md](docs/INSTITUTIONAL_DATA_ACCESS.md) | 湖南师大机构数据库的图书馆入口、认证方式与学校账号权限（CNRDS、EPS、RESSET 等） |
 | [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md) | Agent 接入与全局路由 |
 | [docs/GLOBAL_PAPER_LIBRARY.md](docs/GLOBAL_PAPER_LIBRARY.md) | 全局文献库与外部导入契约 |
 | [docs/PAPER_RESEARCH_NAVIGATOR.md](docs/PAPER_RESEARCH_NAVIGATOR.md) | 文献导航的设计与命令 |

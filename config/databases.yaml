@@ -1,13 +1,26 @@
+# Institutional data sources.  Entry routes and permissions were verified on
+# 2026-09-28 through the HUNNU library; see docs/INSTITUTIONAL_DATA_ACCESS.md.
+# The authoritative CNRDS list for code is
+# src/hunnu_harness/databases/cnrds_catalog.py (SCHOOL_ACCOUNT_BASE_DATABASES).
 databases:
   cnrds:
     display_name: CNRDS
     institution: 湖南师范大学
-    modules:
-      cnfs: 上市公司财务基础数据/财务报表
+    library_route: 图书馆主页 -> 数据库导航 -> CNRDS中国研究数据服务平台(商学院) -> 网络地址 -> https://www.cnrds.com/Home/Login -> 学校登录（用户本人点，校园网 IP 绑定）
+    access: school_account_base_library   # shared account `schooluser`; featured series need a personal account the user registers
+    adapter_status: implemented            # hunnu-harness data-acquire (whole-table downloads)
+    table_route: "https://www.cnrds.com/Home/Index#/BaseDatabase/DB/<code>/ViewName/<table>"
     expected_text:
       - CNRDS
       - 中国研究数据服务平台
       - 学校账号
+    subscribed_base_library:   # 已订阅数据库, valid until 2027-09-28 at verification
+      上市公司股票基础数据: [CNSP, CAST, CSTS, CMTD, CIPO, CSEO]
+      上市公司财务基础数据: [CEPD, FRDT, CNFS, NFSD, CNFI, CEFD]
+      上市公司治理基础数据: [CBID, CCGD, AUDIT, MTDB, VPCE, ECEI, CRTD, CERD, IORD, CCDD, CLAD, CITD]
+      经济研究基础数据: [MACRO, MACROQ, MACROM, CRED, BOND]
+    modules:
+      cnfs: 上市公司财务基础数据/财务报表
     tables:
       - 资产负债表
       - 利润表
@@ -20,7 +33,14 @@ databases:
     adapter_status: reserved
   resset:
     display_name: RESSET
-    adapter_status: reserved
+    adapter_status: implemented   # data-acquire --database RESSET; whole tables; a person types the CAPTCHA
+    library_route: 数据库导航 -> RESSET金融研究数据库 -> 网络地址 (db.resset.com; opens signed in as the library's institutional account)
+    access: library_link_institutional   # nothing is typed; the library page also publishes a shared login, which agents never enter
+    permitted_databases: [股票, 科创板, 新三板, 债券, 基金, 研究报告, 融资融券, 宏观统计, 行业统计, 金融统计, 外汇, 期货, 黄金, 常量]
   eps:
     display_name: EPS
-    adapter_status: reserved
+    adapter_status: implemented   # data-acquire --database EPS; one query (indicators x regions x years) per run; a person presses 确认提交
+    library_route: 数据库导航 -> EPS全球统计数据/分析平台 -> 网络地址 (www.epsnet.com.cn; data at olap.epsnet.com.cn)
+    access: campus_ip   # group account 9993 (湖南师范大学), valid to 2030-12-31; 719 of 882 cubes downloadable
+    cube_route: "https://olap.epsnet.com.cn/#/datas_home?cubeId=<cube>"
+    instant_row_limit: 50000   # larger requests are queued by the platform and refused by the harness

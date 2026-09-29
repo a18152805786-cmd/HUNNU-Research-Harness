@@ -288,6 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
     from .navigator.cli import add_navigator_subcommands
 
     add_navigator_subcommands(sub)
+    from .data_cli import add_data_acquire_parser
+
+    add_data_acquire_parser(sub)
     # One contract across the whole CLI: with --json, stdout is exactly one
     # json.loads-able document.  Commands already emitting one accept the
     # flag as a no-op.
@@ -459,6 +462,10 @@ def main(argv: list[str] | None = None) -> int:
         from .literature.cli import main as literature_main
 
         return literature_main(_acquire_to_literature_argv(args))
+    if args.command == "data-acquire":
+        from .data_cli import run_data_acquire_cli
+
+        return run_data_acquire_cli(args)
     if args.command == "acquire-batch":
         from .literature.acquire_batch import run_batch_cli
 

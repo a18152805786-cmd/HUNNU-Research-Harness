@@ -40,6 +40,15 @@ codex mcp list
 
 ## CNRDS
 
+**入口与权限**（2026-09-28 实测，详见 [INSTITUTIONAL_DATA_ACCESS.md](INSTITUTIONAL_DATA_ACCESS.md)）：图书馆主页 → 数据库导航 → “CNRDS中国研究数据服务平台(商学院)” → 网络地址 → CNRDS 登录页 → 用户本人点“学校登录”（校园网 IP 绑定，无需账号密码）。学校账号是全校共用的 `schooluser`，只订阅 29 个基础库；公司特色库、经济特色库（供应链 SCRD、ESG、新质生产力 NQPD 等）要个人账号，只能由用户本人注册。
+
+**整表下载**：`data-acquire` 走表页路由 `#/BaseDatabase/DB/<库代码>/ViewName/<表名>`，先核对 URL、表标题和账号自己的“已订阅数据库”，选“时间不限 / 全部代码 / 全选字段”和格式，点“下载”→“添加到下载队列”，再从共用的“下载列表”里按任务编号差集认领本次任务并下载，最后归档、计算 SHA-256、写 manifest。试用数据、锁定期、特色库、限流等对话框一律停下交还用户，从不点“继续下载”。按代码、字段或期间筛选暂不支持，会明确拒绝。
+
+```powershell
+.venv\Scripts\hunnu-harness.exe browser-start
+.venv\Scripts\hunnu-harness.exe data-acquire --module CNSP --table 个股年回报率 --json
+```
+
 v0.1 的端到端验收（`HarnessV01CNRDSTestPassed=true`）：在用户人工完成统一身份认证后，使用专用 Research Chrome 完成一次最小真实链路 CNRDS → CNFS → 现金流量表 → 000001 → 2024 → CSV。下载由 Download Manager 检测完成（监测 `.crdownload` / `.part` 等临时文件、等待文件大小稳定），原始压缩包保留、计算 SHA-256，并生成 manifest。
 
 实际使用流程：
@@ -176,8 +185,11 @@ CNKI 的一框式检索一次只检一个字段，所以指定刊名时按「文
 ## 尚未实现
 
 - 已打开的日常 Chrome 标签页自动接管尚未作为默认路径启用；优先使用专用 profile。Chrome Extension / CDP 接管需要单独验证和人工完成扩展操作（见 [CHROME_EXTENSION_MODE.md](CHROME_EXTENSION_MODE.md)）。
-- CNRDS 目前覆盖 CNFS 三张财务报表，动态页面的全部字段选择器尚未逐一做端到端验证。
-- 万方、RESSET、EPS 等尚未实现的来源不能静默退回临时浏览器流程；需先报告缺失能力并获得用户授权后才可扩展。
+- CNRDS 的 `data-acquire` 覆盖学校账号订阅的 29 个基础库，但只做整表下载；按代码、字段或期间筛选的选择器尚未做端到端验证，请求会以 `CNRDS_SUBSET_UNSUPPORTED` 拒绝。特色库需要用户本人注册的个人账号。
+- 万方等尚未实现的来源不能静默退回临时浏览器流程；需先报告缺失能力并获得用户授权后才可扩展。
+  - RESSET 已实现：`data-acquire --database RESSET`。从图书馆链接进入即以机构账户登录，下载前的验证码由人输入。
+  - EPS 已实现：`data-acquire --database EPS`，一次一个查询，“确认提交”由人点。只接指标、地区、时间三种维度；预估 5 万行以上的请求拒绝，平台会把它们排队，Harness 尚不接排队任务。
+  - 入口见 [INSTITUTIONAL_DATA_ACCESS.md](INSTITUTIONAL_DATA_ACCESS.md)。
 - agent 文献 live execution 的 Python `BrowserTransport` → Codex Playwright MCP bridge 尚未实现。
 - FDM 接管下载的兼容性尚未启用；建议专用 profile 使用浏览器原生下载，以便 Harness 可靠识别下载链路。
 
