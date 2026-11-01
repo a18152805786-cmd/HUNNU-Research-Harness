@@ -180,7 +180,7 @@ python -m venv .venv
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 运行细节：路径边界、浏览器生命周期、CNRDS 用法、OfficialWeb、分批预算 |
 | [docs/INSTITUTIONAL_DATA_ACCESS.md](docs/INSTITUTIONAL_DATA_ACCESS.md) | 湖南师大机构数据库的图书馆入口、认证方式与学校账号权限（CNRDS、EPS、RESSET 等） |
 | [docs/AGENT_INTEGRATION.md](docs/AGENT_INTEGRATION.md) | Agent 接入与全局路由 |
-| [docs/WORKBUDDY_CALLING.md](docs/WORKBUDDY_CALLING.md) | Codex Desktop 调用 WorkBuddy 的工具入口、参数和工作步骤 |
+| [docs/WORKBUDDY_CALLING.md](docs/WORKBUDDY_CALLING.md) | Codex Desktop 调用 WorkBuddy，以及把 WorkBuddy 接成 Codex MCP 的说明 |
 | [docs/GLOBAL_PAPER_LIBRARY.md](docs/GLOBAL_PAPER_LIBRARY.md) | 全局文献库与外部导入契约 |
 | [docs/PAPER_RESEARCH_NAVIGATOR.md](docs/PAPER_RESEARCH_NAVIGATOR.md) | 文献导航的设计与命令 |
 | [docs/POST_ACQUISITION_CLASSIFICATION.md](docs/POST_ACQUISITION_CLASSIFICATION.md) | 入库后主题分类与校准 |
