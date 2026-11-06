@@ -85,8 +85,8 @@ flowchart LR
 ## 实际使用情况
 
 - 在 CNKI、ScienceDirect、SpringerLink、Oxford Academic 四个站点完成过真实验收；CNRDS 完成过一次端到端验收。
-- 日常用于本人实证研究的文献工作：本地文献库 198 篇 / 211 个文件版本 / 39 个主题（截至 2026-09-21）。
-- 19 个版本，每版有发布记录与离线验收（[docs/RELEASE_HISTORY.md](docs/RELEASE_HISTORY.md)）；带真实文献库运行时 1314 项测试通过、0 失败。
+- 日常用于本人实证研究的文献工作：本地文献库 376 篇 / 389 个文件版本 / 42 个主题（截至 2026-11-06）。
+- 19 个版本，每版有发布记录与离线验收（[docs/RELEASE_HISTORY.md](docs/RELEASE_HISTORY.md)）；带真实文献库运行时 1545 项测试通过、0 失败。
 
 ## 开发方式
 
