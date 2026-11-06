@@ -26,6 +26,21 @@ from hunnu_harness.paths import (
     PAPERS_BY_TOPIC_DIR,
 )
 
+# Resealed at 376/389/620 on 2026-11-06, from 272/285/463, at the user's
+# instruction.  104 works entered the corpus since the 2026-09-27 reseal.
+# Twenty-nine of them came through acquire-batch on 2026-11-06 (a random
+# sample of 会计研究 2023-2025 empirical articles, fetched to check whether
+# their descriptive-statistics tables report a median); the other 75 were
+# acquired in earlier sessions between 2026-09-28 and 2026-11-05 and had not
+# been sealed.  Fifty-eight of the 104 carried no topic; the user asked on
+# 2026-11-06 for them to be confirmed, and they were, one by one through
+# library-confirm-topics (a primary topic plus at most one secondary, with
+# --allow-taxonomy-override).  Twelve of those had raised no candidate at
+# all, so the Output Root's navigator_lexicon.json gained twelve narrow
+# concepts first; that file is data outside the repository.  No topic was
+# created: unique topics stay 42 and nested variants 13.  The numbers are
+# read from LibraryFingerprinter().capture(), not derived.
+#
 # Resealed at 272/285/463 on 2026-09-27, from 255/268/437, at the user's
 # instruction. Seventeen works entered the corpus: seven Chinese papers on
 # corporate financialization came through the CNKI adapter on 2026-09-26 for
@@ -138,9 +153,9 @@ from hunnu_harness.paths import (
 # Unique topics moves only when the user changes the taxonomy (39 until
 # 2026-09-24, 42 since): an acquisition is filed under a topic that already
 # exists, and nothing here may create one.
-EXPECTED_WORKS = 272
-EXPECTED_VERSIONS = 285
-EXPECTED_TOPIC_ASSIGNMENTS = 463
+EXPECTED_WORKS = 376
+EXPECTED_VERSIONS = 389
+EXPECTED_TOPIC_ASSIGNMENTS = 620
 EXPECTED_UNIQUE_TOPICS = 42
 
 # Known fixtures in the real corpus, verified during discovery.
