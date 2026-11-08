@@ -30,6 +30,7 @@ from hunnu_harness.browser.browser_directed_download import (
     _host_is_allowed,
     _matching_declared_label,
     _normalize_declared_identity,
+    _pending_claimed_identity,
     host_of,
     lease_for,
     pii_from_url,
@@ -169,6 +170,87 @@ def temp_root(prefix: str):
 
 
 class IdentityTests(unittest.TestCase):
+    def test_elsevier_main_pdf_path_uses_the_last_article_pii_not_the_issue(self) -> None:
+        article = "S0165410109000469"
+        url = f"https://pdf.sciencedirectassets.com/271661/1-s2.0-S0165410109X00054/1-s2.0-{article}/main.pdf"
+        self.assertEqual(pii_from_url(url), article)
+        self.assertEqual(pii_from_url(f"https://ars.els-cdn.com/1-s2.0-{article}/main.pdf"), article)
+        self.assertEqual(pii_from_url(f"https://pdf.sciencedirectassets.com/1-s2.0-{article}-main.pdf"), article)
+
+    def test_new_elsevier_path_forms_are_strict_and_host_bound(self) -> None:
+        for url in (
+            f"https://pdf.sciencedirectassets.com.evil.invalid/1-s2.0-{PII}/main.pdf",
+            f"https://download.cnki.net/1-s2.0-{PII}/main.pdf",
+            f"https://academic.oup.com/1-s2.0-{PII}/main.pdf",
+            "https://pdf.sciencedirectassets.com/1-s2.0-S1234/main.pdf",
+            f"https://pdf.sciencedirectassets.com/1-s2.0-{PII}9/main.pdf",
+            f"https://pdf.sciencedirectassets.com/1-s2.0-{PII}/main.pdf/extra",
+            f"https://pdf.sciencedirectassets.com/files/{PII}.pdf",
+            f"https://pdf.sciencedirectassets.com/1-s2.0-{PII}-main.pdf.exe",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(pii_from_url(url), "")
+
+    def test_standard_elsevier_suggested_filename_requires_its_existing_delivery_host(self) -> None:
+        pending = _Pending("g", "https://pdf.sciencedirectassets.com/opaque/main.pdf", FILENAME)
+        self.assertEqual(_pending_claimed_identity(pending, PII), PII)
+        for host in ("download.cnki.net", "pdf.sciencedirectassets.com.evil.invalid"):
+            pending = _Pending("g", f"https://{host}/opaque/main.pdf", FILENAME)
+            self.assertEqual(_pending_claimed_identity(pending, PII), "")
+        for filename in (f"prefix-{FILENAME}", FILENAME + ".exe", f"1-s2.0-{PII}9-main.pdf"):
+            pending = _Pending("g", "https://pdf.sciencedirectassets.com/opaque/main.pdf", filename)
+            self.assertEqual(_pending_claimed_identity(pending, PII), "")
+
+    def test_recognized_conflicting_url_cannot_be_washed_by_filename_or_label(self) -> None:
+        for url in (
+            f"https://pdf.sciencedirectassets.com/opaque/main.pdf?pii={OTHER_PII}",
+            f"https://pdf.sciencedirectassets.com/271661/1-s2.0-S0165410109X00054/1-s2.0-{OTHER_PII}/main.pdf",
+        ):
+            for filename in (FILENAME, PII + ".pdf"):
+                with self.subTest(url=url, filename=filename):
+                    pending = _Pending("g", url, filename)
+                    self.assertEqual(_pending_claimed_identity(pending, PII, (PII,)), "")
+
+    def test_elsevier_standard_path_and_query_conflict_fail_closed_in_both_directions(self) -> None:
+        for path_pii, query_pii in ((OTHER_PII, PII), (PII, OTHER_PII)):
+            url = f"https://pdf.sciencedirectassets.com/271661/1-s2.0-S0165410109X00054/1-s2.0-{path_pii}/main.pdf?pii={query_pii}"
+            with self.subTest(path_pii=path_pii, query_pii=query_pii):
+                self.assertEqual(pii_from_url(url), "")
+                for locked in (path_pii, query_pii):
+                    pending = _Pending("g", url, f"1-s2.0-{locked}-main.pdf")
+                    self.assertEqual(_pending_claimed_identity(pending, locked, (locked,)), "")
+
+    def test_springer_paths_name_the_complete_doi_on_official_or_bound_gateway_hosts(self) -> None:
+        doi = "10.1007/s11573-023-01162-8"
+        for url in (
+            f"https://link.springer.com/article/{doi}",
+            f"https://link.springer.com/content/pdf/{doi}.pdf?download=1",
+            f"https://yclib.hunnu.edu.cn/vpn/article/{doi}",
+            f"https://yclib.hunnu.edu.cn/vpn/opaque-prefix/content/pdf/{doi}.pdf",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(pii_from_url(url), doi)
+
+    def test_springer_identity_is_not_a_generic_basename_or_untrusted_route(self) -> None:
+        doi = "10.1007/s11573-023-01162-8"
+        for url in (
+            f"https://evil.example/content/pdf/{doi}.pdf",
+            f"https://link.springer.com.evil.example/article/{doi}",
+            "https://link.springer.com/files/s11573-023-01162-8.pdf",
+            f"https://link.springer.com/other/content/pdf/{doi}.pdf",
+            f"https://yclib.hunnu.edu.cn/content/pdf/{doi}.pdf",
+            f"https://link.springer.com/content/pdf/{doi}.pdf/trailing",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(pii_from_url(url), "")
+
+    def test_full_springer_doi_does_not_collapse_shared_suffixes_or_query_labels(self) -> None:
+        first = "https://link.springer.com/content/pdf/10.1007/same-suffix.pdf?pii=shared"
+        second = "https://link.springer.com/content/pdf/10.9999/same-suffix.pdf?pii=shared"
+        self.assertEqual(pii_from_url(first), "10.1007/same-suffix")
+        self.assertEqual(pii_from_url(second), "10.9999/same-suffix")
+        self.assertNotEqual(pii_from_url(first), pii_from_url(second))
+
     def test_the_real_delivery_url_yields_the_paper_identifier(self) -> None:
         self.assertEqual(pii_from_url(REAL_URL), PII)
 
@@ -222,6 +304,23 @@ class IdentityTests(unittest.TestCase):
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_queryless_elsevier_path_or_standard_filename_still_requires_completed_event(self) -> None:
+        for url in (
+            f"https://pdf.sciencedirectassets.com/271661/1-s2.0-S0165410109X00054/1-s2.0-{PII}/main.pdf",
+            "https://pdf.sciencedirectassets.com/opaque/main.pdf",
+        ):
+            with self.subTest(url=url), temp_root("bdd-elsevier-main-") as tmp:
+                fixture = _Fixture(Path(tmp))
+
+                async def script(f):
+                    f.session.emit("Browser.downloadWillBegin", begin(url=url))
+                    f.land()
+                    f.session.emit("Browser.downloadProgress", progress())
+
+                result = run(fixture, script)
+                self.assertEqual(result.source_pii, PII)
+                self.assertEqual(result.path.read_bytes(), PDF_BYTES)
+
     def test_a_completed_download_for_the_locked_paper_is_accepted(self) -> None:
         with temp_root("bdd-ok-") as tmp:
             fixture = _Fixture(Path(tmp))

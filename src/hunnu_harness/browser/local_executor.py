@@ -8,6 +8,7 @@ with the caller that supplied the existing local backend.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from pathlib import Path
@@ -650,17 +651,72 @@ class LocalPlaywrightExecutor:
             self.downloads_dir,
             allow_outside_output_for_tests=spec.allow_outside_output_for_tests,
         )
-        return await capture.capture_pdf(
-            page=page,
-            official_action=locator.click,
-            trusted_hosts=spec.trusted_hosts,
-            response_url_is_expected=self._expected_url_predicate(spec.expected_url),
-            controlled_filename=command.suggested_filename,
-            provenance_host=spec.provenance_host,
-            source_route=spec.source_route,
-            timeout_ms=command.timeout_ms,
-            require_download_event=spec.require_download_event or not spec.allow_response_capture,
-        )
+        identity_predicate = self._capture_identity_predicate(spec)
+        click_error: BaseException | None = None
+
+        async def official_action() -> None:
+            nonlocal click_error
+            click_error = await self._operate_download_control_once(locator)
+
+        try:
+            result = await capture.capture_pdf(
+                page=page,
+                official_action=official_action if identity_predicate is not None else locator.click,
+                trusted_hosts=spec.trusted_hosts,
+                response_url_is_expected=(
+                    identity_predicate or self._expected_url_predicate(spec.expected_url)
+                ),
+                controlled_filename=command.suggested_filename,
+                provenance_host=spec.provenance_host,
+                source_route=spec.source_route,
+                timeout_ms=command.timeout_ms,
+                require_download_event=spec.require_download_event or not spec.allow_response_capture,
+                download_url_is_expected=identity_predicate,
+            )
+        except Exception:
+            if click_error is not None:
+                raise DownloadFailure(
+                    f"Authorized control could not be operated: {_redacted_reason(click_error)}"
+                ) from click_error
+            raise
+        if click_error is not None:
+            self.last_post_click_warning = (
+                f"TRIGGER_COMPLETED_WITH_POST_CLICK_TIMEOUT: {_redacted_reason(click_error)}"
+            )
+        return result
+
+    @staticmethod
+    async def _operate_download_control_once(locator: Any) -> BaseException | None:
+        # Decide keyword support before invoking the action.  Retrying after
+        # TypeError could operate a real control twice if the first click had
+        # already reached the publisher.
+        click = locator.click
+        try:
+            parameters = inspect.signature(click).parameters.values()
+            no_wait = any(
+                item.name == "no_wait_after" or item.kind is inspect.Parameter.VAR_KEYWORD
+                for item in parameters
+            )
+        except (TypeError, ValueError):
+            no_wait = False
+        try:
+            await _maybe_await(click(no_wait_after=True) if no_wait else click())
+        except Exception as exc:
+            return exc
+        return None
+
+    @staticmethod
+    def _capture_identity_predicate(spec: DownloadCaptureSpec):
+        """A declared identity requirement never degrades to a host-only match."""
+
+        if not spec.download_identity_required:
+            return None
+        from .browser_directed_download import pii_from_url
+
+        locked = pii_from_url(spec.expected_url or "").casefold()
+        if not locked:
+            raise DownloadFailure("Expected PDF URL does not name a supported stable paper identity")
+        return lambda value: pii_from_url(value).casefold() == locked
 
     async def _directed_capture(self, locator: Any, command: DownloadCommand):
         """Catch the download through the browser itself, when we only attached.
@@ -683,6 +739,7 @@ class LocalPlaywrightExecutor:
             BrowserDirectedDownload,
             DIRECTED_DOWNLOAD_DEFAULT_HOSTS,
             DirectedDownloadFailure,
+            DirectedDownloadOutcome,
             lease_for,
             pii_from_url,
         )
@@ -738,6 +795,13 @@ class LocalPlaywrightExecutor:
         )
         await directed.arm()
         click_error: BaseException | None = None
+        captured: AuthorizedFileCaptureResult | None = None
+        capture_tasks: list[asyncio.Task] = []
+
+        async def official_action() -> None:
+            nonlocal click_error
+            click_error = await self._operate_download_control_once(locator)
+
         try:
             # The click's job is to operate the authorized control.  Whether a
             # download happened is answered by the browser, not by the click
@@ -746,14 +810,64 @@ class LocalPlaywrightExecutor:
             #
             # no_wait_after is measured, not assumed: on a page whose control
             # redirects before delivering, it cuts the click from 1546ms to 47ms.
-            try:
-                await _maybe_await(locator.click(no_wait_after=True))
-            except TypeError:
-                # Simple test doubles expose click() with no keyword arguments.
-                await _maybe_await(locator.click())
-            except Exception as exc:
-                click_error = exc
-            result = await directed.await_download()
+            identity_predicate = self._capture_identity_predicate(spec) if spec is not None else None
+            if (
+                identity_predicate is not None
+                and spec.allow_response_capture
+                and not spec.require_download_event
+            ):
+                # An official PDF action can open/render a PDF without ever
+                # causing Browser.downloadWillBegin.  Listen to that same
+                # browser action's trusted, identity-bound PDF response at the
+                # same time as CDP downloads; never GET or click again after a
+                # timeout.  Context response events also cover a new popup.
+                capture = BrowserAuthorizedFileCapture(
+                    self.downloads_dir,
+                    allow_outside_output_for_tests=spec.allow_outside_output_for_tests,
+                )
+                directed_task = asyncio.create_task(directed.await_download())
+                capture_task = asyncio.create_task(capture.capture_pdf(
+                    page=self._require_page(),
+                    official_action=official_action,
+                    trusted_hosts=spec.trusted_hosts,
+                    response_url_is_expected=identity_predicate,
+                    download_url_is_expected=identity_predicate,
+                    controlled_filename=command.suggested_filename,
+                    provenance_host=spec.provenance_host,
+                    source_route=spec.source_route,
+                    timeout_ms=command.timeout_ms,
+                ))
+                capture_tasks = [directed_task, capture_task]
+                done, _ = await asyncio.wait(capture_tasks, return_when=asyncio.FIRST_COMPLETED)
+                if directed_task in done:
+                    try:
+                        result = directed_task.result()
+                    except DirectedDownloadFailure as direct_error:
+                        if (
+                            directed.matching_download_started
+                            or not str(direct_error).startswith(DirectedDownloadOutcome.DOWNLOAD_EVENT_TIMEOUT.value)
+                        ):
+                            raise
+                        try:
+                            captured = await capture_task
+                        except Exception:
+                            raise direct_error
+                else:
+                    try:
+                        captured = capture_task.result()
+                    except Exception:
+                        result = await directed_task
+                    else:
+                        if directed.matching_download_started:
+                            # Once Chrome names the target's download, respect
+                            # its completion/cancellation and preserve event
+                            # provenance instead of replacing it with a copy of
+                            # a response that happened to finish first.
+                            result = await directed_task
+                            captured = None
+            else:
+                await official_action()
+                result = await directed.await_download()
         except DirectedDownloadFailure as exc:
             # No download, or not this paper's.  If the click also failed, that
             # is the more useful account of why nothing was downloaded.
@@ -764,6 +878,11 @@ class LocalPlaywrightExecutor:
                 ) from click_error
             raise DownloadFailure(str(exc)) from exc
         finally:
+            for task in capture_tasks:
+                if not task.done():
+                    task.cancel()
+            if capture_tasks:
+                await asyncio.gather(*capture_tasks, return_exceptions=True)
             await directed.release()
 
         if click_error is not None:
@@ -778,10 +897,13 @@ class LocalPlaywrightExecutor:
                 f"{_redacted_reason(click_error)}"
             )
 
-        if not BrowserAuthorizedFileCapture._is_valid_pdf_file(result.path):
+        result_path = captured.path if captured is not None else result.path
+        if not BrowserAuthorizedFileCapture._is_valid_pdf_file(result_path):
             raise DownloadFailure(
                 "Directed download completed but the file is not a readable PDF"
             )
+        if captured is not None:
+            return captured
         return AuthorizedFileCaptureResult(
             path=result.path,
             acquisition_method=AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,

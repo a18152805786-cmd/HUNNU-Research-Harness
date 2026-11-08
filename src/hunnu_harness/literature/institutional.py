@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from html.parser import HTMLParser
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import unquote, urljoin, urlsplit
 
 from ..browser.commands import NavigateCommand, ObservationUnavailable, ObserveCommand
@@ -805,7 +805,19 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
             return None, "uncertain"
         return best[0], True
 
-    async def _snapshot_after_goto(self, url: str) -> tuple[str, str, str]:
+    async def _snapshot_after_goto(
+        self,
+        url: str,
+        *,
+        ready: Callable[[str, str, str], bool] | None = None,
+    ) -> tuple[str, str, str]:
+        """Navigate once, then wait boundedly for the required discovery evidence.
+
+        A SPA's first valid HTML can still be an empty application shell.
+        Readiness is stage-specific and does not relax the later URL or source
+        identity checks. Authentication is inspected on every observation and
+        escapes immediately; this wait never retries navigation or a gate.
+        """
         await self.browser.execute(NavigateCommand(url))
         for attempt in range(_SNAPSHOT_SETTLE_MAX_ATTEMPTS):
             try:
@@ -816,10 +828,12 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
                 current_url = observation.url
                 title = observation.title or self._parse(html).title
                 self.detect_manual_authentication(html, url=current_url)
-                return html, current_url, title
+                if ready is None or ready(html, current_url, title) or attempt + 1 == _SNAPSHOT_SETTLE_MAX_ATTEMPTS:
+                    return html, current_url, title
             except ObservationUnavailable:
                 if attempt + 1 == _SNAPSHOT_SETTLE_MAX_ATTEMPTS:
                     raise
+            if attempt + 1 < _SNAPSHOT_SETTLE_MAX_ATTEMPTS:
                 await asyncio.sleep(_SNAPSHOT_SETTLE_DELAY_SECONDS)
         raise AssertionError("unreachable snapshot retry state")
 
@@ -914,7 +928,13 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
                 reason="Multiple equally ranked HUNNU library entries were found",
             )
         library_target = library_entry.navigation_url if library_entry else self.library_url
-        library_html, library_url, library_title = await self._snapshot_after_goto(library_target)
+        library_html, library_url, library_title = await self._snapshot_after_goto(
+            library_target,
+            ready=lambda html, url, _title: configured_entry is not None or bool(
+                self.discover_database_entries(html, base_url=url, requested_source=canonical)
+                or self.discover_resource_entries(html, base_url=url)
+            ),
+        )
         if not self.is_trusted_hunnu_route_url(library_url):
             return self._failure(
                 canonical,
@@ -965,7 +985,10 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
                     reason=reason,
                 )
             resource_html, resource_url, resource_title = await self._snapshot_after_goto(
-                resource_entry.navigation_url
+                resource_entry.navigation_url,
+                ready=lambda html, url, _title: bool(
+                    self.discover_database_entries(html, base_url=url, requested_source=canonical)
+                ),
             )
             if not self.is_trusted_hunnu_route_url(resource_url):
                 return self._failure(
@@ -1013,7 +1036,25 @@ class HUNNUInstitutionalAccessResolver(InstitutionalAccessResolver):
 
         destination = database_entry.navigation_url
         if self.is_trusted_hunnu_route_url(destination) and not self.is_hunnu_gateway_url(destination):
-            detail_html, detail_url, detail_title = await self._snapshot_after_goto(destination)
+            detail_html, detail_url, detail_title = await self._snapshot_after_goto(
+                destination,
+                ready=lambda html, url, title: self.source_identity_matches_text(
+                    canonical, f"{title} {self._parse(html).body_text[:5000]}"
+                ) and bool(
+                    [item for item in self.discover_database_entries(
+                        html, base_url=url, requested_source=canonical
+                    ) if self.is_official_source_url(canonical, item.navigation_url)]
+                    or self.discover_gateway_entries(html, base_url=url)
+                ),
+            )
+            if not self.is_trusted_hunnu_route_url(detail_url):
+                return self._failure(
+                    canonical,
+                    trigger,
+                    steps,
+                    match=False,
+                    reason="HUNNU database detail navigation left the official domain",
+                )
             self._step(
                 steps,
                 label=f"{canonical} Database Detail",

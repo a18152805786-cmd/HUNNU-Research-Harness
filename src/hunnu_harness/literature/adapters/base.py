@@ -261,11 +261,21 @@ def authorized_capture_result_from_artifact(
         source_route = str(metadata["SourceRoute"])
     except (KeyError, ValueError) as exc:
         raise SourceUnavailable("Authorized browser artifact is missing capture provenance") from exc
+    flags: dict[str, bool] = {}
+    for key in ("DownloadEventEmitted", "AuthorizedPDFResponseCaptured"):
+        value = metadata.get(key, False)
+        if type(value) is not bool:
+            # bool("false") is True. Capture provenance is evidence supplied
+            # by a typed executor, not a truthy user-facing display value.
+            raise SourceUnavailable(
+                f"Authorized browser artifact has invalid boolean capture provenance: {key}"
+            )
+        flags[key] = value
     return AuthorizedFileCaptureResult(
         path=artifact.local_path,
         acquisition_method=method,
         source_host=source_host,
         source_route=source_route,
-        download_event_emitted=bool(metadata.get("DownloadEventEmitted", False)),
-        authorized_pdf_response_captured=bool(metadata.get("AuthorizedPDFResponseCaptured", False)),
+        download_event_emitted=flags["DownloadEventEmitted"],
+        authorized_pdf_response_captured=flags["AuthorizedPDFResponseCaptured"],
     )

@@ -302,6 +302,36 @@ class PlanningGateTests(_BatchCase):
 
 
 class ExecutionTests(_BatchCase):
+    def test_legacy_top_level_manual_status_also_blocks_automatic_refetch(self) -> None:
+        queue = _queue(["legacy manual", "later"], source="oxfordacademic")
+        batch = self.batch(queue, browser_running=lambda: self.fail("manual status must stop before browser access"))
+        item = batch.queue.items[0]
+        batch.state.append({**item.as_dict(), "Key": item.key, "Outcome": "HUMAN_ACTION_REQUIRED", "Terminal": False,
+                            "Status": "ACTION_REQUIRED_USER_DOWNLOAD"})
+        code, report, notes = asyncio.run(batch.run())
+        self.assertEqual(code, EXIT_HUMAN_ACTION_REQUIRED)
+        self.assertTrue(report["ACTION_REQUIRED_USER_DOWNLOAD"])
+        self.assertFalse(any(row["Outcome"] == "STARTED" for row in self.state_rows()))
+        self.assertTrue(any("local manual-download" in note for note in notes))
+
+    def test_manual_download_gate_requires_local_resume_before_another_acquisition(self) -> None:
+        queue = _queue(["manual paper", "later paper"], source="oxfordacademic")
+        batch = self.batch(queue, browser_running=lambda: self.fail("must not probe/start browser for an unresolved local handoff"))
+        item = batch.queue.items[0]
+        receipt_path = str(self.root / "manual-state" / "STATE.json")
+        batch.state.append({
+            **item.as_dict(), "Key": item.key, "Outcome": "HUMAN_ACTION_REQUIRED", "Terminal": False,
+            "ItemReport": {"Status": "ACTION_REQUIRED_USER_DOWNLOAD", "ACTION_REQUIRED_USER_DOWNLOAD": True,
+                           "ManualDownloadHandoffPersisted": True, "StatePath": receipt_path, "StateSHA256": "a" * 64},
+        })
+        code, report, notes = asyncio.run(batch.run())
+        self.assertEqual(code, EXIT_HUMAN_ACTION_REQUIRED)
+        self.assertEqual(report["Status"], "STOPPED_FOR_HUMAN_ACTION")
+        self.assertEqual(report["StatePath"], receipt_path)
+        self.assertFalse(any(row["Outcome"] == "STARTED" for row in self.state_rows()))
+        self.assertTrue(any("manual-download-resume" in note for note in notes))
+        self.assertFalse(any("runs first" in note for note in notes))
+
     def test_items_run_in_order_through_the_single_paper_path_attach_only_and_never_refetch(self) -> None:
         publisher = _Publisher()
         code, report, _notes = self.run_batch(_queue(["one", "two", "three"]), publisher)

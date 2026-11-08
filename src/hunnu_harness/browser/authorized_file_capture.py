@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -10,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..paths import _logical_path, _windows_io_path, require_output_path
+from .browser_directed_download import _host_is_allowed
 
 
 class AcquisitionMethod(str, Enum):
@@ -118,6 +120,7 @@ class BrowserAuthorizedFileCapture:
         timeout_ms: int = 45_000,
         download_priority_grace_ms: int = 250,
         require_download_event: bool = False,
+        download_url_is_expected: Callable[[str], bool] | None = None,
     ) -> AuthorizedFileCaptureResult:
         context = getattr(page, "context", None)
         if context is None:
@@ -131,13 +134,29 @@ class BrowserAuthorizedFileCapture:
 
         loop = asyncio.get_running_loop()
         download_future: asyncio.Future[AuthorizedFileCaptureResult] = loop.create_future()
-        response_future: asyncio.Future[tuple[bytes, str]] = loop.create_future()
+        response_future: asyncio.Future[tuple[Path, str]] = loop.create_future()
         tasks: set[asyncio.Task[Any]] = set()
         attached_pages: list[Any] = []
         armed = True
         download_event_emitted = False
+        download_started = False
         response_candidate_seen = False
-        target = self._unique_target(controlled_filename)
+        # Chrome writes CDP downloads directly into staging using publisher
+        # suggested names. A predicted filename in that same directory can
+        # collide with those first bytes. Isolate every capture atomically;
+        # the browser's root-level files can never be overwritten by a copy.
+        capture_root = _logical_path(Path(tempfile.mkdtemp(
+            prefix="capture-", dir=str(_windows_io_path(self.staging_dir))
+        )))
+        safe_name = self._safe_filename(controlled_filename)
+        download_target = capture_root / f"download_{safe_name}"
+        response_target = capture_root / f"response_{safe_name}"
+        invalid_response_count = 0
+        response_body_saved = False
+
+        def write_exclusive(path: Path, payload: bytes) -> None:
+            with _windows_io_path(path).open("xb") as stream:
+                stream.write(payload)
 
         def track(coro: Awaitable[Any]) -> None:
             task = asyncio.create_task(coro)
@@ -145,25 +164,37 @@ class BrowserAuthorizedFileCapture:
             task.add_done_callback(tasks.discard)
 
         async def save_download(download: Any) -> None:
-            nonlocal download_event_emitted
-            download_event_emitted = True
-            if not armed or download_future.done():
+            nonlocal download_event_emitted, download_started
+            if not armed or download_future.done() or download_started:
                 return
+            if download_url_is_expected is not None:
+                # A popup or another tab can download at the same time.  A
+                # caller opting into identity locking must not claim those
+                # bytes merely because this context emitted a download event.
+                url = str(getattr(download, "url", ""))
+                try:
+                    expected = _host_is_allowed(self._host(url), frozenset(trusted)) and download_url_is_expected(url)
+                except Exception:
+                    expected = False
+                if not expected:
+                    return
+            # Claim at most one matching event.  Another event must not start
+            # a concurrent save into this capture's first downloaded file.
+            download_started = True
+            download_event_emitted = True
             try:
-                await download.save_as(str(_windows_io_path(target)))
+                await download.save_as(str(_windows_io_path(download_target)))
                 if not armed or download_future.done():
                     return
-                if not self._is_valid_pdf_file(target):
-                    try:
-                        _windows_io_path(target).unlink()
-                    except OSError:
-                        pass
+                if not self._is_valid_pdf_file(download_target):
+                    # The first bytes are diagnostic evidence, even when
+                    # empty/invalid.  Reject ingestion without deleting them.
                     raise AuthorizedFileCaptureUnavailable(
                         "Playwright download event produced an empty or invalid PDF"
                     )
                 download_future.set_result(
                     AuthorizedFileCaptureResult(
-                        path=target,
+                        path=download_target,
                         acquisition_method=AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
                         source_host=provenance_host,
                         source_route=source_route,
@@ -195,7 +226,7 @@ class BrowserAuthorizedFileCapture:
                 attached_pages.append(candidate)
 
         async def read_pdf_response(response: Any) -> None:
-            nonlocal response_candidate_seen
+            nonlocal response_candidate_seen, invalid_response_count, response_body_saved
             if not armed or response_future.done():
                 return
             url = str(getattr(response, "url", ""))
@@ -209,7 +240,7 @@ class BrowserAuthorizedFileCapture:
                 ),
                 "",
             ).split(";", 1)[0].strip().casefold()
-            if host not in trusted or content_type != "application/pdf":
+            if not _host_is_allowed(host, frozenset(trusted)) or content_type != "application/pdf":
                 return
             try:
                 expected = response_url_is_expected(url)
@@ -222,9 +253,44 @@ class BrowserAuthorizedFileCapture:
                 payload = await response.body()
             except Exception:
                 return
-            if not armed or response_future.done() or not payload or not payload.startswith(b"%PDF-"):
+            payload = bytes(payload or b"")
+            if not payload or not payload.startswith(b"%PDF-"):
+                # These bytes have already been received from the trusted,
+                # target-bound response. Preserve even an empty/mislabeled
+                # payload for offline diagnosis; never turn it into a PDF
+                # artifact or issue another request to discover what it was.
+                invalid_response_count += 1
+                diagnostic_path = capture_root / f"invalid_response_{invalid_response_count:04d}.bin"
+                try:
+                    write_exclusive(diagnostic_path, payload)
+                    failure = AuthorizedFileCaptureUnavailable(
+                        "Trusted PDF response contained an empty or invalid PDF; "
+                        f"received bytes preserved at {diagnostic_path}"
+                    )
+                except OSError as exc:
+                    failure = AuthorizedFileCaptureUnavailable(
+                        "Trusted PDF response was invalid and diagnostic preservation failed: "
+                        f"{type(exc).__name__}"
+                    )
+                if armed and not response_future.done():
+                    response_future.set_exception(failure)
                 return
-            response_future.set_result((bytes(payload), host))
+            if response_future.done() or response_body_saved:
+                return
+            try:
+                # Preserve bytes already received even when a claimed event
+                # later fails/cancels. This raw copy is not an accepted
+                # acquisition unless the event-free response branch selects it.
+                write_exclusive(response_target, payload)
+                response_body_saved = True
+            except OSError as exc:
+                if armed and not response_future.done():
+                    response_future.set_exception(AuthorizedFileCaptureUnavailable(
+                        "Trusted PDF response could not be preserved: " + type(exc).__name__
+                    ))
+                return
+            if armed and not response_future.done():
+                response_future.set_result((response_target, host))
 
         def on_response(response: Any) -> None:
             if armed:
@@ -247,6 +313,22 @@ class BrowserAuthorizedFileCapture:
         try:
             await official_action()
             deadline = timeout_ms / 1000
+            expires_at = loop.time() + deadline
+
+            async def finish_claimed_download() -> AuthorizedFileCaptureResult:
+                # Once a matching event has been claimed, its result has
+                # priority over a response copy. Never disguise cancellation
+                # or a failed save as response success, and never wait forever.
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(download_future),
+                        timeout=max(0.0, expires_at - loop.time()),
+                    )
+                except TimeoutError as exc:
+                    raise AuthorizedFileCaptureUnavailable(
+                        "Claimed Playwright download did not complete within the capture timeout; "
+                        "received bytes remain preserved for diagnosis"
+                    ) from exc
             waitables = (
                 (download_future,)
                 if require_download_event
@@ -277,18 +359,21 @@ class BrowserAuthorizedFileCapture:
                 and response_future.done()
                 and not response_future.cancelled()
             ):
+                if download_started:
+                    return await finish_claimed_download()
                 if download_priority_grace_ms > 0:
                     try:
                         return await asyncio.wait_for(
                             asyncio.shield(download_future),
-                            timeout=download_priority_grace_ms / 1000,
+                            timeout=min(download_priority_grace_ms / 1000, max(0.0, expires_at - loop.time())),
                         )
                     except TimeoutError:
                         pass
-                payload, host = response_future.result()
-                _windows_io_path(target).write_bytes(payload)
+                if download_started:
+                    return await finish_claimed_download()
+                response_path, host = response_future.result()
                 return AuthorizedFileCaptureResult(
-                    path=target,
+                    path=response_path,
                     acquisition_method=AcquisitionMethod.AUTHORIZED_PDF_RESPONSE,
                     source_host=host,
                     source_route=source_route,
@@ -304,9 +389,20 @@ class BrowserAuthorizedFileCapture:
                 self._remove_listener(context, "response", on_response)
             for candidate in attached_pages:
                 self._remove_listener(candidate, "download", on_download)
-            for task in tuple(tasks):
+            pending_tasks = tuple(tasks)
+            for task in pending_tasks:
                 if not task.done():
                     task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            for future in (download_future, response_future):
+                if future.done() and not future.cancelled():
+                    # A different capture branch may have won.  Retrieve any
+                    # loser exception after its task cleanup to avoid leaving
+                    # an unobserved background failure behind.
+                    future.exception()
+                elif not future.done():
+                    future.cancel()
 
 
 __all__ = [

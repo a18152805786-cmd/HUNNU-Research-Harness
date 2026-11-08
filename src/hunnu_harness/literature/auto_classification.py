@@ -254,6 +254,13 @@ class PostAcquisitionClassifier:
     ) -> tuple[ClassificationResult, ApplyOutcome]:
         """Write an assignable classification to the canonical store and view."""
 
+        with self.store.mutation_lock():
+            return self._apply_classification_locked(paper_id, result=result, force=force)
+
+    def _apply_classification_locked(
+        self, paper_id: str, *, result: ClassificationResult | None = None, force: bool = False
+    ) -> tuple[ClassificationResult, ApplyOutcome]:
+
         outcome = result or self.classify_work(paper_id, force=force)
         if not outcome.is_classified:
             return outcome, ApplyOutcome(
@@ -338,6 +345,12 @@ class PostAcquisitionClassifier:
         assignment is a reclassification, not a confirmation.
         """
 
+        with self.store.mutation_lock():
+            return self._confirm_topics_locked(paper_id, topics, allow_taxonomy_override=allow_taxonomy_override)
+
+    def _confirm_topics_locked(
+        self, paper_id: str, topics: Sequence[str], *, allow_taxonomy_override: bool = False
+    ) -> ConfirmationResult:
         selected = _labels_from(topics)
         rows = self.store.load()
         row = self._row_for(paper_id, rows)
@@ -567,6 +580,19 @@ class PostAcquisitionClassifier:
         version of a WORK already held -- reuses what the WORK already has.
         """
 
+        if dry_run:
+            result = self.classify_work(paper_id)
+            return result, ApplyOutcome(
+                paper_id=paper_id,
+                topics_written=result.existing_topics if result.status is ClassificationStatus.SKIPPED_EXISTING else (),
+                reason="REUSED_EXISTING_WORK_TOPICS" if result.status is ClassificationStatus.SKIPPED_EXISTING else "DRY_RUN",
+            )
+        with self.store.mutation_lock():
+            return self._classify_after_ingest_locked(paper_id, disposition=disposition)
+
+    def _classify_after_ingest_locked(
+        self, paper_id: str, *, disposition: str
+    ) -> tuple[ClassificationResult, ApplyOutcome]:
         result = self.classify_work(paper_id)
         if result.status is ClassificationStatus.SKIPPED_EXISTING:
             return result, ApplyOutcome(
@@ -574,10 +600,10 @@ class PostAcquisitionClassifier:
                 topics_written=result.existing_topics,
                 reason="REUSED_EXISTING_WORK_TOPICS",
             )
-        if dry_run or not result.is_classified:
+        if not result.is_classified:
             return result, ApplyOutcome(
                 paper_id=paper_id,
-                reason=f"NOT_APPLIED_{result.status.value}" if not dry_run else "DRY_RUN",
+                reason=f"NOT_APPLIED_{result.status.value}",
             )
         applied, outcome = self.apply_classification(paper_id, result=result)
         if applied.applied:

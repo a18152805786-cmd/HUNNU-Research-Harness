@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from dataclasses import dataclass
@@ -8,7 +9,6 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
 from ...browser.commands import (
-    AuthenticatedFetchCommand,
     BrowserTarget,
     DownloadCaptureSpec,
     DownloadCommand,
@@ -28,7 +28,8 @@ from .base import (
     authorized_capture_result_from_artifact,
 )
 from .sciencedirect import _Anchor, _ScienceDirectHTMLParser, _meta_all, _meta_first
-from ..fulltext import AuthorizedFullTextValidator
+from ..fulltext import AuthorizedFullTextValidator, DOIContentVerification, verify_external_paper_identity
+from ..downloads import reject_downloaded_challenge
 from ..models import (
     AccessDecision,
     AccessType,
@@ -381,27 +382,17 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
 
     @staticmethod
     def validate_pdf_identity(path: Path, record: LiteratureRecord) -> SpringerPDFIdentityResult:
-        try:
-            from pypdf import PdfReader  # type: ignore[import-not-found]
-
-            with _windows_io_path(path).open("rb") as handle:
-                reader = PdfReader(handle, strict=False)
-                text = "\n".join((page.extract_text() or "") for page in reader.pages[:2])
-        except Exception:
-            return SpringerPDFIdentityResult(False, False, False, False)
-        title_match = AuthorizedFullTextValidator._title_matches_extracted_text(record.title, text) is True
+        proof = verify_external_paper_identity(path, record)
+        text = AuthorizedFullTextValidator.extract_pdf_first_page_text(path)
+        title_match = proof.title_verification == "matched"
         expected_doi = normalize_doi(record.doi)
-        doi_candidates = {
-            normalize_doi(match)
-            for match in re.findall(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", text, flags=re.IGNORECASE)
-        }
-        doi_match = expected_doi != UNKNOWN and expected_doi in doi_candidates
+        doi_match = proof.doi_verification == DOIContentVerification.MATCHED
         first_author = normalize_person(record.first_author)
         author_match = (
             first_author != UNKNOWN
             and first_author.replace(" ", "") in normalize_person(text).replace(" ", "")
         )
-        confirmed = doi_match if expected_doi != UNKNOWN else title_match and author_match
+        confirmed = proof.verified and title_match and (doi_match if expected_doi != UNKNOWN else author_match)
         return SpringerPDFIdentityResult(confirmed, title_match, doi_match, author_match)
 
     def _quarantine(self, path: Path) -> Path:
@@ -471,7 +462,7 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
             status=RunStatus.SUCCESS,
             reason="Official Springer article page exposed an enabled Download PDF control",
             download_url=candidate_url,
-            download_locator="a[href^='/content/pdf/']",
+            download_locator=f"a[href={json.dumps(candidate.href, ensure_ascii=False)}]",
         )
 
     def _check_gateway_fulltext_access_html(self, html: str, *, source_url: str) -> AccessDecision:
@@ -652,6 +643,7 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
                             trusted_hosts=(self.hunnu_gateway_host,),
                             provenance_host=self.hunnu_gateway_host,
                             source_route="HUNNU_GATEWAY_TO_SPRINGER",
+                            expected_url=access.download_url,
                             require_download_event=True,
                             allow_response_capture=False,
                             allow_outside_output_for_tests=self._allow_capture_outside_output_for_tests,
@@ -662,11 +654,26 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
             except Exception as exc:
                 ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
                 raise SourceUnavailable(str(exc)) from exc
-            if result.acquisition_method != AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT:
+            if (
+                result.acquisition_method not in {
+                    AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
+                    AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,
+                }
+                or not result.download_event_emitted
+            ):
                 ticket.record_outcome(
                     ok=False, detail="acquisition emitted no download event"
                 )
                 raise SourceUnavailable("Institutional Springer acquisition emitted no download event")
+            if result.authorized_pdf_response_captured:
+                ticket.record_outcome(ok=False, detail="download-event capture carried mixed response provenance")
+                raise SourceUnavailable("Institutional Springer download has mixed response provenance")
+            if (
+                result.source_host.casefold().rstrip(".") != self.hunnu_gateway_host
+                or result.source_route != "HUNNU_GATEWAY_TO_SPRINGER"
+            ):
+                ticket.record_outcome(ok=False, detail="captured source did not match the bound gateway")
+                raise SourceUnavailable("Institutional Springer capture source did not match the bound gateway")
             self._last_capture = result
             record.acquisition_method = result.acquisition_method.value
             record.source_host = result.source_host
@@ -674,7 +681,7 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
             record.institutional_route_used = True
             record.institution = "湖南师范大学"
             record.download_event_emitted = result.download_event_emitted
-            record.authorized_pdf_response_captured = False
+            record.authorized_pdf_response_captured = result.authorized_pdf_response_captured
             record.official_pdf_action_confirmed = True
             record.source_access_status = "InstitutionalAuthenticated"
             record.unattended_download_attempted = True
@@ -703,32 +710,107 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
                 )
             ticket.record_outcome(ok=True, detail="gateway download completed")
             return result.path
-        if parsed.hostname != "link.springer.com" or not _PDF_PATH.search(parsed.path):
+        pdf_match = _PDF_PATH.fullmatch(parsed.path)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "link.springer.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or pdf_match is None
+        ):
             raise SourceLayoutChanged("Download URL is not a stable official Springer PDF path")
-        # The public official-PDF request is still a publisher fetch; budget it
-        # the same way before it is issued.
+        expected_doi = normalize_doi(record.doi)
+        if (
+            not record.target_identity_confirmed
+            or expected_doi == UNKNOWN
+            or normalize_doi(pdf_match.group(1)) != expected_doi
+        ):
+            raise SourceLayoutChanged("Official Springer PDF control is not bound to the locked article DOI")
+        # Use the already-authorized visible control once. A separate context
+        # HTTP GET does not exercise the signed-in browser's normal PDF action
+        # and was observed returning challenge HTML while the article was clear.
+        # There is no HTTP replay or second click after a capture failure.
         ticket = self.authorize_publisher_fetch(record)
         try:
-            response = await self.browser.execute(
-                AuthenticatedFetchCommand(
-                    url=access.download_url,
-                    suggested_filename=Path(parsed.path).name or f"{record.paper_id}.pdf",
+            artifact = await self.browser.execute(
+                DownloadCommand(
+                    target=BrowserTarget(
+                        css=access.download_locator,
+                        text_regex=r"^\s*download\s+pdf\s*$",
+                    ),
+                    suggested_filename=f"{record.paper_id}.pdf",
+                    timeout_ms=self._capture_timeout_ms,
+                    capture=DownloadCaptureSpec(
+                        trusted_hosts=("link.springer.com",),
+                        provenance_host="link.springer.com",
+                        source_route="SPRINGER_DIRECT",
+                        expected_url=access.download_url,
+                        download_identity_required=True,
+                        allow_outside_output_for_tests=self._allow_capture_outside_output_for_tests,
+                    ),
                 )
             )
-            if not response.ok:
-                raise SourceUnavailable(f"Official Springer PDF returned HTTP {response.status}")
-            if response.artifact is None:
-                raise SourceUnavailable("Official Springer PDF response produced no local artifact")
-        except SourceUnavailable as exc:
+            validation = AuthorizedFullTextValidator.validate(artifact.local_path)
+            reject_downloaded_challenge(validation)
+            if not validation.passed:
+                raise SourceUnavailable(f"Official Springer PDF capture failed file validation: {validation.error}")
+            result = authorized_capture_result_from_artifact(artifact)
+            event = (
+                result.acquisition_method in {
+                    AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
+                    AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,
+                }
+                and result.download_event_emitted
+                and not result.authorized_pdf_response_captured
+            )
+            response = (
+                result.acquisition_method is AcquisitionMethod.AUTHORIZED_PDF_RESPONSE
+                and result.authorized_pdf_response_captured
+                and not result.download_event_emitted
+            )
+            if (
+                not (event or response)
+                or result.source_host.casefold().rstrip(".") != "link.springer.com"
+                or result.source_route != "SPRINGER_DIRECT"
+            ):
+                raise SourceUnavailable("Official Springer capture has missing or inconsistent source provenance")
+            identity = self.validate_pdf_identity(result.path, record)
+            record.target_title_matched = identity.title_matched
+            record.target_doi_matched = identity.doi_matched
+            record.target_identity_confirmed = identity.confirmed
+            if not identity.confirmed:
+                # Preserve the first raw bytes for offline diagnosis. The
+                # manager never archives an unconfirmed captured file.
+                raise SourceLayoutChanged("Captured official Springer PDF failed local target identity validation")
+        except (SourceUnavailable, SourceActionRequired) as exc:
+            ticket.record_outcome(ok=False, detail=str(exc))
+            raise
+        except SourceLayoutChanged as exc:
             ticket.record_outcome(ok=False, detail=str(exc))
             raise
         except Exception as exc:
             ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
             raise SourceUnavailable(
-                f"Authorized Springer PDF request failed: {type(exc).__name__}"
+                f"Authorized Springer PDF action failed: {type(exc).__name__}"
             ) from exc
-        ticket.record_outcome(ok=True, detail="official PDF request completed")
-        return response.artifact.local_path
+        self._last_capture = result
+        record.acquisition_method = result.acquisition_method.value
+        record.source_host = result.source_host
+        record.source_route = result.source_route
+        record.institutional_route_used = False
+        record.download_event_emitted = result.download_event_emitted
+        record.authorized_pdf_response_captured = result.authorized_pdf_response_captured
+        record.official_pdf_action_confirmed = True
+        record.unattended_download_attempted = True
+        record.automatic_download_initiation = True
+        record.automatic_download_detection = True
+        record.user_native_viewer_click_required = False
+        record.manual_download_handoff_used = False
+        record.human_download_action = False
+        record.download_initiation_mode = "HARNESS_OFFICIAL_PDF_ACTION_CLICK"
+        record.file_finalization_mode = "HARNESS_AUTOMATIC"
+        ticket.record_outcome(ok=True, detail="official browser PDF action completed")
+        return result.path
 
     async def get_citation(self) -> dict[str, Any]:
         record = await self.extract_metadata(search_query=UNKNOWN)

@@ -351,6 +351,7 @@ class OxfordManualDownloadHandoffTests(unittest.IsolatedAsyncioTestCase):
         watch.mkdir()
         return OxfordAcademicAdapter(
             _Browser(watch),
+            manual_download_watch_directory=watch,
             allow_capture_outside_output_for_tests=True,
             capture_timeout_ms=20,
         )

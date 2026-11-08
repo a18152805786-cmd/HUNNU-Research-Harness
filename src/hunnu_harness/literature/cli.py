@@ -16,6 +16,7 @@ from ..browser.playwright_backend import (
     discover_chrome_executable,
 )
 from ..browser.research_chrome_lock import ResearchChromeBusy
+from ..browser.pdf_preferences import assess_pdf_download_readiness
 from ..cli_output import CliReport, attach_json_flag
 from ..exit_codes import (
     EXIT_BUDGET_EXHAUSTED,
@@ -184,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     oxford_live.add_argument("--max-results", type=int, default=1)
     oxford_live.add_argument("--max-downloads", type=int, choices=range(0, 2), default=1)
     oxford_live.add_argument("--headless", action="store_true")
+    oxford_live.add_argument("--manual-watch-directory", type=Path, default=None,
+                             help="Explicit directory where the user will save a native PDF download; never inferred from browser capture staging")
     oxford_live.add_argument("--daily-limit", type=int, default=None, help=daily_limit_help)
     oxford_live.add_argument(
         "--allow-refetch",
@@ -289,9 +292,17 @@ async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[i
         require_attach=bool(getattr(args, "require_attached_browser", False)),
     )
     adapter = None
+    pdf_readiness = assess_pdf_download_readiness(args.profile)
     try:
         await browser.start()
-        adapter = adapter_type(browser)
+        if args.command == "live-oxfordacademic":
+            adapter = adapter_type(
+                browser,
+                research_chrome_direct_pdf_download_configured=bool(pdf_readiness["ResearchChromeDirectPdfDownloadConfigured"]),
+                manual_download_watch_directory=getattr(args, "manual_watch_directory", None),
+            )
+        else:
+            adapter = adapter_type(browser)
         # The write-ahead fetch budget refuses a repeat by default; the flag is
         # the explicit, per-run override and is recorded on the attempt row.
         adapter.allow_refetch = bool(getattr(args, "allow_refetch", False))
@@ -365,6 +376,10 @@ async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[i
                 f"warning: browser teardown failed: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
+        if "Status" in report.payload():
+            # Setup failures preserve the historical Status/Reason prefix.
+            report.put("PdfDownloadReadiness", pdf_readiness)
+            report.put("ResearchChromeDirectPdfDownloadConfigured", pdf_readiness["ResearchChromeDirectPdfDownloadConfigured"])
 
     for key in ("BrowserLaunched", "BrowserHeadless", "FinalURL", "FinalPageTitle"):
         if key in lifecycle:
@@ -373,6 +388,8 @@ async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[i
     report.put("Status", result.status.value)
     report.put("Results", len(result.records))
     report.put("Downloads", len(result.downloads))
+    report.put("PdfDownloadReadiness", pdf_readiness)
+    report.put("ResearchChromeDirectPdfDownloadConfigured", pdf_readiness["ResearchChromeDirectPdfDownloadConfigured"])
     if request.restricted_search:
         # Whether CNKI demonstrably searched what was asked, per query, and
         # what was discarded -- so "Results" is never read as filtered when
@@ -416,11 +433,43 @@ async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[i
     if result.status == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD:
         report.put("ACTION_REQUIRED_USER_LOGIN", False, plain="false")
         report.put("ACTION_REQUIRED_USER_DOWNLOAD", True, plain="true")
-        report.put("BrowserReadyForManualDownload", True, plain="true")
         report.put("Reason", result.action_required_reason)
-        report.note(
-            "Click the Chrome PDF Viewer native Download button once; Harness will ingest the new file."
+        from .manual_resume import ManualResumeError, get_handoff_receipt
+
+        receipt = None
+        current = getattr(result, "manual_download_receipt", None)
+        armed = any(
+            getattr(record, "source_database", None) == "OxfordAcademic"
+            and getattr(record, "manual_download_handoff_armed", False) is True
+            for record in result.records
         )
+        if isinstance(current, dict) and current.get("ManualDownloadHandoffPersisted") is True and armed:
+            try:
+                persisted = get_handoff_receipt(Path(args.run_root))
+                if (
+                    persisted is not None
+                    and Path(current.get("StatePath", "")) == persisted.state_path
+                    and current.get("StateSHA256") == persisted.state_sha256
+                ):
+                    receipt = persisted
+            except (ManualResumeError, OSError, ValueError, TypeError):
+                pass
+        report.put("BrowserReadyForManualDownload", receipt is not None,
+                   plain="true" if receipt is not None else "false")
+        if receipt is not None:
+            for key, value in receipt.as_dict().items():
+                report.put(key, value)
+            report.note(
+                "Save the native PDF once into the explicitly armed watch directory. "
+                "Then use manual-download-resume with the reported StatePath and StateSHA256; "
+                "that command performs only local validation and ingest. Do not repeat the publisher PDF action."
+            )
+        else:
+            report.put("ManualDownloadHandoffPersisted", False)
+            report.note(
+                "No durable manual-download receipt is available. Follow the reported configuration "
+                "requirement; do not assume Harness is watching a directory or repeat a PDF request."
+            )
     return _live_exit_code(result, budget_refusals), result
 
 

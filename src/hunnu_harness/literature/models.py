@@ -856,3 +856,4 @@ class LiteratureRunResult:
     downloads: list[DownloadManifestEntry]
     errors: list[str] = field(default_factory=list)
     action_required_reason: str = UNKNOWN
+    manual_download_receipt: dict[str, Any] | None = None

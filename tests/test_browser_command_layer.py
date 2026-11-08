@@ -216,9 +216,9 @@ class _RecordingPort:
         if isinstance(command, ObserveCommand):
             if "cnki.net" in self.current_url:
                 body = "未找到相关结果"
-            elif "sciencedirect.com" in self.current_url:
-                # An explicit terminal state, as for CNKI.  ScienceDirect no longer
-                # reports a page that never decided as an empty search, so the
+            elif "sciencedirect.com" in self.current_url or "academic.oup.com" in self.current_url:
+                # An explicit terminal state, as for CNKI. These adapters no longer
+                # report a page that never decided as an empty search, so the
                 # stub has to be a page a real search can end on.
                 body = "No results found"
             else:
@@ -262,8 +262,14 @@ class AdapterCommandMigrationTests(unittest.IsolatedAsyncioTestCase):
                 port.title = title
                 adapter = adapter_type(port)
                 await adapter.search("command migration", request)
-                self.assertIsInstance(port.commands[0], NavigateCommand)
-                self.assertIsInstance(port.commands[1], ObserveCommand)
+                offset = 0
+                if source == "ScienceDirect":
+                    # Preserve a user-cleared same-query page before deciding
+                    # whether this request needs a new navigation.
+                    self.assertIsInstance(port.commands[0], ObserveCommand)
+                    offset = 1
+                self.assertIsInstance(port.commands[offset], NavigateCommand)
+                self.assertIsInstance(port.commands[offset + 1], ObserveCommand)
                 self.assertTrue(all(not isinstance(item, str) for item in port.commands))
 
     async def test_command_failure_does_not_fall_back_to_raw_page(self) -> None:

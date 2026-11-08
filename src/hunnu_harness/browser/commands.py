@@ -223,6 +223,7 @@ class DownloadCaptureSpec:
     require_download_event: bool = False
     allow_response_capture: bool = True
     allow_outside_output_for_tests: bool = False
+    download_identity_required: bool = False
 
     def __post_init__(self) -> None:
         hosts = tuple(str(host).casefold().rstrip(".") for host in self.trusted_hosts if str(host).strip())
@@ -233,6 +234,22 @@ class DownloadCaptureSpec:
             raise ValueError("DownloadCaptureSpec.provenance_host must not be empty")
         if not str(self.source_route).strip():
             raise ValueError("DownloadCaptureSpec.source_route must not be empty")
+        if self.download_identity_required:
+            from .browser_directed_download import _host_is_allowed, pii_from_url
+
+            expected = urlsplit(self.expected_url or "")
+            host = (expected.hostname or "").casefold().rstrip(".")
+            if (
+                expected.scheme not in {"http", "https"}
+                or expected.username is not None
+                or expected.password is not None
+                or not _host_is_allowed(host, frozenset(hosts))
+                or not pii_from_url(self.expected_url or "")
+            ):
+                raise ValueError(
+                    "Download identity requires an expected trusted HTTP(S) URL "
+                    "naming a supported stable paper identifier"
+                )
 
 
 class BrowserCommand:
@@ -324,13 +341,16 @@ class DownloadCommand(BrowserCommand):
             raise ValueError("DownloadCommand.timeout_ms must be positive")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "Kind": self.kind,
             "Target": self.target.as_dict(),
             "SuggestedFilename": Path(self.suggested_filename).name,
             "TimeoutMs": self.timeout_ms,
             "CaptureMode": "authorized-pdf" if self.capture else "download-event",
         }
+        if self.capture is not None and self.capture.download_identity_required:
+            payload["DownloadIdentityRequired"] = True
+        return payload
 
 
 @dataclass(frozen=True)

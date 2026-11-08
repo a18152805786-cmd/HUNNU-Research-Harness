@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from hunnu_harness.literature.adapters.oxfordacademic import OxfordAcademicAdapter
 from hunnu_harness.literature.models import LiteratureSearchRequest, RunStatus
@@ -64,6 +65,9 @@ class _Locator:
     async def click(self) -> None:
         self.page.context.emit("response", _Response())
 
+    async def inner_text(self) -> str:
+        return self.page.visible_text
+
 
 class _Context(_Emitter):
     def __init__(self) -> None:
@@ -77,6 +81,7 @@ class _Page(_Emitter):
         self.context = context
         self.url = "about:blank"
         self.html = ""
+        self.visible_text = ""
         context.pages.append(self)
 
     async def content(self) -> str:
@@ -93,6 +98,17 @@ class _Browser:
         self.downloads_dir = downloads_dir
 
     async def goto(self, url: str) -> None:
+        self.page.visible_text = ""
+        if url.startswith("https://api.crossref.org/works/"):
+            self.page.url = url
+            self.page.html = ""
+            self.page.visible_text = json.dumps({
+                "status": "ok", "message": {
+                    "DOI": unquote(urlsplit(url).path.removeprefix("/works/")),
+                    "title": [TITLE], "resource": {"primary": {"URL": ARTICLE_URL}},
+                },
+            })
+            return
         if "search-results" in url:
             self.page.url = "https://academic.oup.com/search-results"
             self.page.html = fixture("oxfordacademic_search.html")

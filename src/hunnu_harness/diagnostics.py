@@ -71,6 +71,10 @@ def build_capabilities() -> dict[str, Any]:
             "such a request before any search, and an unconfirmed restriction returns nothing"
         ),
         "NavigatorCommands": sorted(NAVIGATOR_COMMANDS),
+        "LocalRepairCommands": {
+            "manual-download-resume": "Oxford receipt and SHA-256 bound local-only manual-file finalization; no browser or publisher request",
+            "library-reclassify": "Read-only preview by default; explicit apply, reason, state precondition and audited provenance",
+        },
         "ExitCodeLadder": {
             "0": "run completed (zero hits included; read Results)",
             "1": "run failed outside the ladder; read the report",
@@ -83,6 +87,7 @@ def build_capabilities() -> dict[str, Any]:
             "HUNNU_HARNESS_OUTPUT_ROOT": "runtime output root (default: sibling <repo>-Output)",
             "HUNNU_RESEARCH_PROFILE": "dedicated Chrome profile directory",
             "HUNNU_RESEARCH_CHROME": "explicit Chrome executable (else auto-discovery)",
+            "HUNNU_HARNESS_MANUAL_DOWNLOAD_WATCH_DIRECTORY": "Explicit Oxford native-save watch directory; never inferred from browser capture staging",
             fetch_ledger.DAILY_FETCH_LIMIT_ENV: (
                 f"daily publisher fetch total (default {fetch_ledger.GLOBAL_DAILY_LIMIT}; "
                 "also --daily-limit)"
@@ -123,9 +128,13 @@ def _check(ok: bool, detail: str) -> dict[str, Any]:
 
 def build_doctor() -> tuple[dict[str, Any], int]:
     from .browser.playwright_backend import discover_chrome_executable
+    from .browser.pdf_preferences import DEFAULT_RESEARCH_CHROME_PROFILE, assess_pdf_download_readiness
+    import os
+    from pathlib import Path
     from .literature.fetch_ledger import FetchLedgerError, FulltextFetchLedger
     from .navigator.lexicon import CONCEPTS
-    from .paths import OUTPUT_ROOT
+    from .paths import OUTPUT_ROOT, TOPIC_TAXONOMY_JSON
+    from .literature.topics import TopicTaxonomy, TopicTaxonomyError
 
     checks: dict[str, dict[str, Any]] = {}
 
@@ -192,6 +201,33 @@ def build_doctor() -> tuple[dict[str, Any], int]:
         else "empty (legal state; concept expansion and facets are inactive)",
     )
 
+    # Acquisition can safely archive a paper without topic filing, but a
+    # missing frozen configuration must be visible before the first download.
+    # This is a read-only capability check; never invent a default taxonomy.
+    try:
+        taxonomy = TopicTaxonomy.load(TOPIC_TAXONOMY_JSON)
+        checks["topic_taxonomy"] = _check(
+            True,
+            f"{len(taxonomy.domains)} domains / {len(taxonomy.labels())} topics loaded from {TOPIC_TAXONOMY_JSON}",
+        )
+    except TopicTaxonomyError as exc:
+        checks["topic_taxonomy"] = _check(
+            False,
+            f"{exc}. Automatic topic filing is unavailable; initialize from an explicitly reviewed frozen taxonomy and its SHA-256, never from inferred labels.",
+        )
+
+    profile = Path(os.environ.get("HUNNU_RESEARCH_PROFILE", DEFAULT_RESEARCH_CHROME_PROFILE))
+    pdf_readiness = assess_pdf_download_readiness(profile)
+    checks["pdf_direct_download"] = _check(
+        bool(pdf_readiness["AutomaticPdfDownloadPreconditionReady"]),
+        str(pdf_readiness["Detail"]),
+    )
+    warnings = []
+    if not checks["topic_taxonomy"]["ok"]:
+        warnings.append(checks["topic_taxonomy"]["detail"])
+    if not checks["pdf_direct_download"]["ok"]:
+        warnings.append(str(pdf_readiness["Detail"]) + " " + str(pdf_readiness["ConfigurationAction"]))
+
     # The first blocking finding grades the exit. Environment problems come
     # first: installing Playwright will not help while the Output Root is
     # unwritable.
@@ -200,17 +236,26 @@ def build_doctor() -> tuple[dict[str, Any], int]:
     elif not checks["playwright"]["ok"] or not checks["pypdf"]["ok"]:
         verdict, exit_code = "CAPABILITY_MISSING", EXIT_CAPABILITY_MISSING
     else:
-        verdict, exit_code = "READY", EXIT_OK
+        verdict = "READY_WITH_WARNINGS" if warnings else "READY"
+        exit_code = EXIT_OK
 
     payload: dict[str, Any] = {
         "HarnessVersion": __version__,
         "Verdict": verdict,
         "Checks": checks,
+        "AcquisitionReady": exit_code == EXIT_OK,
+        "ClassificationReady": checks["topic_taxonomy"]["ok"],
+        "AutomaticPdfDownloadPreconditionReady": bool(pdf_readiness["AutomaticPdfDownloadPreconditionReady"]),
+        "PdfDownloadReadiness": pdf_readiness,
+        "Warnings": warnings,
         "NetworkActivity": False,
         "Note": (
             "READY means acquisition can start; it does not assert you are "
             "signed in (login state is only observable in a live run) or that "
-            "any specific publisher is reachable."
+            "any specific publisher is reachable. READY_WITH_WARNINGS still allows "
+            "acquisition; ClassificationReady separately reports whether automatic "
+            "topic filing has its required frozen configuration. AutomaticPdfDownloadPreconditionReady "
+            "reports only the PDF profile setting; it does not prove current-session download delivery."
         ),
     }
     if chrome is None and playwright_present:

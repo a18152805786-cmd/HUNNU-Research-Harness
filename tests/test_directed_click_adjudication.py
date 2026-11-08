@@ -180,6 +180,47 @@ def temp_root(prefix: str):
 
 
 class AdjudicationTests(unittest.TestCase):
+    def test_springer_gateway_complete_doi_is_captured_from_exactly_one_click(self) -> None:
+        doi = "10.1007/s11573-023-01162-8"
+        pdf = f"https://yclib.hunnu.edu.cn/vpn/content/pdf/{doi}.pdf"
+        springer_command = DownloadCommand(
+            target=BrowserTarget(css="a#pdf"), suggested_filename="TARGET.pdf",
+            capture=DownloadCaptureSpec(
+                trusted_hosts=("yclib.hunnu.edu.cn",), expected_url=pdf,
+                provenance_host="yclib.hunnu.edu.cn", source_route="HUNNU_GATEWAY_TO_SPRINGER",
+                require_download_event=True, allow_response_capture=False,
+            ),
+        )
+        with temp_root("adj-springer-doi-") as tmp:
+            result, _, locator = attempt(
+                "settles", Path(tmp), download_command=springer_command,
+                source_url=pdf, href=pdf,
+                page_url=f"https://yclib.hunnu.edu.cn/vpn/article/{doi}",
+            )
+            self.assertEqual(result.path.read_bytes(), PDF_BYTES)
+        self.assertEqual(result.source_host, "yclib.hunnu.edu.cn")
+        self.assertEqual(locator.clicked, 1)
+
+    def test_springer_gateway_different_doi_cannot_be_claimed_by_a_shared_filename(self) -> None:
+        doi = "10.1007/s11573-023-01162-8"
+        expected = f"https://yclib.hunnu.edu.cn/vpn/content/pdf/{doi}.pdf"
+        other = expected.replace("10.1007/", "10.9999/")
+        springer_command = DownloadCommand(
+            target=BrowserTarget(css="a#pdf"), suggested_filename="TARGET.pdf",
+            capture=DownloadCaptureSpec(
+                trusted_hosts=("yclib.hunnu.edu.cn",), expected_url=expected,
+                provenance_host="yclib.hunnu.edu.cn", source_route="HUNNU_GATEWAY_TO_SPRINGER",
+                require_download_event=True, allow_response_capture=False,
+            ),
+        )
+        with temp_root("adj-springer-wrong-doi-") as tmp:
+            with self.assertRaisesRegex(DownloadFailure, "DOWNLOAD_EVENT_TIMEOUT"):
+                attempt(
+                    "settles", Path(tmp), download_command=springer_command,
+                    source_url=other, href=expected,
+                    page_url=f"https://yclib.hunnu.edu.cn/vpn/article/{doi}",
+                )
+
     def test_capture_spec_trusted_hosts_reach_the_directed_allowlist(self) -> None:
         oup_command = DownloadCommand(
             target=BrowserTarget(css="a#pdf"),

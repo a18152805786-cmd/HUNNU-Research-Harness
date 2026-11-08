@@ -11,7 +11,8 @@ to put the file and then watches the browser's own account of it.  The
 browser-level protocol is what makes that safe: ``Browser.downloadWillBegin``
 names both the URL the bytes actually come from and the browser's suggested
 filename.  Identity must match the URL's recognised paper identifier, the exact
-stem of a suggested ``.pdf``/``.caj`` filename, or a sufficiently long
+stem of a suggested ``.pdf``/``.caj`` filename, a standard Elsevier main-PDF
+filename on its existing delivery hosts, or a sufficiently long
 bibliographic label explicitly declared by the adapter; a file merely appearing
 in a directory remains insufficient.
 
@@ -31,7 +32,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from ..paths import _windows_io_path
 
@@ -57,12 +58,20 @@ DIRECTED_DOWNLOAD_DEFAULT_HOSTS = ELSEVIER_PDF_HOSTS | frozenset(
 
 _PII_IN_URL = re.compile(r"[?&]pii=([A-Za-z0-9]+)", re.IGNORECASE)
 _PII_IN_PATH = re.compile(r"/pii/([A-Za-z0-9]+)", re.IGNORECASE)
+_ELSEVIER_MAIN_PDF_PATH = re.compile(
+    r"/(?:[0-9]+/)?(?:1-s2\.0-[A-Za-z0-9]+/)?1-s2\.0-(S[0-9]{16})/main\.pdf$",
+    re.IGNORECASE,
+)
+_ELSEVIER_MAIN_PDF_NAME = re.compile(r"1-s2\.0-(S[0-9]{16})-main\.pdf$", re.IGNORECASE)
 _OUP_ARTICLE_PDF_PATH = re.compile(
     r"/article-pdf/(?:[^/?#]+/)+([A-Za-z0-9][A-Za-z0-9._-]*)\.pdf$",
     re.IGNORECASE,
 )
 _CNKI_ORDER_HOST = "bar.cnki.net"
 _CNKI_ORDER_PATH = "/bar/download/order"
+_SPRINGER_DOI_SUFFIX = r"(10\.\d{4,9}/[A-Za-z0-9][A-Za-z0-9._;()/:+\-]*)"
+_SPRINGER_ARTICLE_IDENTITY = re.compile(r"/article/" + _SPRINGER_DOI_SUFFIX + r"$", re.IGNORECASE)
+_SPRINGER_PDF_IDENTITY = re.compile(r"/content/pdf/" + _SPRINGER_DOI_SUFFIX + r"\.pdf$", re.IGNORECASE)
 _DIRECTED_DOWNLOAD_IDENTITY_SUFFIXES = frozenset({".pdf", ".caj"})
 
 DEFAULT_WILL_BEGIN_TIMEOUT_SECONDS = 45.0
@@ -103,30 +112,67 @@ class DirectedDownloadResult:
         }
 
 
+def _elsevier_pdf_path_pii(url: str) -> str:
+    """Recognize only a complete standard main-PDF path on existing hosts."""
+
+    try:
+        parsed = urlsplit(url)
+        if (parsed.hostname or "").casefold().rstrip(".") not in ELSEVIER_PDF_HOSTS:
+            return ""
+    except ValueError:
+        return ""
+    path = unquote(parsed.path)
+    found = _ELSEVIER_MAIN_PDF_PATH.fullmatch(path)
+    if found is None:
+        found = _ELSEVIER_MAIN_PDF_NAME.fullmatch(path.removeprefix("/"))
+    return found.group(1) if found else ""
+
+
 def pii_from_url(url: str) -> str:
     """The paper identifier a download URL names, or empty when it names none.
 
-    Existing ``pii=`` and ``/pii/`` forms keep priority.  The only additional
-    identities are an OUP main-article PDF stem and a CNKI single-paper order
-    id; an arbitrary PDF filename remains insufficient.
+    Existing ``pii=`` and ``/pii/`` forms keep their priority for those sources.
+    A Springer DOI path remains authoritative over an unrelated query label.
+    The only additional identities are a standard Elsevier main-PDF path on
+    its existing trusted hosts, an OUP main-article PDF stem, a CNKI single-paper order id,
+    and the full DOI in a standard Springer article/PDF path on the official
+    host or the separately bound HUNNU gateway. An arbitrary PDF filename
+    remains insufficient; host permission is still checked for every event.
     """
 
     value = url or ""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        parsed = None
+    host = (parsed.hostname or "").casefold().rstrip(".") if parsed is not None else ""
+    if parsed is not None and host in {"link.springer.com", "yclib.hunnu.edu.cn"}:
+        path = unquote(parsed.path)
+        gateway = host == "yclib.hunnu.edu.cn" and path.startswith("/vpn/")
+        if host == "link.springer.com" or gateway:
+            for pattern in (_SPRINGER_PDF_IDENTITY, _SPRINGER_ARTICLE_IDENTITY):
+                found = pattern.search(path) if gateway else pattern.fullmatch(path)
+                if found:
+                    return found.group(1).casefold()
+
+    elsevier_pii = _elsevier_pdf_path_pii(value)
+    if elsevier_pii:
+        # A query must not replace the explicit article PII in this path.
+        # Ambiguous identities fail closed in both response and event capture.
+        query_piis = [candidate for key, candidate in parse_qsl(parsed.query, keep_blank_values=True) if key.casefold() == "pii"]
+        if any(candidate.casefold() != elsevier_pii.casefold() for candidate in query_piis):
+            return ""
+        return elsevier_pii
     for pattern in (_PII_IN_URL, _PII_IN_PATH):
         found = pattern.search(value)
         if found:
             return found.group(1)
-
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
+    if parsed is None:
         return ""
-
     found = _OUP_ARTICLE_PDF_PATH.search(parsed.path)
     if found:
         return found.group(1)
 
-    host = (parsed.hostname or "").casefold().rstrip(".")
     if host == _CNKI_ORDER_HOST and parsed.path.casefold() == _CNKI_ORDER_PATH:
         for key, candidate in parse_qsl(parsed.query, keep_blank_values=True):
             if key.casefold() == "id" and candidate:
@@ -231,13 +277,23 @@ def _pending_claimed_identity(
     locked = locked_pii.casefold()
     if locked:
         url_pii = pii_from_url(pending.url)
-        if url_pii.casefold() == locked:
-            return url_pii
+        if url_pii:
+            # A recognized conflicting URL identity is decisive: a matching
+            # suggested filename or title cannot wash another paper's URL.
+            return url_pii if url_pii.casefold() == locked else ""
+        if _elsevier_pdf_path_pii(pending.url):
+            # The standard path was recognized but rejected for conflicting
+            # query identity. A filename/title must not revive this event.
+            return ""
         filename_identity = _suggested_filename_identity(
             pending.suggested_filename
         )
         if filename_identity.casefold() == locked:
             return filename_identity
+        if host_of(pending.url) in ELSEVIER_PDF_HOSTS:
+            found = _ELSEVIER_MAIN_PDF_NAME.fullmatch(Path(pending.suggested_filename).name)
+            if found:
+                return found.group(1) if found.group(1).casefold() == locked else ""
     return _matching_declared_label(pending, locked_labels)
 
 
@@ -319,6 +375,12 @@ class BrowserDirectedDownload:
     _target: asyncio.Future | None = None
     _armed: bool = False
     configured: bool = False
+
+    @property
+    def matching_download_started(self) -> bool:
+        """Whether the browser has already named a download for this target."""
+
+        return bool(self._target is not None and self._target.done() and not self._target.cancelled())
 
     # -- lifecycle -------------------------------------------------------
 

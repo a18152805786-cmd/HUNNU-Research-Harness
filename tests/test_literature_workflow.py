@@ -95,6 +95,12 @@ class _MockAdapter(LiteratureSourceAdapter):
         path = self.root / "source.pdf"
         if self.mode == "invalid_pdf":
             path.write_text("<html>blocked</html>", encoding="utf-8")
+        elif self.mode == "download_challenge":
+            path.write_text(
+                "<!DOCTYPE html><html><head><title>Client Challenge</title></head>"
+                "<body>Required site content could not load.</body></html>",
+                encoding="utf-8",
+            )
         else:
             write_minimal_pdf(path)
         return path
@@ -335,6 +341,25 @@ class LiteratureWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ACTION_REQUIRED_USER_LOGIN=true", result.action_required_reason)
             self.assertTrue((root / "run" / "RUN_AUDIT.md").exists())
             self.assertEqual(result.downloads, [])
+
+    async def test_downloaded_challenge_stops_with_a_human_gate_and_keeps_the_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = _MockAdapter(root, mode="download_challenge")
+            result = await LiteratureAcquisitionWorkflow(
+                adapter,
+                run_root=root / "run",
+                human_like_delay_seconds=0,
+                allow_outside_project_for_tests=True,
+            ).run(request())
+            self.assertEqual(result.status, RunStatus.ACTION_REQUIRED_USER_LOGIN)
+            self.assertEqual(result.records[0].error_status, RunStatus.ACTION_REQUIRED_USER_LOGIN.value)
+            self.assertEqual(adapter.download_calls, 1)
+            self.assertEqual(result.downloads, [])
+            self.assertIn("challenge HTML document", result.action_required_reason)
+            self.assertIn("Client Challenge", (root / "source.pdf").read_text(encoding="utf-8"))
+            manifest = json.loads((root / "run" / "DOWNLOAD_MANIFEST.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["Downloads"], [])
 
     async def test_identity_locked_keep_candidate_reaches_authorization_stage(self):
         with tempfile.TemporaryDirectory() as tmp:

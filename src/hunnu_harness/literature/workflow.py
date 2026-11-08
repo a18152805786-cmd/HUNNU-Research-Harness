@@ -257,6 +257,7 @@ class LiteratureAcquisitionWorkflow:
         search_pacer: "SearchPaceLedger | None" = None,
     ):
         self.adapter = adapter
+        self._allow_outside_project_for_tests = allow_outside_project_for_tests
         self.writer = LiteratureArtifactWriter(
             run_root,
             allow_outside_project_for_tests=allow_outside_project_for_tests,
@@ -296,6 +297,7 @@ class LiteratureAcquisitionWorkflow:
         downloads: list[DownloadManifestEntry] = []
         errors: list[str] = []
         action_required_reason = UNKNOWN
+        manual_download_receipt: dict[str, Any] | None = None
         status = RunStatus.SUCCESS
 
         if request.restricted_search and not getattr(self.adapter, "supports_restricted_search", False):
@@ -612,11 +614,32 @@ class LiteratureAcquisitionWorkflow:
                         full_text_format=record.full_text_format,
                     )
                 except SourceUserDownloadRequired as exc:
-                    action_required_reason = str(exc)
-                    errors.append(str(exc))
+                    handoff_receipt = None
+                    persistence_error = ""
+                    if exc.handoff_state is not None and record.source_database == "OxfordAcademic":
+                        from .manual_resume import save_oxford_manual_handoff
+                        try:
+                            handoff_receipt = save_oxford_manual_handoff(
+                                request=request, record=record, access=access,
+                                state=exc.handoff_state, run_root=self.writer.run_root,
+                                allow_outside_output_for_tests=self._allow_outside_project_for_tests,
+                            )
+                            self.logger.log("manual_download_handoff_persisted", status=RunStatus.ACTION_REQUIRED_USER_DOWNLOAD.value, **handoff_receipt.as_dict())
+                            manual_download_receipt = handoff_receipt.as_dict()
+                        except (OSError, ValueError, TypeError) as save_error:
+                            record.manual_download_handoff_armed = False
+                            persistence_error = f"; ManualDownloadHandoffPersisted=false; do not click Download until persistence is repaired: {save_error}"
+                    record.error_status = RunStatus.ACTION_REQUIRED_USER_DOWNLOAD.value
+                    record.error_reason = str(exc) + persistence_error
+                    if handoff_receipt is not None:
+                        record.error_reason += f"; StatePath={handoff_receipt.state_path}; StateSHA256={handoff_receipt.state_sha256}"
+                    action_required_reason = record.error_reason
+                    errors.append(record.error_reason)
                     status = RunStatus.ACTION_REQUIRED_USER_DOWNLOAD
                     break
                 except SourceActionRequired as exc:
+                    record.error_status = RunStatus.ACTION_REQUIRED_USER_LOGIN.value
+                    record.error_reason = str(exc)
                     action_required_reason = str(exc)
                     errors.append(str(exc))
                     status = RunStatus.ACTION_REQUIRED_USER_LOGIN
@@ -670,6 +693,7 @@ class LiteratureAcquisitionWorkflow:
             errors=errors,
             query_count=self._query_log_count(),
             action_required_reason=action_required_reason,
+            manual_download_receipt=manual_download_receipt,
         )
 
     async def _rate_limit(self) -> None:
@@ -693,6 +717,7 @@ class LiteratureAcquisitionWorkflow:
         errors: list[str],
         query_count: int,
         action_required_reason: str = UNKNOWN,
+        manual_download_receipt: dict[str, Any] | None = None,
     ) -> LiteratureRunResult:
         self.writer.write_search_results(records)
         self.writer.write_screening_decisions(records)
@@ -743,6 +768,7 @@ class LiteratureAcquisitionWorkflow:
             downloads=downloads,
             errors=errors,
             action_required_reason=action_required_reason,
+            manual_download_receipt=manual_download_receipt,
         )
 
 
@@ -1520,9 +1546,16 @@ def finalize_unattended_download_acceptance(
     downloads: list[DownloadManifestEntry] = []
     errors: list[str] = []
     status = RunStatus.SUCCESS
-    allowed_methods = {"PLAYWRIGHT_DOWNLOAD_EVENT", "AUTHORIZED_PDF_RESPONSE"}
+    allowed_methods = {
+        "PLAYWRIGHT_DOWNLOAD_EVENT", "AUTHORIZED_PDF_RESPONSE", "BROWSER_DIRECTED_DOWNLOAD",
+    }
     if record.acquisition_method not in allowed_methods:
         errors.append("Unattended browser acquisition method was not established")
+        status = RunStatus.DOWNLOAD_FAILED
+    elif record.acquisition_method == "BROWSER_DIRECTED_DOWNLOAD" and (
+        not record.download_event_emitted or record.authorized_pdf_response_captured
+    ):
+        errors.append("Directed unattended download requires completed browser download-event provenance")
         status = RunStatus.DOWNLOAD_FAILED
     elif not record.target_identity_confirmed:
         errors.append("Unattended download target identity was not confirmed")

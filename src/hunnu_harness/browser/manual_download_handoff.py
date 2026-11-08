@@ -17,6 +17,13 @@ _TEMPORARY_SUFFIXES = (".crdownload", ".part", ".partial", ".download", ".tmp")
 _SAFE_FILENAME = re.compile(r"[^0-9A-Za-z._-]+")
 
 
+def _reject_local_links(path: Path) -> None:
+    for candidate in (Path(path), *Path(path).parents):
+        io = _windows_io_path(candidate)
+        if io.is_symlink() or getattr(io, "is_junction", lambda: False)():
+            raise ManualDownloadHandoffError("Manual download paths cannot contain links or junctions")
+
+
 class ManualDownloadHandoffError(RuntimeError):
     pass
 
@@ -206,6 +213,8 @@ class ManualDownloadHandoff:
         *,
         allow_outside_output_for_tests: bool = False,
     ) -> None:
+        _reject_local_links(watch_directory)
+        _reject_local_links(staging_directory)
         self.watch_directory = _logical_path(watch_directory)
         self.staging_directory = _logical_path(staging_directory)
         if not _windows_io_path(self.watch_directory).is_dir():
@@ -240,6 +249,8 @@ class ManualDownloadHandoff:
             _windows_io_path(self.watch_directory).iterdir(),
             key=lambda item: item.name.casefold(),
         ):
+            if raw_path.is_symlink() or getattr(raw_path, "is_junction", lambda: False)():
+                continue
             path = _logical_path(raw_path)
             path_io = _windows_io_path(path)
             if not path_io.is_file():
@@ -378,6 +389,7 @@ class ManualDownloadHandoff:
         *,
         controlled_filename: str,
     ) -> ManualDownloadHandoffResult:
+        _reject_local_links(detection.source_path)
         source = _logical_path(detection.source_path)
         source_io = _windows_io_path(source)
         if source.parent != self.watch_directory:
@@ -388,14 +400,20 @@ class ManualDownloadHandoff:
         if not safe_name.casefold().endswith(".pdf"):
             safe_name = f"{safe_name or 'manual-download'}.pdf"
         destination = self.staging_directory / safe_name
+        _reject_local_links(destination)
         digest = _sha256(source)
+        source_stat = source_io.stat()
         if _windows_io_path(destination).exists() and _sha256(destination) != digest:
             destination = destination.with_name(f"{destination.stem}_{digest[:12]}.pdf")
+            _reject_local_links(destination)
         if source != destination and not _windows_io_path(destination).exists():
             shutil.copy2(source_io, _windows_io_path(destination))
         destination_io = _windows_io_path(destination)
         if not destination_io.is_file() or _sha256(destination) != digest:
             raise ManualDownloadHandoffError("Controlled staging copy failed SHA256 verification")
+        current_stat = source_io.stat()
+        if (current_stat.st_size, current_stat.st_mtime_ns) != (source_stat.st_size, source_stat.st_mtime_ns) or _sha256(source) != digest:
+            raise ManualDownloadHandoffError("Original manual download changed during staging; retained copy requires review")
         return ManualDownloadHandoffResult(
             source_path=source,
             staged_path=destination,

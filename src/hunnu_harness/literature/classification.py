@@ -59,6 +59,27 @@ MAX_NAME_TERM_WEIGHT = 6.0
 # is weaker than the score alone suggests, which is what gates secondaries.
 SIGNAL_LEXICON = "LEXICON"
 SIGNAL_TAXONOMY_NAME = "TAXONOMY_NAME"
+SIGNAL_METHOD_CONTEXT = "METHOD_CONTEXT"
+CLASSIFIER_VERSION = "work-classifier-2026-11-08-method-context-v1"
+
+# Only an explicitly methodological *title* earns this signal. Merely using
+# DML in an application, or mentioning it in references/body text, does not.
+_DML_METHOD_TITLE = re.compile(
+    r"^(?:double(?:\s*[/\-]\s*debiased)?|debiased)\s+machine\s+learning\s+for\s+"
+    r"(?:treatment\s+and\s+structural\s+parameters|treatment\s+parameters|"
+    r"structural\s+parameters|treatment\s+effects|causal\s+parameters|"
+    r"causal\s+inference|semiparametric\s+(?:estimation|inference)|"
+    r"difference[\s-]+in[\s-]+differences(?:\s+models)?)\s*[.?!]?$",
+    re.IGNORECASE,
+)
+_DML_METHOD_TITLE_ZH = re.compile(
+    r"^(?:双重(?:去偏)?|去偏)机器学习(?:的)?(?:估计与推断|估计方法|推断方法|方法与理论|理论与方法)[。]?$"
+)
+
+
+def _methodological_dml_title(title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", title.strip()).replace("–", "-").replace("—", "-")
+    return bool(_DML_METHOD_TITLE.fullmatch(normalized) or _DML_METHOD_TITLE_ZH.fullmatch(normalized))
 
 # Confidence saturates as score / (score + CONFIDENCE_SCALE).  Calibrated on the
 # 179-work corpus; see docs/POST_ACQUISITION_CLASSIFICATION.md.
@@ -295,11 +316,16 @@ class WorkClassifier:
         """Accumulate evidence per taxonomy label across every populated field."""
 
         totals: dict[TopicLabel, _TopicAccumulator] = {}
+        method_title = _methodological_dml_title(payload.title)
         for field_name, weight in FIELD_WEIGHTS.items():
             text = getattr(payload, field_name, "") or ""
             if not text.strip():
                 continue
-            matches = match_concepts(text)
+            # In a confirmed method-title context, the generic ML phrase names
+            # the estimator rather than AI adoption. Other AI/robot evidence
+            # is still scored normally; application titles take the old path.
+            scored_text = re.sub(r"\bmachine\s+learning\b|机器学习", " ", text, flags=re.I) if method_title else text
+            matches = match_concepts(scored_text)
             per_concept: dict[str, int] = {}
             for match in matches:
                 hits = per_concept.get(match.key, 0)
@@ -307,7 +333,14 @@ class WorkClassifier:
                     continue
                 per_concept[match.key] = hits + 1
                 self._credit(totals, match, weight=weight, field_name=field_name)
-            self._credit_taxonomy_names(totals, text, weight=weight, field_name=field_name)
+            self._credit_taxonomy_names(totals, scored_text, weight=weight, field_name=field_name)
+        if method_title:
+            label = self.taxonomy.resolve_subtopic("计量方法与研究设计")
+            if label is not None:
+                totals.setdefault(label, _TopicAccumulator()).add(
+                    weight=9.0, concept="methodological_dml_title", field_name="title",
+                    term=payload.title, signal=SIGNAL_METHOD_CONTEXT,
+                )
         return totals
 
     def _credit_taxonomy_names(
@@ -517,6 +550,7 @@ def _clean(value: Any) -> str:
 
 
 __all__ = [
+    "CLASSIFIER_VERSION",
     "CONFIDENCE_SCALE",
     "DEFAULT_AUTO_ASSIGN_THRESHOLD",
     "DEFAULT_REVIEW_THRESHOLD",
@@ -525,6 +559,7 @@ __all__ = [
     "MAX_TOPICS_PER_WORK",
     "REQUIRE_TAXONOMY_NAME_FOR_SECONDARY",
     "SIGNAL_LEXICON",
+    "SIGNAL_METHOD_CONTEXT",
     "SIGNAL_TAXONOMY_NAME",
     "TAXONOMY_NAME_SPLIT",
     "ClassificationEvidence",

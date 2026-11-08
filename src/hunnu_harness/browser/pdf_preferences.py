@@ -147,6 +147,8 @@ class ResearchChromePdfPreference:
             payload = json.loads(_windows_io_path(self.preferences_path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ResearchChromePreferenceError("Research Chrome Preferences is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ResearchChromePreferenceError("Research Chrome Preferences root is not a JSON object")
         return payload
 
     def _read(self, container: str, key: str, kind: type) -> bool | int | None:
@@ -318,6 +320,59 @@ class ResearchChromePdfPreference:
         raise ResearchChromePreferenceError(f"Unterminated JSON object for {key}")
 
 
+def assess_pdf_download_readiness(profile_dir: Path) -> dict[str, object]:
+    """Read the dedicated profile's PDF-handling precondition, without changing it.
+
+    This answers a narrower question than live acquisition readiness. Metadata
+    retrieval and a human PDF handoff do not require this preference; callers
+    promising automatic file delivery should report a missing precondition
+    before spending a publisher fetch. A saved setting alone never proves the
+    running browser loaded it, login works, or a publisher will deliver a PDF.
+    """
+
+    value: bool | None = None
+    error: str | None = None
+    try:
+        value = ResearchChromePdfPreference(profile_dir).inspect()
+        state = "ENABLED" if value is True else "DISABLED" if value is False else "ABSENT_OR_INVALID"
+    except (ResearchChromePreferenceError, OSError, ValueError) as exc:
+        state = "UNAVAILABLE"
+        error = str(exc)
+    ready = value is True
+    if ready:
+        detail = (
+            "The dedicated Research Chrome profile enables direct PDF downloads. "
+            "This is a profile-setting check; current-session file delivery is not verified."
+        )
+    else:
+        detail = (
+            "Automatic PDF file delivery has an unconfirmed profile precondition: "
+            f"{PDF_DIRECT_DOWNLOAD_PREFERENCE} is {state}. "
+            "Metadata access and an explicit manual-download handoff remain separate capabilities."
+        )
+        if error:
+            detail += f" {error}"
+    return {
+        "ResearchChromeDirectPdfDownloadConfigured": ready,
+        "AutomaticPdfDownloadPreconditionReady": ready,
+        "PdfPreferenceState": state,
+        "ConfigurationRequired": not ready,
+        "CurrentSessionDownloadVerified": False,
+        "Detail": detail,
+        "ConfigurationAction": (
+            "None"
+            if ready
+            else (
+                "Stop the dedicated Research Chrome normally; run "
+                "hunnu-harness browser-configure-pdf-download on that same stopped profile; "
+                "restart it with hunnu-harness browser-start. Never reset the profile or its login state."
+            )
+        ),
+        "NetworkActivity": False,
+        "ProfileModified": False,
+    }
+
+
 __all__ = [
     "DEFAULT_RESEARCH_CHROME_PROFILE",
     "PDF_DIRECT_DOWNLOAD_PREFERENCE",
@@ -327,4 +382,5 @@ __all__ = [
     "ResearchChromePdfPreference",
     "ResearchChromePreferenceError",
     "ResearchChromeProfileInUse",
+    "assess_pdf_download_readiness",
 ]

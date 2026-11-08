@@ -1,14 +1,15 @@
 import unittest
+import tempfile
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
-from hunnu_harness.browser import DownloadCommand
+from hunnu_harness.browser import DownloadArtifact, DownloadCommand
 from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceLayoutChanged
 from hunnu_harness.literature.adapters.sciencedirect import ScienceDirectAdapter
 from hunnu_harness.literature.models import AccessType, LiteratureSearchRequest, PublicationStatus
 
-from literature_test_support import isolated_fetch_ledger
+from hunnu_harness.paths import TEMP_DIR
+from literature_test_support import isolated_fetch_ledger, write_minimal_pdf_with_text
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "literature"
@@ -171,14 +172,23 @@ class ScienceDirectAdapterAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authorized_pdf_download_uses_mcp_representable_css_target(self):
         class _DownloadBrowser:
-            def __init__(self):
+            def __init__(self, path):
                 self.command = None
+                self.path = path
 
             async def execute(self, command):
                 self.command = command
-                return SimpleNamespace(local_path=FIXTURES / "sciencedirect_article_authorized.html")
+                return DownloadArtifact.from_path(self.path, metadata={
+                    "AcquisitionMethod": "BROWSER_DIRECTED_DOWNLOAD",
+                    "DownloadEventEmitted": True, "AuthorizedPDFResponseCaptured": False,
+                    "SourceHost": "pdf.sciencedirectassets.com", "SourceRoute": "SCIENCEDIRECT_OFFICIAL_PDF",
+                })
 
-        browser = _DownloadBrowser()
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        holder = tempfile.TemporaryDirectory(prefix="sd-capture-fixture-", dir=TEMP_DIR)
+        self.addCleanup(holder.cleanup)
+        path = Path(holder.name) / "received.pdf"
+        browser = _DownloadBrowser(path)
         adapter = ScienceDirectAdapter(browser)
         record = ScienceDirectAdapter.parse_article_html(
             fixture("sciencedirect_article_authorized.html"),
@@ -188,6 +198,7 @@ class ScienceDirectAdapterAsyncTests(unittest.IsolatedAsyncioTestCase):
             fixture("sciencedirect_article_authorized.html"),
             source_url=record.source_page,
         )
+        write_minimal_pdf_with_text(path, record.title + " DOI: " + record.doi)
 
         with isolated_fetch_ledger() as ledger:
             adapter.fetch_ledger = ledger
@@ -198,6 +209,10 @@ class ScienceDirectAdapterAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/pdfft", browser.command.target.css)
         self.assertNotEqual(browser.command.target.css, access.download_locator)
         self.assertIsNone(browser.command.target.text_regex)
+        self.assertIsNotNone(browser.command.capture)
+        self.assertTrue(browser.command.capture.download_identity_required)
+        self.assertEqual(browser.command.capture.expected_url, access.download_url)
+        self.assertIn("pdf.sciencedirectassets.com", browser.command.capture.trusted_hosts)
 
     async def test_authorized_pdf_download_rejects_control_for_another_article(self):
         class _DownloadBrowser:

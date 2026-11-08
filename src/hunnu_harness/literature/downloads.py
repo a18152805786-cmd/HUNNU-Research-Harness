@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from ..paths import _logical_path, _windows_io_path, _windows_path_units, require_output_path
-from .fulltext import AuthorizedFullTextValidator, infer_full_text_format
+from .fulltext import AuthorizedFullTextValidator, FullTextValidationResult, infer_full_text_format
+from .adapters.base import HumanActionReason, SourceActionRequired
 from .auto_classification import PostAcquisitionClassifier
 from .classification import ClassificationStatus
 from .library import GlobalPaperLibrary
@@ -26,6 +27,17 @@ class InvalidFullTextDownload(ValueError):
 
 class InvalidPDFDownload(InvalidFullTextDownload):
     pass
+
+
+def reject_downloaded_challenge(validation: FullTextValidationResult) -> None:
+    """Stop on retained challenge bytes without claiming a visible CAPTCHA."""
+
+    if validation.manual_action_required:
+        raise SourceActionRequired(
+            "ACTION_REQUIRED_USER_LOGIN=true; Reason=Downloaded response is a challenge "
+            "HTML document, not the authorized full text; BrowserReadyForManualAction=false",
+            reason=HumanActionReason.CHALLENGE_TEXT_UNVERIFIED,
+        )
 
 
 class LiteratureDownloadManager:
@@ -91,6 +103,7 @@ class LiteratureDownloadManager:
         declared_format = full_text_format or access.full_text_format
         resolved_format = infer_full_text_format(source, declared_format)
         validation = AuthorizedFullTextValidator.validate(source, resolved_format, record=record)
+        reject_downloaded_challenge(validation)
         if not validation.passed:
             raise InvalidFullTextDownload(validation.error)
 

@@ -27,7 +27,9 @@ README 讲它是什么、为什么这样设计；这份文档讲具体怎么跑�
 - `browser-status` 只报告是否在监听以及 profile 是否被占用（`ProfileInUse`），不会启动浏览器；它与 `browser-stop` 依据同一组事实作答。
 - `browser-start` 以 Chrome 自带的 `--restore-last-session` 启动，因此正常退出后再次启动时，出版商在机构登录后签发的会话 Cookie 会被恢复而不是被清除；没有持久浏览器时由运行自行启动的 Playwright 浏览器也带同一开关。
 - `browser-configure-session-restore` 不修改 Preferences（`session.restore_on_startup` 在 Windows 上是 Chrome 受保护的 tracked preference，Harness 无法也不应伪造），只报告实际生效的机制。
-- `browser-configure-pdf-download` 仅对停止状态的专用 profile 定向启用 `plugins.always_open_pdf_externally`，这样点击 Oxford 官方 PDF 按钮会直接产生标准下载事件，无需操作 Chrome PDF Viewer。全程不 replay URL，也不自动操作 Viewer GUI；`ManualDownloadHandoff` 保留为人工兜底，但不计为无人值守成功。
+- `browser-configure-pdf-download` 仅对停止状态的专用 profile 定向启用 `plugins.always_open_pdf_externally`，用于让 PDF 链接按文件下载处理。先正常 `browser-stop`，配置后用 `browser-start` 以原 profile 恢复；不能在线修改运行中的 profile，也不改 Cookie 或登录存储。配置值是前置条件，实际下载是否成功仍以当前运行的事件、文件和身份校验为准。全程不 replay URL，也不自动操作 Viewer GUI；`ManualDownloadHandoff` 保留为人工兜底，不计为无人值守成功。
+
+`doctor --json` 的 `AutomaticPdfDownloadPreconditionReady` 和 `PdfDownloadReadiness` 单独报告这项设置。缺少设置会给出 `READY_WITH_WARNINGS`；元数据和显式人工接续仍是独立能力，`AcquisitionReady=true` 不能被解释为所有出版商下载已通过。
 
 Python API 仍提供 `research_browser.start()`、`status()`、`stop()`，供后续服务化封装使用。
 
@@ -85,6 +87,22 @@ v0.1 的端到端验收（`HarnessV01CNRDSTestPassed=true`）：在用户人工�
 ```
 
 `--source` 可选 `sciencedirect`、`springerlink`、`cnki`、`oxfordacademic`；目标用 `--title`、`--doi` 或 `--request-json` 指定。退出码 2 表示需要人（登录、人工下载或人工判断），这时停下交还用户（AGENTS.md 规则 72），不要转去同一机构会话的另一个来源。
+
+Oxford 的明确 DOI 请求先通过同一受控 `BrowserCommandPort` 读取固定 Crossref 单条公开书目端点，核对返回 DOI，并只用 `resource.primary.URL` 定位规范的 Oxford 文章落地页。随后仍须由 Oxford 自身元数据同时确认 DOI、题名和文章 ID。此步骤不授权全文、不使用 Crossref 的全文链接，也不扩大出版商域名白名单。公开元数据不可读或身份不符会明确停止；普通官网全文检索中的有限候选未匹配，不代表出版商零命中。主题检索仍走 Oxford 官方搜索页。
+
+持久 Research Chrome 的下载证据可报告为 `BROWSER_DIRECTED_DOWNLOAD`：必须有匹配目标的已完成浏览器下载事件，并通过来源、文件和目标身份核验。该方法与响应正文捕获、人工下载 handoff 分别记载，不能互相伪造。ScienceDirect 同一次官方 PDF 点击可监听下载事件及可信同身份 PDF 响应；不会在超时后再点一次或补发 GET。首次收到的无效字节保留用于离线诊断。
+
+Springer 的公开文章与已绑定的机构路径都使用已经核实的官方 PDF 按钮，不再用单独的浏览器上下文 HTTP 请求替代页面操作。公开路径在点击前核对完整 DOI、HTTPS 和精确来源主机，收到文件后使用现有本地文章身份校验，参考文献中引用的 DOI 不能代替本篇 DOI。
+
+Oxford 人工下载接续需要明确的绝对保存目录：`acquire --source oxfordacademic ... --manual-watch-directory <目录>`，或同义环境变量 `HUNNU_HARNESS_MANUAL_DOWNLOAD_WATCH_DIRECTORY`。可指定 Output 内的约定目录，也可明确指定专用浏览器的实际下载目录；用户应把文件保存到该处。受控 staging 和所有运行证据始终在 Output Root 内。此参数不修改 Chrome 下载设置，不能把临时浏览器 capture 目录当作默认下载目录。
+
+当运行返回 `ACTION_REQUIRED_USER_DOWNLOAD` 时，先检查 `ManualDownloadHandoffPersisted=true`、`StatePath` 和 `StateSHA256`。只有已有真实下载前快照和凭证，才让用户把 PDF 保存到约定目录一次，然后执行纯本地恢复：
+
+```powershell
+.venv\Scripts\hunnu-harness.exe manual-download-resume --state <StatePath> --sha256 <StateSHA256> --json
+```
+
+恢复只检测单个新文件、复制并校验原件、核对题名与 DOI，再经原有清单、哈希、入库和分类流程；不启动浏览器、不访问出版商、不重点击 PDF。超时、多个候选、坏文件或身份冲突会明确停止。未完成的人工下载条目会阻止批次再次取件；本地入库完成后，再运行原 `acquire-batch`，由文献库去重跳过该项。没有持久凭证或文件在快照前已下载时，不能重建、伪造旧快照，应走明确单文件 `library-stage` 和 `library-import` 的独立身份校验流程。
 
 **受限检索（只找学术期刊、只找指定刊物、只找指定年份；目前仅 CNKI，规则 39）。** 在请求 JSON 里加可选字段：`ResourceType`（只接受 `JournalArticle`，其他值直接判为无效请求）、`SourceJournals`（最多 8 个刊名，给了刊名即视为 `JournalArticle`）、`YearStart`/`YearEnd`（也可写 `YearFrom`/`YearTo`，两种写法数值不一致则拒绝）。受限请求里的年份对每条结果强制生效，不再只是筛选时扣分：
 

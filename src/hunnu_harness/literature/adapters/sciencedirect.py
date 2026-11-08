@@ -11,15 +11,18 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlsplit
+from urllib.parse import parse_qsl, quote_plus, urljoin, urlsplit
 
 from ...browser.commands import (
     BrowserTarget,
+    DownloadArtifact,
+    DownloadCaptureSpec,
     DownloadCommand,
     NavigateCommand,
     ObservationUnavailable,
     ObserveCommand,
 )
+from ...browser.authorized_file_capture import AcquisitionMethod
 from ...browser.playwright_backend import (
     _INTERSTITIAL_BODY_MARKERS,
     _INTERSTITIAL_TITLE_MARKERS,
@@ -31,7 +34,10 @@ from .base import (
     SourceActionRequired,
     SourceLayoutChanged,
     SourceUnavailable,
+    authorized_capture_result_from_artifact,
 )
+from ..downloads import reject_downloaded_challenge
+from ..fulltext import AuthorizedFullTextValidator, DOIContentVerification, verify_external_paper_identity
 from ..models import (
     AccessDecision,
     AccessType,
@@ -757,6 +763,40 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         observation = await self.browser.execute(ObserveCommand(include_html=True))
         return observation.require_html(), observation.url
 
+    @staticmethod
+    def _search_url_matches_query(url: str, query: str) -> bool:
+        """Bind reuse to the exact official, unfiltered query, never URL text."""
+
+        try:
+            parsed = urlsplit(url)
+            return (
+                parsed.scheme == "https"
+                and parsed.hostname in _SCIENCEDIRECT_HOSTS
+                and parsed.port in (None, 443)
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path == "/search"
+                and parse_qsl(
+                    parsed.query, keep_blank_values=True, strict_parsing=True,
+                    errors="strict", max_num_fields=1,
+                ) == [("qs", query)]
+            )
+        except (ValueError, UnicodeError):
+            return False
+
+    @classmethod
+    def _raise_if_search_interrupted(
+        cls, html: str, current_url: str, observation: SearchPageObservation
+    ) -> None:
+        if observation.page_type is SearchPageType.PUBLISHER_BLOCKED:
+            raise cls._publisher_block_stop(
+                "search", cls.publisher_block_evidence(cls._parser(html)) or "PublisherReference=unknown"
+            )
+        # A result container behind challenge text does not clear the gate.
+        cls.detect_interruption(html, url=current_url)
+        if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
+            raise cls._interstitial_stop("search")
+
     async def search(
         self,
         query: str,
@@ -765,23 +805,41 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         url = f"{self.search_origin}/search?qs={quote_plus(query)}"
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
-        await self.browser.execute(NavigateCommand(url))
-        html, current_url, observation = await self._settled_search_page(source_url=url)
-        self.last_search_observation = observation
-        if observation.page_type is SearchPageType.PUBLISHER_BLOCKED:
-            # Before detect_interruption: a refusal is not a challenge to pass,
-            # and it must not be reported as one.
-            raise self._publisher_block_stop(
-                "search", self.publisher_block_evidence(self._parser(html)) or "PublisherReference=unknown"
-            )
-        if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
-            # Challenge first: a page that is not a search page never reaches the
-            # result parser.  CAPTCHA and login text stay ``detect_interruption``'s
-            # to report, unchanged; what is left is the bot-check interstitial,
-            # which has no CAPTCHA words and used to fall through the parser as
-            # an empty -- and apparently successful -- search.
+        # A new CLI run may attach to the exact query whose gate the user just
+        # cleared. Reloading it would discard that page and can start the gate
+        # again. Observe first; never navigate out of an observed source gate.
+        try:
+            html, current_url = await self._content()
+        except ObservationUnavailable as exc:
+            raise SourceUnavailable(
+                "SEARCH_RESUME_OBSERVATION_UNAVAILABLE: the current page could not "
+                "be inspected safely; no search navigation was issued"
+            ) from exc
+        try:
+            official_page = urlsplit(current_url).hostname in _SCIENCEDIRECT_HOSTS
+        except ValueError:
+            official_page = False
+        observation = self.observe_search_page(html, source_url=current_url)
+        if official_page:
+            self.last_search_observation = observation
+            self._raise_if_search_interrupted(html, current_url, observation)
+        else:
+            # An institutional login handoff may be on CAS/WebVPN rather than
+            # the publisher host. Its existing manual gate must also survive.
             self.detect_interruption(html, url=current_url)
-            raise self._interstitial_stop("search")
+        if self._search_url_matches_query(current_url, query):
+            if observation.page_type is SearchPageType.PENDING:
+                html, current_url, observation = await self._settled_search_page(source_url=url)
+            if not self._search_url_matches_query(current_url, query):
+                raise SourceLayoutChanged(
+                    "ScienceDirect's observed search page changed its query while settling; "
+                    "no replacement navigation was issued"
+                )
+        else:
+            await self.browser.execute(NavigateCommand(url))
+            html, current_url, observation = await self._settled_search_page(source_url=url)
+        self.last_search_observation = observation
+        self._raise_if_search_interrupted(html, current_url, observation)
         results = self.parse_search_results_html(
             html,
             query=query,
@@ -1189,8 +1247,65 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                         css=download_target,
                     ),
                     suggested_filename=f"{record.paper_id}.pdf",
+                    capture=DownloadCaptureSpec(
+                        trusted_hosts=(
+                            "www.sciencedirect.com", "sciencedirect.com",
+                            "pdf.sciencedirectassets.com", "ars.els-cdn.com",
+                        ),
+                        provenance_host="www.sciencedirect.com",
+                        source_route="SCIENCEDIRECT_OFFICIAL_PDF",
+                        expected_url=access.download_url,
+                        download_identity_required=True,
+                    ),
                 )
             )
+            if not isinstance(artifact, DownloadArtifact):
+                raise SourceUnavailable("ScienceDirect capture is missing typed capture provenance")
+            # Page identity is not proof that the received PDF is this paper.
+            record.target_identity_confirmed = False
+            record.target_title_matched = False
+            record.target_doi_matched = False
+            result = authorized_capture_result_from_artifact(artifact)
+            event = (
+                result.acquisition_method in {
+                    AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
+                    AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,
+                }
+                and result.download_event_emitted
+                and not result.authorized_pdf_response_captured
+            )
+            response = (
+                result.acquisition_method is AcquisitionMethod.AUTHORIZED_PDF_RESPONSE
+                and result.authorized_pdf_response_captured
+                and not result.download_event_emitted
+            )
+            if (
+                not (event or response)
+                or result.source_host.casefold().rstrip(".") not in {
+                    "www.sciencedirect.com", "sciencedirect.com",
+                    "pdf.sciencedirectassets.com", "ars.els-cdn.com",
+                }
+                or result.source_route != "SCIENCEDIRECT_OFFICIAL_PDF"
+            ):
+                raise SourceUnavailable("ScienceDirect capture has missing or inconsistent source provenance")
+            validation = AuthorizedFullTextValidator.validate(result.path, record=record)
+            reject_downloaded_challenge(validation)
+            if not validation.passed:
+                raise SourceUnavailable(f"Captured ScienceDirect PDF failed file validation: {validation.error}")
+            proof = verify_external_paper_identity(result.path, record, validation=validation)
+            record.target_title_matched = proof.title_verification == "matched"
+            record.target_doi_matched = proof.doi_verification is DOIContentVerification.MATCHED
+            record.content_title_verification = proof.title_verification
+            record.target_identity_confirmed = bool(
+                proof.verified
+                and record.target_title_matched
+                and (normalize_doi(record.doi) == UNKNOWN or record.target_doi_matched)
+            )
+            if not record.target_identity_confirmed:
+                raise SourceLayoutChanged("Captured ScienceDirect PDF failed local target identity validation")
+        except (SourceUnavailable, SourceActionRequired, SourceLayoutChanged) as exc:
+            ticket.record_outcome(ok=False, detail=str(exc))
+            raise
         except Exception as exc:
             # The message, not just the class.  "DownloadFailure" alone sent two
             # rounds of investigation looking in the wrong place while the real
@@ -1201,8 +1316,26 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             raise SourceUnavailable(
                 f"Authorized PDF control did not produce a browser download: {detail}"
             ) from exc
+        record.acquisition_method = result.acquisition_method.value
+        record.source_host = result.source_host
+        record.source_route = result.source_route
+        record.institutional_route_used = False
+        record.download_event_emitted = result.download_event_emitted
+        record.authorized_pdf_response_captured = result.authorized_pdf_response_captured
+        record.official_pdf_action_confirmed = True
+        record.unattended_download_attempted = True
+        record.automatic_download_initiation = True
+        record.automatic_download_detection = True
+        record.manual_download_required = False
+        record.manual_download_handoff_armed = False
+        record.manual_download_detected = False
+        record.user_native_viewer_click_required = False
+        record.manual_download_handoff_used = False
+        record.human_download_action = False
+        record.download_initiation_mode = "HARNESS_OFFICIAL_PDF_ACTION_CLICK"
+        record.file_finalization_mode = "HARNESS_AUTOMATIC"
         ticket.record_outcome(ok=True, detail="browser download completed")
-        return artifact.local_path
+        return result.path
 
     async def get_citation(self) -> dict[str, Any]:
         record = await self.extract_metadata(search_query=UNKNOWN)

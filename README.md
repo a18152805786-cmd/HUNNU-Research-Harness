@@ -151,7 +151,20 @@ python -m venv .venv
 
 失败分支：如果报 `must be outside Core Root`，说明有人把输出根指进了代码文件夹——换个位置；如果报路径过长，把输出根设到更浅的目录（例如 `C:\HUNNU-Output`）。
 
+**第 4.1 步 · 主题分类配置。** `config/topic_taxonomy.default.json` 是 2026-11-08 新设计的通用经管研究初始模板（8 个领域、39 个主题），覆盖当前内置分类别名与检索概念。检查它是否适合自己的用途后，可显式初始化：
+
+```powershell
+$taxonomySource = (Resolve-Path config/topic_taxonomy.default.json).Path
+$taxonomyDigest = (Get-FileHash -LiteralPath $taxonomySource -Algorithm SHA256).Hash
+.venv\Scripts\python.exe -m hunnu_harness.cli library-init-taxonomy --source $taxonomySource --sha256 $taxonomyDigest --json
+.venv\Scripts\python.exe -m hunnu_harness.cli doctor --json
+```
+
+初始化只创建尚不存在的 Output Root 分类表，拒绝覆盖已有配置。也可使用自己审核过的分类表。未配置时仍可下载和入库，`doctor` 会报告 `READY_WITH_WARNINGS`、`ClassificationReady=false`；分类表有效时该字段为 true。此模板不是历史个人文献库分类表的恢复，也不继承其回测准确率。详见 [分类配置说明](docs/POST_ACQUISITION_CLASSIFICATION.md)。
+
 **第 5 步 · 浏览器。** Harness 自动发现系统 Chrome（也认环境变量 `HUNNU_RESEARCH_CHROME`），找到就不需要下载任何浏览器。验证跳过。只有这台机器确实没装 Chrome 时才走回落分支：安装 Google Chrome，或执行 `.venv\Scripts\python.exe -m playwright install chromium`（约 150MB 下载）。
+
+使用专用 Research Chrome 自动保存 PDF 前，先正常停止它，再运行 `browser-configure-pdf-download`，最后用 `browser-start` 以原 profile 恢复。`doctor` 的 `AutomaticPdfDownloadPreconditionReady` 只确认这项配置，不证明出版商会话或本次下载已通过。Oxford 需要人工保存时，使用明确的 watch 目录及返回的持久凭证，通过 `manual-download-resume` 本地接续；详见 [运行细节](docs/OPERATIONS.md)。
 
 **第 6 步 · 自检（测试套件）。**
 

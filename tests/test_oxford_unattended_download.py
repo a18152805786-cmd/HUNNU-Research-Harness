@@ -40,6 +40,8 @@ from hunnu_harness.literature.institutional import (
 )
 from hunnu_harness.literature.normalization import sha256_file
 from hunnu_harness.literature.workflow import finalize_unattended_download_acceptance
+from hunnu_harness.paths import TEMP_DIR
+from hunnu_harness.literature.adapters.base import SourceLayoutChanged
 
 from literature_test_support import isolated_fetch_ledger, write_minimal_pdf_with_text
 
@@ -239,6 +241,78 @@ class ResearchChromePdfPreferenceTests(unittest.TestCase):
 
 
 class OxfordUnattendedStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_automatic_capture_readiness_requires_consistent_method_and_event_provenance(self) -> None:
+        cases = (
+            (AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD, True, False, True),
+            (AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD, False, False, False),
+            (AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD, True, True, False),
+            (AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT, False, False, False),
+            (AcquisitionMethod.AUTHORIZED_PDF_RESPONSE, False, True, True),
+            (AcquisitionMethod.AUTHORIZED_PDF_RESPONSE, True, True, False),
+            (AcquisitionMethod.AUTHORIZED_PDF_RESPONSE, False, False, False),
+            (AcquisitionMethod.MANUAL_NATIVE_VIEWER_DOWNLOAD_HANDOFF, True, False, False),
+        )
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        for method, emitted, response_captured, expected_ready in cases:
+            with self.subTest(method=method, emitted=emitted, response=response_captured):
+                with tempfile.TemporaryDirectory(prefix="oxford-capture-provenance-", dir=TEMP_DIR) as td:
+                    root = Path(td)
+                    captured = root / "captured.pdf"
+                    captured.write_bytes(b"%PDF-1.4\n%%EOF\n")
+                    adapter = OxfordAcademicAdapter(_Browser(root), allow_capture_outside_output_for_tests=True)
+
+                    async def capture(*_args, **kwargs):
+                        await kwargs["official_action"]()
+                        return AuthorizedFileCaptureResult(
+                            captured, method, "academic.oup.com", "OXFORD_DIRECT",
+                            emitted, response_captured,
+                        )
+
+                    record = _record()
+                    with isolated_fetch_ledger() as ledger, patch.object(
+                        BrowserAuthorizedFileCapture, "capture_pdf", new=capture
+                    ), patch.object(
+                        OxfordAcademicAdapter, "validate_pdf_identity",
+                        return_value=OxfordPDFIdentityResult(True, True, True, True),
+                    ):
+                        adapter.fetch_ledger = ledger
+                        result = await adapter.download_fulltext(record, _access())
+                    self.assertEqual(result, captured)
+                    self.assertEqual(record.acquisition_method, method.value)
+                    self.assertEqual(record.download_event_emitted, emitted)
+                    self.assertEqual(record.authorized_pdf_response_captured, response_captured)
+                    self.assertEqual(record.oxford_unattended_download_ready, expected_ready)
+                    self.assertFalse(record.manual_download_handoff_used)
+
+    async def test_directed_download_never_reports_ready_when_local_pdf_identity_fails(self) -> None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="oxford-directed-wrong-identity-", dir=TEMP_DIR) as td:
+            root = Path(td)
+            captured = root / "captured.pdf"
+            captured.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            adapter = OxfordAcademicAdapter(_Browser(root), allow_capture_outside_output_for_tests=True)
+
+            async def capture(*_args, **kwargs):
+                await kwargs["official_action"]()
+                return AuthorizedFileCaptureResult(
+                    captured, AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,
+                    "academic.oup.com", "OXFORD_DIRECT", True, False,
+                )
+
+            record = _record()
+            with isolated_fetch_ledger() as ledger, patch.object(
+                BrowserAuthorizedFileCapture, "capture_pdf", new=capture
+            ), patch.object(
+                OxfordAcademicAdapter, "validate_pdf_identity",
+                return_value=OxfordPDFIdentityResult(False, False, False, False),
+            ), patch.object(OxfordAcademicAdapter, "_quarantine", return_value=captured):
+                adapter.fetch_ledger = ledger
+                with self.assertRaisesRegex(SourceLayoutChanged, "failed local target identity"):
+                    await adapter.download_fulltext(record, _access())
+            self.assertFalse(record.oxford_unattended_download_ready)
+            self.assertFalse(record.target_identity_confirmed)
+            self.assertTrue(captured.exists())
+
     async def test_download_event_marks_fully_unattended_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

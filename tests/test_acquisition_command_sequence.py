@@ -36,7 +36,7 @@ from hunnu_harness.literature.models import LiteratureRecord, LiteratureSearchRe
 from hunnu_harness.literature.workflow import LiteratureAcquisitionWorkflow
 from hunnu_harness.paths import TEMP_DIR
 
-from literature_test_support import minimal_pdf_bytes
+from literature_test_support import minimal_pdf_with_text_bytes
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "literature"
 SEARCH_HTML = (FIXTURES / "sciencedirect_search.html").read_text(encoding="utf-8")
@@ -109,8 +109,12 @@ class RecordingBrowser:
             target = getattr(command.target, "css", "") or ""
             self.commands.append(("DownloadCommand", target))
             path = self.downloads_dir / (command.suggested_filename or "download.pdf")
-            path.write_bytes(minimal_pdf_bytes())
-            return DownloadArtifact.from_path(path, source_url=self.url, page=self.page_handle)
+            path.write_bytes(minimal_pdf_with_text_bytes(FIXTURE_TITLE + " DOI: 10.1016/j.frl.2026.109884"))
+            return DownloadArtifact.from_path(path, source_url=self.url, page=self.page_handle, metadata={
+                "AcquisitionMethod": "BROWSER_DIRECTED_DOWNLOAD",
+                "DownloadEventEmitted": True, "AuthorizedPDFResponseCaptured": False,
+                "SourceHost": "pdf.sciencedirectassets.com", "SourceRoute": "SCIENCEDIRECT_OFFICIAL_PDF",
+            })
         raise AssertionError(f"unexpected command: {type(command).__name__}")
 
 

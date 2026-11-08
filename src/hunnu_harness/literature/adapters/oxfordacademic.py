@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from ...browser.commands import (
     BrowserTarget,
@@ -42,7 +46,7 @@ from ..models import (
     RunStatus,
     UNKNOWN,
 )
-from ..fulltext import AuthorizedFullTextValidator
+from ..fulltext import AuthorizedFullTextValidator, DOIContentVerification, verify_external_paper_identity
 from ..normalization import normalize_doi, normalize_person, normalize_title, stable_paper_id
 from ..security import sanitize_url
 from ...paths import QUARANTINE_DIR, _logical_path, _windows_io_path
@@ -68,6 +72,72 @@ _REJECT_PDF_LABELS = (
     "download issue",
     "data supplement",
 )
+
+# Silverchair search cards are distinct from the article links in navigation,
+# recommendations and promotional panels. Never fall back to all page links:
+# with a one-result budget a recommendation used to consume the only slot.
+_SEARCH_CARD_CLASSES = frozenset({"sr-list", "sr-list-item", "sr-list__item"})
+_SEARCH_TITLE_CLASSES = frozenset({"article-link", "item-title", "sri-title"})
+_VOID_HTML_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+})
+SEARCH_RENDER_MAX_OBSERVATIONS = 21
+SEARCH_RENDER_POLL_SECONDS = 0.5
+_PUBLIC_DOI_METADATA_ORIGIN = "https://api.crossref.org"
+_PUBLIC_DOI_METADATA_MAX_CHARS = 2_000_000
+_NO_RESULTS_MARKERS = (
+    "no results found", "no results were found", "your search did not return any results",
+)
+
+
+class _OxfordSearchHTMLParser(HTMLParser):
+    """Read title links only inside publisher search-result cards."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.anchors: list[_Anchor] = []
+        self.result_cards = 0
+        self.text_parts: list[str] = []
+        self._elements: list[tuple[str, frozenset[str]]] = []
+        self._anchors: list[tuple[str, dict[str, str], list[str], bool]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        values = {key.casefold(): value or "" for key, value in attrs}
+        classes = frozenset(values.get("class", "").split())
+        if classes & _SEARCH_CARD_CLASSES:
+            self.result_cards += 1
+        if tag not in _VOID_HTML_TAGS:
+            self._elements.append((tag, classes))
+        if tag == "a":
+            in_card = any(tokens & _SEARCH_CARD_CLASSES for _, tokens in self._elements)
+            is_title = bool(classes & _SEARCH_TITLE_CLASSES) or any(
+                name in {"h2", "h3", "h4", "h5"} or tokens & _SEARCH_TITLE_CLASSES
+                for name, tokens in self._elements
+            )
+            self._anchors.append((values.get("href", ""), values, [], in_card and is_title))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag == "a" and self._anchors:
+            href, attrs, parts, is_result = self._anchors.pop()
+            if is_result:
+                self.anchors.append(_Anchor(href, " ".join(parts).strip(), attrs, True))
+        for index in range(len(self._elements) - 1, -1, -1):
+            if self._elements[index][0] == tag:
+                del self._elements[index:]
+                break
+
+    def handle_data(self, data: str) -> None:
+        if not any(tag in {"script", "style", "template", "noscript"} for tag, _ in self._elements):
+            self.text_parts.append(data)
+        if self._anchors and data.strip():
+            self._anchors[-1][2].append(data.strip())
+
+    @property
+    def body_text(self) -> str:
+        return " ".join(self.text_parts)
 
 
 def _host(value: str) -> str:
@@ -126,11 +196,17 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         allow_capture_outside_output_for_tests: bool = False,
         capture_timeout_ms: int = 45_000,
         research_chrome_direct_pdf_download_configured: bool = False,
+        manual_download_watch_directory: Path | None = None,
     ) -> None:
         super().__init__(browser)
+        configured_watch = manual_download_watch_directory or os.environ.get(
+            "HUNNU_HARNESS_MANUAL_DOWNLOAD_WATCH_DIRECTORY"
+        )
+        self._manual_download_watch_directory = Path(configured_watch) if configured_watch else None
         self._institutional_route = institutional_route
         self._expected_record: LiteratureRecord | None = None
         self._detail_record: LiteratureRecord | None = None
+        self._resolved_doi_record: LiteratureRecord | None = None
         self._last_capture: AuthorizedFileCaptureResult | None = None
         self._manual_download_handoff: ManualDownloadHandoff | None = None
         self._manual_download_handoff_state: ManualDownloadHandoffState | None = None
@@ -157,7 +233,12 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         from ..institutional import HUNNUInstitutionalAccessResolver
 
         if not route.institutional_route_resolved or route.institutional_target_database_match is not True:
-            raise SourceLayoutChanged("Oxford institutional route is not resolved and identity-locked")
+            from ..security import sanitize_text
+
+            reason = sanitize_text(route.reason)[:600]
+            raise SourceLayoutChanged(
+                "Oxford institutional route is not resolved and identity-locked: " + reason
+            )
         if HUNNUInstitutionalAccessResolver.canonical_source(route.requested_source) != self.name:
             raise SourceLayoutChanged("Institutional route requested a source other than OxfordAcademic")
         self._institutional_route = route
@@ -286,7 +367,8 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         institutional_route_verified: bool = False,
     ) -> list[LiteratureRecord]:
         cls.detect_interruption(html, url=source_url)
-        parser = cls._parser(html)
+        parser = _OxfordSearchHTMLParser()
+        parser.feed(html)
         records: list[LiteratureRecord] = []
         seen: set[str] = set()
         for anchor in parser.anchors:
@@ -409,7 +491,6 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             return False
         if (
             expected.stable_identifier != UNKNOWN
-            and actual.stable_identifier != UNKNOWN
             and expected.stable_identifier != actual.stable_identifier
         ):
             return False
@@ -418,26 +499,26 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
     @staticmethod
     def validate_pdf_identity(path: Path, record: LiteratureRecord) -> OxfordPDFIdentityResult:
         try:
-            from pypdf import PdfReader  # type: ignore[import-not-found]
-
-            with _windows_io_path(path).open("rb") as handle:
-                reader = PdfReader(handle, strict=False)
-                text = "\n".join((page.extract_text() or "") for page in reader.pages[:2])
+            verification = verify_external_paper_identity(path, record)
+            text = AuthorizedFullTextValidator.extract_pdf_first_page_text(path) or ""
         except Exception:
             return OxfordPDFIdentityResult(False, False, False, False)
-        title_match = AuthorizedFullTextValidator._title_matches_extracted_text(record.title, text) is True
+        title_match = verification.title_verification == "matched"
         expected_doi = normalize_doi(record.doi)
-        doi_candidates = {
-            normalize_doi(match)
-            for match in re.findall(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", text, flags=re.IGNORECASE)
-        }
-        doi_match = expected_doi != UNKNOWN and expected_doi in doi_candidates
+        # The shared local helper excludes References and rejects conflicting
+        # article DOI evidence. A DOI cited by another paper is never identity.
+        doi_match = verification.doi_verification == DOIContentVerification.MATCHED
         first_author = normalize_person(record.first_author)
         author_match = (
             first_author != UNKNOWN
             and first_author.replace(" ", "") in normalize_person(text).replace(" ", "")
         )
-        confirmed = doi_match or (title_match and author_match)
+        title_evidence_required = normalize_title(record.title) != UNKNOWN
+        confirmed = (
+            verification.verified
+            and (not title_evidence_required or title_match)
+            and (doi_match if expected_doi != UNKNOWN else title_match and author_match)
+        )
         return OxfordPDFIdentityResult(confirmed, title_match, doi_match, author_match)
 
     @staticmethod
@@ -594,7 +675,116 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             parameters.extend(query.items())
         return urlunsplit((gateway.scheme, gateway.netloc, path, urlencode(parameters), ""))
 
+    @classmethod
+    def _public_doi_metadata_record(cls, payload: Any, *, requested_doi: str) -> LiteratureRecord:
+        """Validate a claimed identity from one public Crossref work record.
+
+        Only ``resource.primary.URL`` can supply the publisher landing page.
+        The DOI resolver URL and full-text/TDM ``link`` entries are never used.
+        This does not authorize full text: Oxford must independently confirm
+        the DOI, title and stable article identifier afterwards.
+        """
+
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise SourceLayoutChanged("Oxford exact DOI metadata response was not a confirmed Crossref work")
+        message = payload.get("message")
+        message_doi = message.get("DOI") if isinstance(message, dict) else None
+        if not isinstance(message_doi, str) or message_doi.strip().casefold() != requested_doi:
+            raise SourceLayoutChanged("Oxford exact DOI metadata response did not match the requested DOI")
+        titles = message.get("title")
+        if not isinstance(titles, list) or len(titles) != 1 or not isinstance(titles[0], str) or not titles[0].strip():
+            raise SourceLayoutChanged("Oxford exact DOI metadata did not supply one unambiguous title")
+        resource = message.get("resource")
+        primary = resource.get("primary") if isinstance(resource, dict) else None
+        landing = primary.get("URL") if isinstance(primary, dict) else None
+        if not isinstance(landing, str):
+            raise SourceLayoutChanged("Oxford exact DOI metadata had no primary publisher landing URL")
+        try:
+            parsed = urlsplit(landing)
+            safe = (
+                parsed.scheme == "https"
+                and parsed.hostname is not None
+                and parsed.hostname.casefold().rstrip(".") == cls.official_host
+                and parsed.port in {None, 443}
+                and parsed.username is None and parsed.password is None
+                and not parsed.query and not parsed.fragment
+                and "%" not in parsed.path
+                and re.search(r"[\x00-\x20\x7f\\]", landing) is None
+                and _ARTICLE_PATH.fullmatch(parsed.path.rstrip("/")) is not None
+                and all(
+                    part not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9._-]+", part)
+                    for part in parsed.path.split("/")[1:]
+                )
+                and ".pdf" not in parsed.path.casefold()
+                and landing == _canonical_article_url(landing)
+            )
+        except ValueError:
+            safe = False
+        if not safe:
+            raise SourceLayoutChanged(
+                "Oxford exact DOI primary URL was not a canonical unsigned Oxford article landing page"
+            )
+        paper_id = stable_paper_id(doi=requested_doi)
+        return LiteratureRecord(
+            paper_id=paper_id,
+            title=titles[0].strip(),
+            doi=requested_doi,
+            source_database=cls.name,
+            source_page=_canonical_article_url(landing),
+            navigation_url=landing,
+            stable_identifier=_stable_identifier(landing),
+            search_query=requested_doi,
+            canonical_paper_id=paper_id,
+        )
+
+    async def _resolve_public_doi_metadata(self, doi: str) -> list[LiteratureRecord]:
+        if self.browser is None:
+            raise SourceUnavailable("Browser command port is unavailable")
+        self._resolved_doi_record = None
+        # This fixed, unauthenticated bibliographic endpoint is separate from
+        # the publisher allowlist. It never supplies or downloads full text.
+        endpoint = f"{_PUBLIC_DOI_METADATA_ORIGIN}/works/{quote(doi, safe='')}"
+        await self.browser.execute(NavigateCommand(endpoint))
+        observation = await self.browser.execute(
+            ObserveCommand(include_html=False, include_visible_text=True)
+        )
+        try:
+            parsed = urlsplit(observation.url)
+            endpoint_matches = (
+                parsed.scheme == "https"
+                and parsed.hostname == "api.crossref.org"
+                and parsed.port in {None, 443}
+                and parsed.username is None and parsed.password is None
+                and not parsed.query and not parsed.fragment
+                and unquote(parsed.path).casefold() == f"/works/{doi}".casefold()
+            )
+        except ValueError:
+            endpoint_matches = False
+        if not endpoint_matches:
+            raise SourceLayoutChanged("Oxford DOI metadata navigation left the fixed Crossref DOI endpoint")
+        text = observation.visible_text
+        if not isinstance(text, str) or not text.strip() or len(text) > _PUBLIC_DOI_METADATA_MAX_CHARS:
+            raise SourceLayoutChanged("Oxford DOI metadata JSON observation is unavailable or exceeds its bound")
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            # A rendered challenge must still hand off immediately; do not
+            # poll it, fall back to a request client, or change providers.
+            self.detect_interruption(text, url=observation.url)
+            raise SourceLayoutChanged("Oxford DOI metadata page did not expose readable public JSON") from exc
+        record = self._public_doi_metadata_record(payload, requested_doi=doi)
+        await self.open_result(record)
+        metadata = await self.extract_metadata(search_query=doi)
+        if normalize_doi(metadata.doi) != doi or not metadata.target_identity_confirmed:
+            raise SourceLayoutChanged("Oxford page did not confirm the public DOI metadata identity")
+        self._resolved_doi_record = metadata
+        return [metadata]
+
     async def search(self, query: str, request: LiteratureSearchRequest) -> list[LiteratureRecord]:
+        exact_doi = normalize_doi(query)
+        if exact_doi != UNKNOWN and exact_doi in {normalize_doi(value) for value in request.dois}:
+            return await self._resolve_public_doi_metadata(exact_doi)
+        self._resolved_doi_record = None
         gateway_navigation_available = (
             self._gateway_trusted()
             and self._institutional_route is not None
@@ -609,7 +799,28 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
         await self.browser.execute(NavigateCommand(search_url))
-        html, current_url = await self._content()
+        for attempt in range(SEARCH_RENDER_MAX_OBSERVATIONS):
+            html, current_url = await self._content()
+            # A challenge is a handoff, never something this render wait
+            # retries through. Each observation checks it before readiness.
+            self.detect_interruption(html, url=current_url)
+            if not self._is_trusted_url(
+                current_url, institutional_route_verified=self._gateway_trusted()
+            ):
+                raise SourceUnavailable("Oxford search navigation did not reach a trusted source route")
+            if not urlsplit(current_url).path.rstrip("/").endswith("/search-results"):
+                raise SourceLayoutChanged("Oxford search navigation did not reach the search-results page")
+            parser = _OxfordSearchHTMLParser()
+            parser.feed(html)
+            body = parser.body_text.casefold()
+            empty = any(marker in body for marker in _NO_RESULTS_MARKERS)
+            if parser.anchors or empty:
+                break
+            if attempt + 1 == SEARCH_RENDER_MAX_OBSERVATIONS:
+                raise SourceLayoutChanged(
+                    "Oxford search did not expose recognized result title cards or an explicit zero-result state"
+                )
+            await asyncio.sleep(SEARCH_RENDER_POLL_SECONDS)
         results = self.parse_search_results_html(
             html,
             query=query,
@@ -622,9 +833,49 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             institutional_route_verified=self._gateway_trusted(),
         ):
             raise SourceUnavailable("Oxford search navigation did not reach a trusted source route")
+        if not results and not empty:
+            raise SourceLayoutChanged(
+                "Oxford result cards did not expose a trusted article identity; zero results were not confirmed"
+            )
+        exact_doi = normalize_doi(query)
+        if exact_doi != UNKNOWN:
+            # A result page can quote a DOI in a snippet or reference. Only
+            # the selected article's own verified metadata establishes an
+            # exact DOI hit; never stamp the query DOI onto an unknown card.
+            matched: list[LiteratureRecord] = []
+            for result in results:
+                await self.open_result(result)
+                metadata = await self.extract_metadata(search_query=query)
+                if normalize_doi(metadata.doi) == exact_doi:
+                    matched.append(metadata)
+                else:
+                    metadata.target_identity_confirmed = False
+            if results and not matched:
+                raise SourceLayoutChanged(
+                    "OXFORD_EXACT_DOI_LOOKUP_UNCONFIRMED: no article metadata matched the requested "
+                    f"DOI among {len(results)} bounded search candidate(s); "
+                    "this is not evidence of zero publisher results"
+                )
+            return matched
         return results
 
     async def open_result(self, record: LiteratureRecord) -> None:
+        resolved = self._resolved_doi_record
+        self._resolved_doi_record = None
+        if resolved is record and record.target_identity_confirmed:
+            # The workflow opens a search result again before extracting its
+            # metadata. Avoid a second navigation only after a fresh live
+            # observation proves the exact same Oxford identity still holds.
+            html, current_url = await self._content()
+            self.detect_interruption(html, url=current_url)
+            if self._is_trusted_url(current_url, institutional_route_verified=self._gateway_trusted()):
+                current = self.parse_article_html(html, source_url=current_url, search_query=record.search_query)
+                if self.identity_matches(record, current):
+                    current.target_identity_confirmed = True
+                    self._expected_record = record
+                    self._detail_record = current
+                    return
+            raise SourceLayoutChanged("Oxford DOI lookup page identity changed before the workflow opened it")
         target = record.navigation_url if record.navigation_url != UNKNOWN else record.source_page
         if (
             self._gateway_trusted()
@@ -745,14 +996,20 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             institutional_route_verified=self._gateway_trusted(),
         ) or not _PDF_PATH.search(urlsplit(access.download_url).path):
             raise SourceLayoutChanged("OfficialPdfActionConfirmed=false")
-        watch = Path(
-            watch_directory
-            if watch_directory is not None
-            else getattr(self.browser, "downloads_dir", "")
-        )
-        if not str(watch):
-            raise SourceUnavailable("Manual download watch directory is unavailable")
-        staging = Path(staging_directory) if staging_directory is not None else watch / "manual-handoff-staging"
+        # Capture releases Chrome's run-specific download policy. A later
+        # native Viewer click uses Chrome's configured default, which must be
+        # explicitly supplied rather than guessed from the old staging path.
+        configured_watch = watch_directory or self._manual_download_watch_directory
+        if configured_watch is None or not Path(configured_watch).is_absolute():
+            raise SourceUnavailable("ManualDownloadWatchDirectoryUnconfigured=true; configure an explicit absolute native download directory before clicking Download")
+        watch = Path(configured_watch)
+        if staging_directory is not None:
+            staging = Path(staging_directory)
+        else:
+            controlled_root = getattr(self.browser, "downloads_dir", None)
+            if not controlled_root:
+                raise SourceUnavailable("Controlled manual download staging directory is unavailable")
+            staging = Path(controlled_root) / "manual-handoff-staging"
         handoff = ManualDownloadHandoff(
             watch,
             staging,
@@ -883,20 +1140,28 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
             except Exception:
                 observation = None
             if observation is not None and self._native_pdf_viewer_opened(observation):
-                state = self.arm_manual_download_handoff(
-                    record,
-                    access,
-                    pdf_viewer_opened=True,
-                )
                 # The PDF has been served into the viewer, so publisher bytes
                 # were fetched even though no file landed yet.
                 ticket.record_outcome(
-                    ok=False, detail="PDF opened in viewer; manual download handoff armed"
+                    ok=False, detail="PDF opened in viewer; native download requires user action"
                 )
+                try:
+                    state = self.arm_manual_download_handoff(
+                        record,
+                        access,
+                        pdf_viewer_opened=True,
+                    )
+                except (SourceUnavailable, ManualDownloadHandoffError, OSError, ValueError) as arm_error:
+                    raise SourceUserDownloadRequired(
+                        "ACTION_REQUIRED_USER_DOWNLOAD=true; PDF is open in Chrome PDF Viewer; "
+                        "ManualDownloadHandoffArmed=false; do not click Download until an explicit "
+                        f"native download watch directory is configured: {arm_error}",
+                    ) from exc
                 raise SourceUserDownloadRequired(
                     "ACTION_REQUIRED_USER_DOWNLOAD=true; ACTION_REQUIRED_USER_LOGIN=false; "
                     "BrowserReadyForManualDownload=true; PDF is open in Chrome PDF Viewer; "
-                    "click the native Download button once while Harness waits for the file",
+                    "click the native Download button once after the persisted handoff receipt is available; "
+                    "then run the local manual-download-resume command",
                     handoff_state=state,
                 ) from exc
             ticket.record_outcome(ok=False, detail=str(exc).strip() or type(exc).__name__)
@@ -916,10 +1181,10 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         record.manual_download_handoff_used = False
         record.automatic_download_initiation = True
         record.automatic_download_detection = True
-        record.oxford_unattended_download_ready = result.acquisition_method in {
-            AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
-            AcquisitionMethod.AUTHORIZED_PDF_RESPONSE,
-        }
+        # A capture route alone is not readiness evidence. In particular a
+        # directed Chrome download must carry a real browser event, and local
+        # PDF identity still has to pass before readiness can become true.
+        record.oxford_unattended_download_ready = False
         record.download_initiation_mode = "HARNESS_OFFICIAL_PDF_ACTION_CLICK"
         record.file_finalization_mode = "HARNESS_AUTOMATIC"
         identity = self.validate_pdf_identity(result.path, record)
@@ -938,6 +1203,25 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
                 f"Captured Oxford PDF failed local target identity validation; Quarantine=true; "
                 f"QuarantineFile={quarantined.name}"
             )
+        automatic_event = (
+            result.acquisition_method in {
+                AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT,
+                AcquisitionMethod.BROWSER_DIRECTED_DOWNLOAD,
+            }
+            and result.download_event_emitted
+            and not result.authorized_pdf_response_captured
+        )
+        automatic_response = (
+            result.acquisition_method is AcquisitionMethod.AUTHORIZED_PDF_RESPONSE
+            and result.authorized_pdf_response_captured
+            and not result.download_event_emitted
+        )
+        record.oxford_unattended_download_ready = bool(
+            (automatic_event or automatic_response)
+            and not record.manual_download_handoff_used
+            and not record.user_native_viewer_click_required
+            and not record.human_download_action
+        )
         ticket.record_outcome(ok=True, detail="download completed")
         return result.path
 

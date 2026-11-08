@@ -340,6 +340,89 @@ class InstitutionalResolverParsingTests(unittest.TestCase):
 
 
 class InstitutionalResolverNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_waits_for_spa_business_evidence_without_renavigating(self):
+        class RenderingPage(_MockPage):
+            def __init__(self, browser):
+                super().__init__(browser)
+                self.reads = {}
+
+            async def content(self):
+                url = self.browser.current_url
+                self.reads[url] = self.reads.get(url, 0) + 1
+                if "hunnu.edu.cn" in url and url != "https://www.hunnu.edu.cn/" and self.reads[url] == 1:
+                    return "<html><title>Loading</title><body><div id='app'></div></body></html>"
+                return self.browser.current_html
+
+        browser = _MockBrowser(successful_route_pages())
+        browser.page = RenderingPage(browser)
+        with patch.object(institutional_module, "_SNAPSHOT_SETTLE_DELAY_SECONDS", 0):
+            route = await HUNNUInstitutionalAccessResolver(browser).resolve(
+                "SpringerLink", trigger=InstitutionalResolutionTrigger.ACCESS_ROUTE_UNKNOWN
+            )
+        self.assertTrue(route.institutional_route_resolved)
+        self.assertEqual(browser.history, list(successful_route_pages()))
+        self.assertEqual(browser.page.reads["https://lib.hunnu.edu.cn/"], 2)
+        self.assertEqual(browser.page.reads["https://lib.hunnu.edu.cn/resource/foreign"], 2)
+        self.assertEqual(browser.page.reads["https://lib.hunnu.edu.cn/database/springer"], 2)
+
+    async def test_missing_business_evidence_has_a_bounded_observation_budget(self):
+        class ShellPort:
+            downloads_dir = TEMP_DIR
+            session = SessionHandle()
+            page_handle = PageHandle(session=session)
+
+            def __init__(self):
+                self.navigations = 0
+                self.observations = 0
+
+            async def execute(self, command):
+                if isinstance(command, NavigateCommand):
+                    self.navigations += 1
+                    return BrowserActionResult(self.session, self.page_handle, 0, "navigate", command.url)
+                self.observations += 1
+                return BrowserObservation(
+                    self.session, self.page_handle, 0, "https://lib.hunnu.edu.cn/",
+                    html="<html><title>Library</title><div id='app'></div></html>",
+                )
+
+        port = ShellPort()
+        with patch.object(institutional_module, "_SNAPSHOT_SETTLE_DELAY_SECONDS", 0):
+            snapshot = await HUNNUInstitutionalAccessResolver(port)._snapshot_after_goto(
+                "https://lib.hunnu.edu.cn/", ready=lambda _html, _url, _title: False
+            )
+        self.assertEqual(snapshot[2], "Library")
+        self.assertEqual(port.navigations, 1)
+        self.assertEqual(port.observations, institutional_module._SNAPSHOT_SETTLE_MAX_ATTEMPTS)
+
+    async def test_spa_wait_stops_at_a_login_gate_before_another_observation(self):
+        class GatedPort:
+            downloads_dir = TEMP_DIR
+            session = SessionHandle()
+            page_handle = PageHandle(session=session)
+
+            def __init__(self):
+                self.navigations = 0
+                self.observations = 0
+
+            async def execute(self, command):
+                if isinstance(command, NavigateCommand):
+                    self.navigations += 1
+                    return BrowserActionResult(self.session, self.page_handle, 0, "navigate", command.url)
+                self.observations += 1
+                html = "<html><div id='app'></div></html>" if self.observations == 1 else fixture("hunnu_captcha.html")
+                return BrowserObservation(
+                    self.session, self.page_handle, 0, "https://lib.hunnu.edu.cn/", html=html,
+                )
+
+        port = GatedPort()
+        with patch.object(institutional_module, "_SNAPSHOT_SETTLE_DELAY_SECONDS", 0):
+            with self.assertRaises(SourceActionRequired):
+                await HUNNUInstitutionalAccessResolver(port)._snapshot_after_goto(
+                    "https://lib.hunnu.edu.cn/", ready=lambda _html, _url, _title: False
+                )
+        self.assertEqual(port.navigations, 1)
+        self.assertEqual(port.observations, 2)
+
     async def test_snapshot_retries_one_unavailable_observation_then_succeeds(self):
         class _SettlingPort:
             downloads_dir = TEMP_DIR
@@ -449,6 +532,22 @@ class InstitutionalResolverNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(route.institutional_route_resolved)
         self.assertEqual(route.institutional_target_database_match, "uncertain")
         self.assertNotIn("https://link.springer.com/", browser.history)
+
+    async def test_detail_redirect_to_an_untrusted_host_cannot_supply_a_publisher_entry(self):
+        pages = successful_route_pages()
+        pages["https://lib.hunnu.edu.cn/database/springer"] = (
+            fixture("hunnu_springer_detail.html"),
+            "https://untrusted.example/forged-database-detail",
+        )
+        browser = _MockBrowser(pages)
+        route = await HUNNUInstitutionalAccessResolver(browser).resolve(
+            "SpringerLink", trigger=InstitutionalResolutionTrigger.ACCESS_ROUTE_UNKNOWN
+        )
+        self.assertFalse(route.institutional_route_resolved)
+        self.assertFalse(route.institutional_target_database_match)
+        self.assertIn("database detail navigation left the official domain", route.reason)
+        self.assertNotIn("https://link.springer.com/", browser.history)
+        self.assertFalse(any("Database Detail" in step.label for step in route.route_steps))
 
     async def test_manual_login_redirect_stops_without_authentication_actions(self):
         browser = _MockBrowser(
@@ -690,7 +789,7 @@ class InstitutionalSpringerFinalizerTests(unittest.TestCase):
             root = Path(tmp)
             source = write_minimal_pdf_with_text(
                 root / "captured.pdf",
-                f"Sebastian Wagener DOI: {TARGET_DOI}",
+                f"{TARGET_TITLE.replace(chr(8217), chr(39))} Sebastian Wagener DOI: {TARGET_DOI}",
             )
             run_root = root / "run"
             result = finalize_captured_hunnu_springer_acceptance(
@@ -713,6 +812,7 @@ class InstitutionalSpringerFinalizerTests(unittest.TestCase):
             )
             self.assertEqual(result.status, RunStatus.SUCCESS)
             self.assertTrue(result.records[0].target_identity_confirmed)
+            self.assertTrue(result.records[0].target_title_matched)
             self.assertEqual(len(result.downloads[0].sha256), 64)
             self.assertTrue(result.downloads[0].file_validation_passed)
             self.assertTrue(manifest["Downloads"][0]["TargetIdentityConfirmed"])

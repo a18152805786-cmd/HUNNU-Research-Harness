@@ -78,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     library_import.add_argument("--source", type=Path, required=True)
     library_import.add_argument("--metadata-json", type=Path, required=True)
 
+    taxonomy_init = sub.add_parser(
+        "library-init-taxonomy",
+        help="Initialize the missing frozen topic configuration from a reviewed file; never overwrite",
+    )
+    taxonomy_init.add_argument("--source", type=Path, required=True)
+    taxonomy_init.add_argument("--sha256", required=True, help="SHA-256 of the explicitly reviewed source file")
+
     confirm_topics = sub.add_parser(
         "library-confirm-topics",
         help=(
@@ -105,6 +112,33 @@ def build_parser() -> argparse.ArgumentParser:
             "Off by default so a topic can never be invented"
         ),
     )
+    reclassify = sub.add_parser(
+        "library-reclassify",
+        help="Preview an audited automatic reclassification of one filed WORK; apply requires an explicit current-state precondition",
+    )
+    reclassify.add_argument("--paper-id", required=True)
+    reclassify.add_argument("--reason", required=True)
+    reclassify.add_argument("--expect-topic", action="append", default=None)
+    reclassify.add_argument("--expect-fingerprint", default=None)
+    reclassify.add_argument("--apply", action="store_true", help="Commit the preview after its current-state precondition matches")
+    reclassify.add_argument("--authorize-human-confirmed-fingerprint", default=None,
+                            help="Additional explicit permission tied to the exact preview fingerprint of a human-confirmed assignment")
+    recovery = sub.add_parser(
+        "library-reclassification-recover",
+        help="Preview a retained topic rollback package and reconcile verified hardlink aliases only; never rewrites metadata or PDFs",
+    )
+    recovery.add_argument("--recovery-path", type=Path, required=True)
+    recovery.add_argument("--preimage-sha256", required=True)
+    recovery.add_argument("--reason", required=True)
+    recovery.add_argument("--expect-fingerprint", default=None)
+    recovery.add_argument("--apply", action="store_true")
+    manual_resume = sub.add_parser(
+        "manual-download-resume",
+        help="Resume a persisted Oxford manual download locally; never starts a browser or requests publisher content",
+    )
+    manual_resume.add_argument("--state", type=Path, required=True)
+    manual_resume.add_argument("--sha256", required=True)
+    manual_resume.add_argument("--timeout-seconds", type=float, default=120.0)
     status = sub.add_parser(
         "browser-status",
         help=(
@@ -218,6 +252,8 @@ def build_parser() -> argparse.ArgumentParser:
     acquire.add_argument("--max-results", type=int, default=None)
     acquire.add_argument("--max-downloads", type=int, choices=range(0, 2), default=None)
     acquire.add_argument("--headless", action="store_true")
+    acquire.add_argument("--manual-watch-directory", type=Path, default=None,
+                         help="Oxford only: explicitly selected directory where the user will save the native PDF download")
     acquire.add_argument(
         "--daily-limit",
         type=int,
@@ -318,6 +354,7 @@ def _acquire_to_literature_argv(args: argparse.Namespace) -> list[str]:
         ("--max-downloads", args.max_downloads),
         ("--daily-limit", args.daily_limit),
         ("--human-wait", args.human_wait),
+        ("--manual-watch-directory", getattr(args, "manual_watch_directory", None)),
     ):
         if value is not None:
             argv.extend([flag, str(value)])
@@ -457,6 +494,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return exit_code
     if args.command == "acquire":
+        if args.manual_watch_directory is not None and args.source != "oxfordacademic":
+            print(json.dumps({"Status": "INVALID_REQUEST", "Reason": "--manual-watch-directory is supported only for OxfordAcademic"}))
+            return 1
         # The literature module owns the live path end to end (it constructs
         # its own PlaywrightBrowser; no host MCP client is involved).
         from .literature.cli import main as literature_main
@@ -479,6 +519,18 @@ def main(argv: list[str] | None = None) -> int:
 
         staged = ExternalPaperImporter().stage_pdf(args.source)
         print(json.dumps(staged.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.command == "library-init-taxonomy":
+        from .literature.topics import TopicTaxonomyError, initialize_topic_taxonomy
+        from .exit_codes import EXIT_RUN_FAILED
+
+        try:
+            payload = initialize_topic_taxonomy(args.source, expected_sha256=args.sha256)
+        except (TopicTaxonomyError, ValueError) as exc:
+            payload = {"Status": "REFUSED", "Reason": str(exc), "ExistingTaxonomyReplaced": False}
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return EXIT_RUN_FAILED
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     if args.command == "library-provenance-status":
         from .literature.topic_confirmation import TOPIC_PROVENANCE_PATH, TopicProvenanceStore
@@ -520,6 +572,52 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
         accepted = {ConfirmationStatus.CONFIRMED, ConfirmationStatus.ALREADY_CONFIRMED}
         return 0 if result.status in accepted else 2
+
+    if args.command == "library-reclassify":
+        from .literature.topic_reclassification import TopicReclassifier
+
+        result = TopicReclassifier().reclassify(
+            args.paper_id, reason=args.reason,
+            expected_current_topics=args.expect_topic,
+            expected_fingerprint=args.expect_fingerprint,
+            dry_run=not args.apply,
+            authorize_human_confirmed_fingerprint=args.authorize_human_confirmed_fingerprint,
+        )
+        print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if result.succeeded else 1
+
+    if args.command == "library-reclassification-recover":
+        from .literature.topic_reclassification import TopicReclassifier
+
+        result = TopicReclassifier().recover(
+            args.recovery_path, reason=args.reason,
+            expected_preimage_sha256=args.preimage_sha256,
+            expected_current_fingerprint=args.expect_fingerprint,
+            dry_run=not args.apply,
+        )
+        print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if result.succeeded else 1
+
+    if args.command == "manual-download-resume":
+        from .browser.manual_download_handoff import ManualDownloadHandoffError
+        from .literature.manual_resume import ManualResumeError, resume_oxford_manual_handoff
+
+        try:
+            result = asyncio.run(resume_oxford_manual_handoff(
+                state_path=args.state, expected_sha256=args.sha256,
+                timeout_seconds=args.timeout_seconds,
+            ))
+        except (ManualResumeError, ManualDownloadHandoffError, OSError, ValueError) as exc:
+            payload = {"Status": "REFUSED", "Reason": str(exc), "NetworkActivity": False}
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return 1
+        payload = {
+            "Status": result.status.value, "Results": len(result.records),
+            "Downloads": [entry.as_dict() for entry in result.downloads],
+            "Errors": result.errors, "NetworkActivity": False,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if result.downloads else 1
 
     if args.command == "library-import":
         from .literature.library import ExternalPaperImporter, LibraryDisposition

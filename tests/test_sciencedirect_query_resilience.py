@@ -32,7 +32,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
 from hunnu_harness.browser.commands import (
     BrowserCommandError,
@@ -317,6 +317,94 @@ class ConsecutiveQueryTests(_FastWindows):
         self.assertEqual([r.stable_identifier for r in records], [B1[0]])
 
 
+class SearchPageResumeTests(_FastWindows):
+    def _existing(self, query: str, states: list, *, url: str | None = None) -> ScriptedPort:
+        port = ScriptedPort(by_query({query: [results_page(card(*B1))]}))
+        port.url = url or f"https://www.sciencedirect.com/search?qs={quote_plus(query)}"
+        port.states = list(states)
+        return port
+
+    def test_manual_gate_then_cleared_same_query_results_never_navigates(self) -> None:
+        port = self._existing("q", [CAPTCHA_FIXTURE])
+        with self.assertRaises(SourceActionRequired):
+            search(port, "q")
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+        # The user's manual action changes the live page, not the adapter.
+        port.states, port.reads = [results_page(card(*A1))], 0
+        adapter, records = search(port, "q")
+        self.assertEqual([r.stable_identifier for r in records], [A1[0]])
+        self.assertEqual(records[0].search_query, "q")
+        self.assertIs(adapter.last_search_observation.page_type, SearchPageType.RESULTS_PRESENT)
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Observe"])
+
+    def test_same_query_genuine_zero_is_reused(self) -> None:
+        port = self._existing("q", [NO_RESULTS])
+        adapter, records = search(port, "q")
+        self.assertEqual(records, [])
+        self.assertIs(adapter.last_search_observation.page_type, SearchPageType.GENUINE_ZERO_RESULTS)
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+
+    def test_decoded_query_is_bound_without_changing_search_expression(self) -> None:
+        query = '"financial reporting" AND investment + efficiency'
+        port = self._existing(query, [results_page(card(*A2))])
+        _adapter, records = search(port, query)
+        self.assertEqual([r.stable_identifier for r in records], [A2[0]])
+        self.assertEqual(port.navigations, [])
+
+    def test_other_query_filters_duplicate_query_and_untrusted_origin_are_not_reused(self) -> None:
+        for url in (
+            "https://www.sciencedirect.com/search?qs=other",
+            "https://www.sciencedirect.com/search?qs=q&qs=q",
+            "https://www.sciencedirect.com/search?qs=q&years=2026",
+            "https://www.sciencedirect.com.evil.invalid/search?qs=q",
+            "https://www.sciencedirect.com@evil.invalid/search?qs=q",
+            "https://www.sciencedirect.com:444/search?qs=q",
+            "http://www.sciencedirect.com/search?qs=q",
+        ):
+            with self.subTest(url=url):
+                port = self._existing("q", [results_page(card(*A1))], url=url)
+                _adapter, records = search(port, "q")
+                self.assertEqual([r.stable_identifier for r in records], [B1[0]])
+                self.assertEqual(len(port.navigations), 1)
+                self.assertEqual(parse_qs(urlsplit(port.navigations[0]).query), {"qs": ["q"]})
+                self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Navigate", "Observe"])
+
+    def test_same_query_pending_only_observes_until_results_arrive(self) -> None:
+        port = self._existing("q", [UNDECIDED, UNDECIDED, results_page(card(*A1))])
+        _adapter, records = search(port, "q")
+        self.assertEqual([r.stable_identifier for r in records], [A1[0]])
+        self.assertEqual(port.reads, 3)
+        self.assertEqual({kind for kind, _ in port.commands}, {"Observe"})
+
+    def test_same_query_pending_times_out_without_refresh_or_empty_success(self) -> None:
+        port = self._existing("q", [UNDECIDED])
+        with self.assertRaisesRegex(SourceLayoutChanged, "SEARCH_READINESS_TIMEOUT"):
+            search(port, "q")
+        self.assertGreater(port.reads, 1)
+        self.assertEqual({kind for kind, _ in port.commands}, {"Observe"})
+
+    def test_gate_on_another_query_stops_before_any_navigation(self) -> None:
+        for html in (CAPTCHA_FIXTURE, INTERSTITIAL_ZH, LOGIN_FIXTURE):
+            with self.subTest(html=html[:40]):
+                port = self._existing("new", [html], url="https://www.sciencedirect.com/search?qs=old")
+                with self.assertRaises(SourceActionRequired):
+                    search(port, "new")
+                self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+
+    def test_challenge_with_result_cards_cannot_be_reused_as_normal_results(self) -> None:
+        port = self._existing("q", [CAPTCHA_FIXTURE + results_page(card(*A1))])
+        with self.assertRaises(SourceActionRequired):
+            search(port, "q")
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+
+    def test_institutional_login_handoff_is_not_discarded_by_navigation(self) -> None:
+        port = self._existing("q", [LOGIN_FIXTURE], url="https://cas.example.invalid/login")
+        with self.assertRaises(SourceActionRequired) as caught:
+            search(port, "q")
+        self.assertIs(caught.exception.reason, HumanActionReason.LOGIN_REQUIRED)
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+
+
 # -- the ObservationUnavailable of 2026-09-18 -----------------------------------
 
 
@@ -327,7 +415,7 @@ class PageBetweenDocumentsTests(_FastWindows):
         port = ScriptedPort(by_query({"second": [navigating(), results_page(card(*B1))]}))
         _adapter, records = search(port, "second")
         self.assertEqual([r.stable_identifier for r in records], [B1[0]])
-        self.assertEqual([kind for kind, _ in port.commands], ["Navigate", "Observe", "Observe"])
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Navigate", "Observe", "Observe"])
 
     def test_re_reading_never_navigates_again(self) -> None:
         """Waiting for the page is not reloading it: one query, one navigation."""

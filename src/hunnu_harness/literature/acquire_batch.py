@@ -586,6 +586,7 @@ class AcquireBatch:
 
         entries: dict[str, dict[str, Any]] = {}
         to_fetch: list[BatchItem] = []
+        manual_stop: tuple[BatchItem, dict[str, Any]] | None = None
         for item in self.queue.items:
             earlier = latest.get(item.key)
             if earlier is not None and earlier.get("Outcome") in TERMINAL_OUTCOMES:
@@ -594,6 +595,21 @@ class AcquireBatch:
             match = held_match(navigator, item)
             if match is not None:
                 entries[item.key] = self._entry(item, ALREADY_IN_LIBRARY, LibraryMatch=match)
+                continue
+            item_report = (earlier or {}).get("ItemReport") or {}
+            if earlier is not None and earlier.get("Outcome") == HUMAN_ACTION_REQUIRED and (
+                item_report.get("ACTION_REQUIRED_USER_DOWNLOAD") is True
+                or item_report.get("Status") == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD.value
+                or earlier.get("ACTION_REQUIRED_USER_DOWNLOAD") is True
+                or earlier.get("Status") == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD.value
+            ):
+                # The publisher PDF action already happened. Resume its local
+                # handoff, never turn an unfinished native save into another
+                # search/click/fetch when the batch is run again.
+                entry = {**earlier, **item.as_dict(), "FromEarlierRun": True}
+                entries[item.key] = entry
+                if manual_stop is None:
+                    manual_stop = (item, entry)
                 continue
             if earlier is not None and earlier.get("Outcome") == STARTED:
                 notes.append(
@@ -604,6 +620,14 @@ class AcquireBatch:
             to_fetch.append(item)
 
         report["PendingFetchCount"] = len(to_fetch)
+        if manual_stop is not None:
+            report["PlanningAndBudgetGate"] = False
+            report["ResearchChromeRunning"] = None
+            self._report_stop("STOPPED_FOR_HUMAN_ACTION", *manual_stop, report, notes)
+            return self._finish(
+                "STOPPED_FOR_HUMAN_ACTION", report, self._ordered(entries), notes,
+                write_files=not dry_run,
+            )
         gate = len(to_fetch) > CONFIRMATION_THRESHOLD and not self.confirm_budget
         report["PlanningAndBudgetGate"] = gate
         report["ResearchChromeRunning"] = bool(self._browser_running()) if to_fetch else None
@@ -796,6 +820,8 @@ class AcquireBatch:
             for flag in ("ACTION_REQUIRED_USER_LOGIN", "ACTION_REQUIRED_USER_DOWNLOAD"):
                 if flag in item_report:
                     report[flag] = item_report[flag]
+                elif flag in entry:
+                    report[flag] = entry[flag]
             report["Gate"] = {
                 "ItemID": item.item_id,
                 "Source": item.source,
@@ -805,13 +831,33 @@ class AcquireBatch:
                 "FinalURL": item_report.get("FinalURL"),
                 "FinalPageTitle": item_report.get("FinalPageTitle"),
             }
-            notes.append(
-                "HUMAN ACTION REQUIRED. Hand this gate to the user (Rule 72): keep the Research "
-                "Chrome open (`hunnu-harness browser-start` if it is not running), name the page and "
-                "the step, and wait. Start no other acquisition in the meantime. When they are done, "
-                "run the same acquire-batch command again: finished items are skipped and "
-                f"{item.item_id} runs first."
+            manual_download = (
+                item_report.get("ACTION_REQUIRED_USER_DOWNLOAD") is True
+                or item_report.get("Status") == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD.value
+                or entry.get("ACTION_REQUIRED_USER_DOWNLOAD") is True
+                or entry.get("Status") == RunStatus.ACTION_REQUIRED_USER_DOWNLOAD.value
             )
+            if manual_download:
+                report["ACTION_REQUIRED_USER_DOWNLOAD"] = True
+                for key in ("ManualDownloadHandoffPersisted", "StatePath", "StateSHA256"):
+                    if key in item_report:
+                        report[key] = item_report[key]
+                        report["Gate"][key] = item_report[key]
+                notes.append(
+                    "HUMAN ACTION REQUIRED. Finish the local manual-download handoff first. "
+                    "Use manual-download-resume with the reported StatePath and StateSHA256 when a "
+                    "durable receipt exists; otherwise follow the reported recovery requirement. "
+                    "Do not repeat the publisher PDF action. After validated local ingest, rerun the "
+                    "same batch so the held item is skipped. Start no other acquisition meanwhile."
+                )
+            else:
+                notes.append(
+                    "HUMAN ACTION REQUIRED. Hand this gate to the user (Rule 72): keep the Research "
+                    "Chrome open (`hunnu-harness browser-start` if it is not running), name the page and "
+                    "the step, and wait. Start no other acquisition in the meantime. When they are done, "
+                    "run the same acquire-batch command again: finished items are skipped and "
+                    f"{item.item_id} runs first."
+                )
         elif stop == "STOPPED_DAILY_BUDGET_EXHAUSTED":
             notes.append(
                 "Today's fetch total is spent. It is the user's knob (--daily-limit / "
@@ -850,7 +896,7 @@ class AcquireBatch:
         )
         report["Items"] = items
         exit_code = BATCH_EXIT_CODES[status]
-        if report["ItemsRemaining"] and write_files and status != "COMPLETED":
+        if report["ItemsRemaining"] and write_files and status != "COMPLETED" and not report.get("ACTION_REQUIRED_USER_DOWNLOAD"):
             notes.append(
                 "To continue, run the same acquire-batch command again; it skips every item with a "
                 "final outcome."

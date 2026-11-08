@@ -205,6 +205,12 @@ class TopicProvenanceStore:
             probe_io.unlink(missing_ok=True)
 
     def append(self, entry: Mapping[str, Any]) -> None:
+        from .topic_transaction import topic_mutation_lock
+
+        with topic_mutation_lock(self.path.parent / ".topic_mutation.lock"):
+            self._append_locked(entry)
+
+    def _append_locked(self, entry: Mapping[str, Any]) -> None:
         path_io = _windows_io_path(self.path)
         _windows_io_path(self.path.parent).mkdir(parents=True, exist_ok=True)
         line = json.dumps(dict(entry), ensure_ascii=False, sort_keys=True) + "\n"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from html.parser import HTMLParser
 from pathlib import Path
 
 from ..paths import _windows_io_path
@@ -12,6 +13,55 @@ from .pdf import PDFValidator
 
 
 _HTML_PREFIXES = (b"<!doctype html", b"<html", b"<?xml")
+_CHALLENGE_DOCUMENT_TITLES = frozenset({
+    "client challenge", "validate user", "verify you are human",
+    "just a moment", "checking your browser",
+})
+
+
+class _DownloadedHTMLTitle(HTMLParser):
+    """Read a bounded response's document identity without executing it."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_title = False
+        self.title_complete = False
+        self.foreign_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() in {"svg", "math"}:
+            self.foreign_depth += 1
+        if tag.casefold() == "title" and not self.title_complete and not self.foreign_depth:
+            self.in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "title" and self.in_title:
+            self.in_title = False
+            self.title_complete = True
+        if tag.casefold() in {"svg", "math"}:
+            self.foreign_depth = max(0, self.foreign_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.parts.append(data)
+
+
+def _is_downloaded_challenge_document(path: Path) -> bool:
+    # A downloaded HTML response is not a live visibility observation. Only
+    # known challenge document titles establish this stop; words in article,
+    # script or noscript text must never be promoted to a seen CAPTCHA.
+    try:
+        with _windows_io_path(path).open("rb") as stream:
+            html = stream.read(65536).decode("utf-8", errors="replace")
+        parser = _DownloadedHTMLTitle()
+        parser.feed(html)
+        title = re.sub(r"\s+", " ", "".join(parser.parts)).strip().casefold()
+        return title.rstrip(".\u2026 ") in _CHALLENGE_DOCUMENT_TITLES
+    except (OSError, ValueError):
+        return False
+
+
 _CAJ_SIGNATURES = (b"CAJ", b"HNLC", b"KDH")
 _DOI_TOKEN_RE = re.compile(
     r"(?<![\w])10\s{0,3}\.\s{0,3}\d{4,9}\s{0,3}/\s{0,3}"
@@ -158,6 +208,7 @@ class FullTextValidationResult:
     pdf_validation_passed: bool = False
     content_title_verification: str = "not_available"
     error: str = UNKNOWN
+    manual_action_required: bool = False
 
     @property
     def passed(self) -> bool:
@@ -222,6 +273,7 @@ class AuthorizedFullTextValidator:
                 False,
                 size,
                 error="DownloadedHTMLInsteadOfFullText",
+                manual_action_required=_is_downloaded_challenge_document(path),
             )
 
         expected_extension = cls._expected_extension(path, full_text_format)

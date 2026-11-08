@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -116,6 +117,52 @@ class BrowserAuthorizedFileCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.authorized_pdf_response_captured)
         self.assertTrue(payload.startswith(b"%PDF-"))
 
+    async def test_an_explicit_dot_suffix_accepts_only_its_real_subdomains(self) -> None:
+        async def action(context, page):
+            context.emit("response", _FakeResponse(
+                "https://cdn.silverchair.com/ectj/article-pdf/21/1/C1/ectj00c1.pdf"
+            ))
+        result, _, _ = await self._capture(
+            action, trusted_hosts=(".silverchair.com",),
+            response_url_is_expected=lambda value: "ectj00c1.pdf" in value,
+        )
+        self.assertEqual(result.source_host, "cdn.silverchair.com")
+
+    async def test_suffix_declarations_do_not_authorize_apex_or_lookalike_hosts(self) -> None:
+        for declared, host in (
+            ((".silverchair.com",), "silverchair.com"),
+            ((".silverchair.com",), "evil-silverchair.com"),
+            ((".silverchair.com",), "cdn.silverchair.com.evil.example"),
+            (("silverchair.com",), "cdn.silverchair.com"),
+            (("academic.oup.com",), "cdn.silverchair.com"),
+        ):
+            with self.subTest(declared=declared, host=host):
+                async def action(context, page):
+                    context.emit("response", _FakeResponse(f"https://{host}/article-pdf/ectj00c1.pdf"))
+                with self.assertRaises(AuthorizedFileCaptureUnavailable):
+                    await self._capture(
+                        action, trusted_hosts=declared, timeout_ms=10,
+                        response_url_is_expected=lambda _value: True,
+                    )
+
+    async def test_identity_locked_download_event_respects_the_declared_suffix_boundary(self) -> None:
+        context = _FakeContext()
+        page = _FakePage(context)
+        download = _FakeDownload()
+        download.url = "https://cdn.silverchair.com/article-pdf/ectj00c1.pdf"
+        with tempfile.TemporaryDirectory(prefix="capture-declared-suffix-", dir=TEMP_DIR) as temporary:
+            async def action():
+                page.emit("download", download)
+            result = await BrowserAuthorizedFileCapture(Path(temporary)).capture_pdf(
+                page=page, official_action=action,
+                trusted_hosts=(".silverchair.com",),
+                response_url_is_expected=lambda value: "ectj00c1.pdf" in value,
+                download_url_is_expected=lambda value: "ectj00c1.pdf" in value,
+                controlled_filename="target.pdf", provenance_host="academic.oup.com",
+                source_route="test", timeout_ms=50,
+            )
+            self.assertEqual(result.acquisition_method, AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT)
+
     async def test_zero_byte_download_event_is_rejected(self) -> None:
         context = _FakeContext()
         page = _FakePage(context)
@@ -141,7 +188,9 @@ class BrowserAuthorizedFileCaptureTests(unittest.IsolatedAsyncioTestCase):
                     timeout_ms=100,
                     require_download_event=True,
                 )
-            self.assertEqual(list(root.iterdir()), [])
+            files = [path for path in root.rglob("*") if path.is_file()]
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].read_bytes(), b"")
 
     async def test_authorized_pdf_response_is_captured_without_replay(self) -> None:
         async def action(context: _FakeContext, page: _FakePage) -> None:
@@ -190,7 +239,7 @@ class BrowserAuthorizedFileCaptureTests(unittest.IsolatedAsyncioTestCase):
                     source_route="OXFORD_DIRECT",
                     timeout_ms=20,
                 )
-            self.assertEqual(list(Path(temporary).iterdir()), [])
+            self.assertEqual([path for path in Path(temporary).rglob("*") if path.is_file()], [])
 
     async def test_pdf_from_untrusted_host_is_rejected(self) -> None:
         context = _FakeContext()
@@ -240,6 +289,163 @@ class BrowserAuthorizedFileCaptureTests(unittest.IsolatedAsyncioTestCase):
                     source_route="OXFORD_DIRECT",
                     timeout_ms=20,
                 )
+
+    async def test_claimed_slow_download_finishes_before_the_response_can_be_selected(self) -> None:
+        context = _FakeContext()
+        page = _FakePage(context)
+        identity = "S0165410109000469"
+        url = f"https://www.sciencedirect.com/science/article/pii/{identity}/pdfft"
+
+        class SlowDownload:
+            def __init__(self):
+                self.url = url
+                self.save_calls = 0
+                self.finished = False
+                self.path = None
+
+            async def save_as(self, path):
+                self.save_calls += 1
+                self.path = Path(path)
+                self.path.write_bytes(b"first partial bytes")
+                try:
+                    await asyncio.sleep(.02)
+                except asyncio.CancelledError:
+                    # A native save already under way may finish while its
+                    # caller is being canceled.  Cleanup must await it, and
+                    # it must never be writing to the winning response path.
+                    await asyncio.sleep(.01)
+                self.path.write_bytes(minimal_pdf_bytes() + b"\n% download evidence")
+                self.finished = True
+
+        first, duplicate = SlowDownload(), SlowDownload()
+        with tempfile.TemporaryDirectory(prefix="capture-race-", dir=TEMP_DIR) as temporary:
+            root = Path(temporary)
+            capture = BrowserAuthorizedFileCapture(root)
+
+            async def action():
+                page.emit("download", first)
+                page.emit("download", duplicate)
+                context.emit("response", _FakeResponse(url))
+
+            result = await capture.capture_pdf(
+                page=page, official_action=action,
+                trusted_hosts=("www.sciencedirect.com",),
+                response_url_is_expected=lambda value: identity in value,
+                download_url_is_expected=lambda value: identity in value,
+                controlled_filename="target.pdf",
+                provenance_host="www.sciencedirect.com", source_route="test",
+                timeout_ms=100, download_priority_grace_ms=5,
+            )
+            self.assertEqual(result.acquisition_method, AcquisitionMethod.PLAYWRIGHT_DOWNLOAD_EVENT)
+            self.assertTrue(first.finished, "the claimed event must complete before success")
+            self.assertEqual(first.save_calls, 1)
+            self.assertEqual(duplicate.save_calls, 0)
+            self.assertEqual(result.path, first.path)
+            self.assertFalse(result.authorized_pdf_response_captured)
+            self.assertTrue(result.download_event_emitted)
+            self.assertEqual(first.path.read_bytes(), minimal_pdf_bytes() + b"\n% download evidence")
+            response_copies = [p for p in root.rglob("*") if p.is_file() and p != first.path]
+            self.assertEqual(len(response_copies), 1)
+            self.assertNotEqual(response_copies[0], first.path)
+            self.assertEqual(response_copies[0].read_bytes(), minimal_pdf_bytes())
+            snapshot = result.path.read_bytes()
+            await asyncio.sleep(.02)
+            self.assertEqual(result.path.read_bytes(), snapshot)
+            self.assertEqual(len([path for path in root.rglob("*") if path.is_file()]), 2)
+
+    async def test_claimed_download_save_failure_is_not_washed_away_by_a_valid_response(self) -> None:
+        context = _FakeContext()
+        page = _FakePage(context)
+
+        class FailedDownload:
+            async def save_as(self, path):
+                Path(path).write_bytes(b"partial first bytes")
+                await asyncio.sleep(.01)
+                raise RuntimeError("browser canceled the claimed download")
+
+        with tempfile.TemporaryDirectory(prefix="capture-claimed-failure-", dir=TEMP_DIR) as temporary:
+            root = Path(temporary)
+
+            async def action():
+                page.emit("download", FailedDownload())
+                context.emit("response", _FakeResponse("https://academic.oup.com/article-pdf/ectj00c1.pdf"))
+
+            with self.assertRaisesRegex(AuthorizedFileCaptureUnavailable, "could not be saved"):
+                await BrowserAuthorizedFileCapture(root).capture_pdf(
+                    page=page, official_action=action,
+                    trusted_hosts=("academic.oup.com",), response_url_is_expected=lambda _value: True,
+                    controlled_filename="target.pdf", provenance_host="academic.oup.com",
+                    source_route="test", timeout_ms=100, download_priority_grace_ms=5,
+                )
+            payloads = [p.read_bytes() for p in root.rglob("*") if p.is_file()]
+            self.assertEqual(len(payloads), 2)
+            self.assertIn(b"partial first bytes", payloads)
+            self.assertIn(minimal_pdf_bytes(), payloads)
+
+    async def test_claimed_download_wait_is_bounded_and_cleanup_waits_for_late_save(self) -> None:
+        context = _FakeContext()
+        page = _FakePage(context)
+        finished = False
+
+        class SlowDownload:
+            async def save_as(self, path):
+                nonlocal finished
+                Path(path).write_bytes(b"partial first bytes")
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(.01)
+                Path(path).write_bytes(b"retained late first download")
+                finished = True
+
+        with tempfile.TemporaryDirectory(prefix="capture-claimed-timeout-", dir=TEMP_DIR) as temporary:
+            root = Path(temporary)
+
+            async def action():
+                page.emit("download", SlowDownload())
+                context.emit("response", _FakeResponse("https://academic.oup.com/article-pdf/ectj00c1.pdf"))
+
+            with self.assertRaisesRegex(AuthorizedFileCaptureUnavailable, "Claimed Playwright download"):
+                await BrowserAuthorizedFileCapture(root).capture_pdf(
+                    page=page, official_action=action,
+                    trusted_hosts=("academic.oup.com",), response_url_is_expected=lambda _value: True,
+                    controlled_filename="target.pdf", provenance_host="academic.oup.com",
+                    source_route="test", timeout_ms=20, download_priority_grace_ms=5,
+                )
+            self.assertTrue(finished)
+            snapshot = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            self.assertEqual(len(snapshot), 2)
+            self.assertIn(b"retained late first download", snapshot.values())
+            self.assertIn(minimal_pdf_bytes(), snapshot.values())
+            await asyncio.sleep(.02)
+            self.assertEqual({p: p.read_bytes() for p in snapshot}, snapshot)
+
+    async def test_invalid_download_bytes_are_retained_without_becoming_an_artifact(self) -> None:
+        context = _FakeContext()
+        page = _FakePage(context)
+
+        class HtmlDownload:
+            async def save_as(self, path):
+                Path(path).write_bytes(b"<html><title>Client Challenge</title></html>")
+
+        with tempfile.TemporaryDirectory(prefix="capture-invalid-evidence-", dir=TEMP_DIR) as temporary:
+            root = Path(temporary)
+
+            async def action():
+                page.emit("download", HtmlDownload())
+
+            with self.assertRaises(AuthorizedFileCaptureUnavailable):
+                await BrowserAuthorizedFileCapture(root).capture_pdf(
+                    page=page, official_action=action,
+                    trusted_hosts=("academic.oup.com",),
+                    response_url_is_expected=lambda _value: True,
+                    controlled_filename="target.pdf",
+                    provenance_host="academic.oup.com", source_route="test",
+                    timeout_ms=100,
+                )
+            files = [path for path in root.rglob("*") if path.is_file()]
+            self.assertEqual(len(files), 1)
+            self.assertIn(b"Client Challenge", files[0].read_bytes())
 
 
 if __name__ == "__main__":

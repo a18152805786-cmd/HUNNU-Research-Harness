@@ -9,7 +9,8 @@ from typing import Any
 from unittest.mock import patch
 
 from hunnu_harness.literature import cli as literature_cli
-from hunnu_harness.literature.adapters.base import SourceLayoutChanged
+from hunnu_harness.literature.adapters.base import SourceLayoutChanged, SourceUnavailable
+from hunnu_harness.browser.commands import DownloadArtifact, DownloadCommand
 from hunnu_harness.literature.adapters.springerlink import SpringerLinkAdapter
 from hunnu_harness.literature.artifacts import LiteratureArtifactWriter
 from hunnu_harness.literature.downloads import LiteratureDownloadManager
@@ -156,8 +157,9 @@ class _Request:
 
 
 class _Download:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, url: str = "") -> None:
         self.payload = payload
+        self.url = url
 
     async def save_as(self, destination: str) -> None:
         Path(destination).write_bytes(self.payload)
@@ -177,7 +179,7 @@ class _Locator:
 
     async def click(self) -> None:
         self.clicked = True
-        self.page.emit("download", _Download(self.page.download_payload))
+        self.page.emit("download", _Download(self.page.download_payload, getattr(self.page, "download_url", "")))
 
 
 class _Context(_Emitter):
@@ -246,7 +248,7 @@ class SpringerHUNNUGatewayTests(unittest.IsolatedAsyncioTestCase):
         await adapter.open_result(record)
         return adapter, browser, record
 
-    async def test_direct_springer_open_access_keeps_existing_http_download_path(self) -> None:
+    async def test_direct_springer_open_access_uses_one_official_browser_action(self) -> None:
         with tempfile.TemporaryDirectory(prefix="springer-direct-", dir=TEMP_DIR) as temporary:
             root = Path(temporary)
             title = (
@@ -257,9 +259,10 @@ class SpringerHUNNUGatewayTests(unittest.IsolatedAsyncioTestCase):
             browser = _Browser(
                 root,
                 article_html=fixture("springerlink_article_open_access.html"),
-                pdf_text=f"Direct OA fixture Sebastian Wagener DOI: {doi}",
+                pdf_text=f"{title.replace(chr(8217), chr(39))} Sebastian Wagener DOI: {doi}",
             )
-            adapter = SpringerLinkAdapter(browser)
+            browser.page.download_url = f"https://link.springer.com/content/pdf/{doi}.pdf"
+            adapter = SpringerLinkAdapter(browser, capture_timeout_ms=500)
             adapter.fetch_ledger = FulltextFetchLedger(path=root / "fetch_ledger.jsonl")
             record = LiteratureRecord(
                 paper_id="DIRECT",
@@ -276,8 +279,10 @@ class SpringerHUNNUGatewayTests(unittest.IsolatedAsyncioTestCase):
             access = await adapter.check_fulltext_access()
             downloaded = await adapter.download_fulltext(detail, access)
             self.assertEqual(access.access_type, AccessType.OPEN_ACCESS)
-            self.assertEqual(len(browser.context.request.calls), 1)
-            self.assertFalse(browser.page.action.clicked)
+            self.assertEqual(browser.context.request.calls, [])
+            self.assertTrue(browser.page.action.clicked)
+            self.assertTrue(detail.target_doi_matched)
+            self.assertEqual(detail.source_route, "SPRINGER_DIRECT")
             self.assertTrue(downloaded.read_bytes().startswith(b"%PDF-"))
 
     async def test_verified_gateway_preserves_canonical_identity_and_accepts_institution_signal(self) -> None:
@@ -394,6 +399,45 @@ class SpringerHUNNUGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(browser.context.request.calls, [])
             self.assertFalse(detail.target_identity_confirmed)
             self.assertEqual(len(list((root / "quarantine").glob("*.pdf"))), 1)
+
+    async def test_directed_gateway_download_requires_event_provenance_and_file_identity(self) -> None:
+        for emitted, response, host, route, accepted in (
+            (True, False, "yclib.hunnu.edu.cn", "HUNNU_GATEWAY_TO_SPRINGER", True),
+            (False, False, "yclib.hunnu.edu.cn", "HUNNU_GATEWAY_TO_SPRINGER", False),
+            (True, True, "yclib.hunnu.edu.cn", "HUNNU_GATEWAY_TO_SPRINGER", False),
+            (True, False, "untrusted.example", "HUNNU_GATEWAY_TO_SPRINGER", False),
+            (True, False, "yclib.hunnu.edu.cn", "UNBOUND_ROUTE", False),
+        ):
+            with self.subTest(download_event=emitted, response=response, host=host, route=route), tempfile.TemporaryDirectory(prefix="springer-cdp-", dir=TEMP_DIR) as temporary:
+                root = Path(temporary)
+                adapter, browser, _ = await self._bound_adapter(root)
+                detail = await adapter.extract_metadata(search_query=TITLE)
+                access = await adapter.check_fulltext_access()
+                source = write_minimal_pdf_with_text(root / "cdp.pdf", f"{TITLE} Ada Researcher DOI: {DOI}")
+
+                async def captured(command):
+                    self.assertIsInstance(command, DownloadCommand)
+                    self.assertEqual(command.capture.expected_url, access.download_url)
+                    self.assertTrue(command.capture.require_download_event)
+                    return DownloadArtifact.from_path(source, source_url=access.download_url, metadata={
+                        "AcquisitionMethod": "BROWSER_DIRECTED_DOWNLOAD",
+                        "SourceHost": host,
+                        "SourceRoute": route,
+                        "DownloadEventEmitted": emitted,
+                        "AuthorizedPDFResponseCaptured": response,
+                    })
+
+                with patch.object(adapter.browser, "execute", side_effect=captured):
+                    if accepted:
+                        result = await adapter.download_fulltext(detail, access)
+                        self.assertEqual(result, source)
+                        self.assertEqual(detail.acquisition_method, "BROWSER_DIRECTED_DOWNLOAD")
+                        self.assertTrue(detail.target_identity_confirmed)
+                    else:
+                        with self.assertRaises(SourceUnavailable):
+                            await adapter.download_fulltext(detail, access)
+                self.assertTrue(source.exists())
+                self.assertEqual(browser.context.request.calls, [])
 
     async def test_gateway_artifacts_keep_canonical_url_and_remove_runtime_route(self) -> None:
         with tempfile.TemporaryDirectory(prefix="springer-artifact-", dir=TEMP_DIR) as temporary:
@@ -541,8 +585,9 @@ class _FakeLiveBrowser:
 class _FakeAdapter:
     name = "SpringerLink"
 
-    def __init__(self, browser: Any) -> None:
+    def __init__(self, browser: Any, **kwargs: Any) -> None:
         self.browser = browser
+        self.options = kwargs
         self.bound_route: InstitutionalRouteResult | None = None
 
     def bind_institutional_route(self, route: InstitutionalRouteResult) -> None:
