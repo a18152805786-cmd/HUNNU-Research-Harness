@@ -21,7 +21,7 @@ README 讲它是什么、为什么这样设计；这份文档讲具体怎么跑�
 
 默认 profile 位于 `%USERPROFILE%\ResearchHarness\chrome-profile`，不使用日常 Chrome profile。首次打开后，由用户本人完成湖南师范大学图书馆 / 学校统一认证。Harness 只等待并读取可见页面状态；遇到密码、验证码、二维码、MFA 或 WebVPN，必须人工完成后再继续。认证状态分为 `AUTH_UNKNOWN`、`AUTH_REQUIRED`、`AUTH_IN_PROGRESS`、`AUTH_SUCCESS`、`SESSION_EXPIRED`。
 
-`browser-start` 启动专用 profile 并让它一直运行到 `browser-stop`，机构登录状态因此能跨多次运行保留；已在运行时它原样返回而不重启。后续 `acquire` 会附着到它，而不是再启动一个，所以 ScienceDirect 采集应先 `browser-start` 再 `acquire`（AGENTS.md 规则 73）。报告里的 `BrowserLaunched` 对附着和自启同为 true，不能用它判断走了哪一条。附着本身并不能避免出版商的拒绝：2026-09-19 的实测表明，短时间内的大量检索才是诱因，检索因此按 `Output Root\audit\search_pace_ledger.jsonl` 跨进程限速（规则 74）。
+`browser-start` 启动专用 profile 并让它一直运行到 `browser-stop`，机构登录状态因此能跨多次运行保留；已在运行时它原样返回而不重启。后续 `acquire` 会附着到它，而不是再启动一个，所以 ScienceDirect 采集应先 `browser-start` 再 `acquire`（AGENTS.md 规则 73）。报告里的 `BrowserLaunched` 对附着和自启同为 true，不能用它判断走了哪一条。附着本身并不能避免出版商的拒绝：2026-09-19 的实测表明，短时间内的大量检索才是诱因，检索因此按 `Output Root\audit\search_pace_ledger.jsonl` 跨进程限速（规则 74）。页面上出现人机验证字样时，适配器先探测它是否真的渲染在页面上（规则 23）：确认不可见就当普通文字继续；可见就以 `VISIBLE_CHALLENGE` 停下并交出浏览器；判断不了就照旧以 `CHALLENGE_TEXT_UNVERIFIED` 停下。停下的原因里都带 `ManualStep=`，原样转告用户即可（规则 72）。2026-11-17 的实际处理：用户在研究浏览器里点一次 View PDF 过了验证，不用手动保存，原样重跑同一条 `acquire-batch` 命令就下载成功。
 
 - `browser-stop` 通过 CDP 的 `Browser.close` 让 Chrome 正常退出（Chrome 会在退出时写回会话与 Preferences），只有在确认调试端口已关闭、且没有任何 Chrome 进程仍占用该 profile 之后才报告 `PersistentBrowserStopped=true`；限时内未退出则如实报告 `PersistentBrowserRunning=true` 并以退出码 2 结束，绝不把"已断开连接"当作"已停止"。
 - `browser-status` 只报告是否在监听以及 profile 是否被占用（`ProfileInUse`），不会启动浏览器；它与 `browser-stop` 依据同一组事实作答。
