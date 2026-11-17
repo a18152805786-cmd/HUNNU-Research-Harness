@@ -112,6 +112,31 @@ _NO_FULLTEXT_MARKERS = (
 _PUBLISHER_HANDOFF_LABELS = ("view at publisher",)
 _OWN_FULLTEXT_LINK_LABELS = ("view full text",)
 _PDF_PATH_MARKERS = ("/pdfft", "/pdf", ".pdf")
+# Words that make a page a candidate human-verification gate.  Text alone is
+# never the verdict (AGENTS.md Rule 23): on a live page these are probed for
+# visibility before the run calls them a challenge or lets them pass.
+_CHALLENGE_MARKERS = ("captcha", "recaptcha", "verify you are human", "security challenge", "滑块", "验证码")
+_CHALLENGE_PROBES = tuple(
+    re.escape(marker) for marker in ("captcha", "verify you are human", "security challenge", "滑块", "验证码")
+)
+# What the person does at a ScienceDirect challenge, as it was actually cleared
+# on 2026-11-17: the run had stopped on the article page; the user clicked View
+# PDF once in the Research Chrome, the publisher's check passed (the PDF tab
+# came back with ``crasolve=1``), and the same acquire-batch command, rerun
+# unchanged, downloaded both queued papers.  Nothing has to be saved by hand --
+# the rerun fetches the file itself and records it in the ledger.
+_MANUAL_STEP = {
+    "article": (
+        "ManualStep=In the Research Chrome, on the ScienceDirect article page this run left open, "
+        "click View PDF once and complete any verification the publisher shows; when the PDF or "
+        "the article displays, nothing needs saving -- run the same command again"
+    ),
+    "search": (
+        "ManualStep=In the Research Chrome, on the ScienceDirect page this run left open, complete "
+        "any verification the publisher shows until ordinary ScienceDirect content displays; then "
+        "run the same command again"
+    ),
+}
 _NO_PDF_CONTROL_REASON = (
     "No enabled, official PDF view/download control was present on the article page"
 )
@@ -441,8 +466,14 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         url: str = "",
         observed: bool = False,
         challenge_visible: bool = False,
+        challenge_text_cleared: bool = False,
     ) -> None:
         """Decide whether a human is needed, and say how that was established.
+
+        ``challenge_text_cleared`` is set only after a live visibility probe has
+        proven every rendered occurrence of the challenge words hidden (see
+        ``_challenge_visibility``); the words are then page text, not a gate, and
+        only the login checks below still apply.
 
         ``observed`` means this HTML came from a live browser observation of the
         page rather than from static content. Without it a keyword hit is only
@@ -457,8 +488,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
 
         parser = cls._parser(html)
         haystack = f"{url} {_meta_first(parser, 'title', 'og:title')} {parser.body_text}".casefold()
-        captcha_markers = ("captcha", "recaptcha", "verify you are human", "security challenge", "滑块", "验证码")
-        if any(marker in haystack for marker in captcha_markers):
+        if not challenge_text_cleared and any(marker in haystack for marker in _CHALLENGE_MARKERS):
             if observed and challenge_visible:
                 raise SourceActionRequired(
                     "ACTION_REQUIRED_USER_LOGIN=true; "
@@ -510,8 +540,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         query: str,
         source_url: str = "https://www.sciencedirect.com/search",
         max_results: int = 30,
+        challenge_text_cleared: bool = False,
     ) -> list[LiteratureRecord]:
-        cls.detect_interruption(html, url=source_url)
+        cls.detect_interruption(html, url=source_url, challenge_text_cleared=challenge_text_cleared)
         parser = cls._parser(html)
         records: list[LiteratureRecord] = []
         seen: set[str] = set()
@@ -552,7 +583,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         return records
 
     @classmethod
-    def observe_search_page(cls, html: str, *, source_url: str) -> SearchPageObservation:
+    def observe_search_page(
+        cls, html: str, *, source_url: str, challenge_text_cleared: bool = False
+    ) -> SearchPageObservation:
         """Classify the page without parsing it, so an empty result is explainable.
 
         Deliberately does not raise for a login or challenge page: the caller
@@ -582,7 +615,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             # The one detector, rather than a second list of markers to drift
             # out of step with it.  Here its verdict is turned into a page type;
             # raising stays the caller's job.
-            cls.detect_interruption(html, url=source_url)
+            cls.detect_interruption(html, url=source_url, challenge_text_cleared=challenge_text_cleared)
         except LiteratureSourceError:
             return SearchPageObservation(page_type=SearchPageType.NON_SEARCH_PAGE)
         body = parser.body_text.casefold()
@@ -606,8 +639,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         *,
         source_url: str,
         search_query: str = UNKNOWN,
+        challenge_text_cleared: bool = False,
     ) -> LiteratureRecord:
-        cls.detect_interruption(html, url=source_url)
+        cls.detect_interruption(html, url=source_url, challenge_text_cleared=challenge_text_cleared)
         parser = cls._parser(html)
         article_json = _article_json_ld(parser)
 
@@ -727,8 +761,10 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         )
 
     @classmethod
-    def check_fulltext_access_html(cls, html: str, *, source_url: str) -> AccessDecision:
-        cls.detect_interruption(html, url=source_url)
+    def check_fulltext_access_html(
+        cls, html: str, *, source_url: str, challenge_text_cleared: bool = False
+    ) -> AccessDecision:
+        cls.detect_interruption(html, url=source_url, challenge_text_cleared=challenge_text_cleared)
         parser = cls._parser(html)
         candidate, candidate_url = cls._pdf_control(parser, source_url=source_url)
 
@@ -784,18 +820,41 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         except (ValueError, UnicodeError):
             return False
 
-    @classmethod
-    def _raise_if_search_interrupted(
-        cls, html: str, current_url: str, observation: SearchPageObservation
-    ) -> None:
+    async def _search_gate(
+        self,
+        html: str,
+        current_url: str,
+        observation: SearchPageObservation,
+        *,
+        already_cleared: bool = False,
+    ) -> bool:
+        """Stop at a search-page gate, or say the challenge words were proven hidden.
+
+        A refusal is checked first: it is not a challenge to pass.  A result
+        container does not by itself clear challenge words -- they are probed
+        (``_clear_or_stop``); rendered words on a page that shows results stay
+        an unverified stop, because a result title can carry them too.  Returns
+        ``True`` when the words were proven not rendered; a page that is still
+        not a search page once they are ignored is the bot-check interstitial.
+        """
+
         if observation.page_type is SearchPageType.PUBLISHER_BLOCKED:
-            raise cls._publisher_block_stop(
-                "search", cls.publisher_block_evidence(cls._parser(html)) or "PublisherReference=unknown"
+            raise self._publisher_block_stop(
+                "search", self.publisher_block_evidence(self._parser(html)) or "PublisherReference=unknown"
             )
-        # A result container behind challenge text does not clear the gate.
-        cls.detect_interruption(html, url=current_url)
-        if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
-            raise cls._interstitial_stop("search")
+        if already_cleared:
+            self.detect_interruption(html, url=current_url, challenge_text_cleared=True)
+            cleared = True
+        else:
+            cleared = await self._clear_or_stop(
+                html,
+                current_url,
+                stage="search",
+                content_present=observation.page_type is SearchPageType.RESULTS_PRESENT,
+            )
+        if observation.page_type is SearchPageType.NON_SEARCH_PAGE and (already_cleared or not cleared):
+            raise self._interstitial_stop("search")
+        return cleared
 
     async def search(
         self,
@@ -820,16 +879,21 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         except ValueError:
             official_page = False
         observation = self.observe_search_page(html, source_url=current_url)
+        cleared = False
         if official_page:
             self.last_search_observation = observation
-            self._raise_if_search_interrupted(html, current_url, observation)
+            cleared = await self._search_gate(html, current_url, observation)
         else:
             # An institutional login handoff may be on CAS/WebVPN rather than
             # the publisher host. Its existing manual gate must also survive.
             self.detect_interruption(html, url=current_url)
         if self._search_url_matches_query(current_url, query):
-            if observation.page_type is SearchPageType.PENDING:
-                html, current_url, observation = await self._settled_search_page(source_url=url)
+            if observation.page_type is SearchPageType.PENDING or (
+                cleared and observation.page_type is SearchPageType.NON_SEARCH_PAGE
+            ):
+                html, current_url, observation = await self._settled_search_page(
+                    source_url=url, challenge_text_cleared=cleared
+                )
             if not self._search_url_matches_query(current_url, query):
                 raise SourceLayoutChanged(
                     "ScienceDirect's observed search page changed its query while settling; "
@@ -837,14 +901,24 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 )
         else:
             await self.browser.execute(NavigateCommand(url))
+            cleared = False
             html, current_url, observation = await self._settled_search_page(source_url=url)
         self.last_search_observation = observation
-        self._raise_if_search_interrupted(html, current_url, observation)
+        cleared = await self._search_gate(html, current_url, observation, already_cleared=cleared)
+        if observation.page_type is SearchPageType.NON_SEARCH_PAGE:
+            # Challenge words proven not rendered: read the page again as a
+            # search page, the words ignored, within the same bounded window.
+            html, current_url, observation = await self._settled_search_page(
+                source_url=url, challenge_text_cleared=True
+            )
+            self.last_search_observation = observation
+            await self._search_gate(html, current_url, observation, already_cleared=True)
         results = self.parse_search_results_html(
             html,
             query=query,
             source_url=current_url,
             max_results=min(request.max_results_per_source, request.max_search_results),
+            challenge_text_cleared=cleared,
         )
         if not results and "sciencedirect" not in current_url.casefold():
             raise SourceUnavailable("ScienceDirect search navigation did not reach the expected source")
@@ -905,13 +979,138 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             "ACTION_REQUIRED_USER_LOGIN=true; "
             f"Reason=Publisher bot-check interstitial still on the ScienceDirect {stage} page "
             "after the bounded wait; it was not interacted with; "
-            "BrowserReadyForManualAction=false",
+            f"BrowserReadyForManualAction=false; {_MANUAL_STEP.get(stage, _MANUAL_STEP['search'])}",
             reason=HumanActionReason.CHALLENGE_TEXT_UNVERIFIED,
             challenge_observed=True,
             challenge_visible=False,
             challenge_blocking=False,
             browser_ready_for_manual_action=False,
         )
+
+    @staticmethod
+    def _challenge_stop(stage: str, evidence: str, *, visible: bool) -> SourceActionRequired:
+        """The stop for challenge words on a live page, after they were probed.
+
+        Visible means the probe found an occurrence rendered (or a blocking
+        overlay) on a page that is not presenting its own content -- the state a
+        person can see and pass, so the browser is handed over as ready (Rules
+        24, 31).  Anything the probe could not settle stays
+        CHALLENGE_TEXT_UNVERIFIED, exactly as before the probe existed.  Both
+        carry the step the person takes, so the hand-off (Rule 72) names it.
+        """
+
+        step = _MANUAL_STEP.get(stage, _MANUAL_STEP["search"])
+        if visible:
+            return SourceActionRequired(
+                "ACTION_REQUIRED_USER_LOGIN=true; "
+                f"Reason=Visible human verification challenge on the ScienceDirect {stage} page; "
+                f"{evidence}; it was not interacted with; "
+                f"BrowserReadyForManualAction=true; {step}",
+                reason=HumanActionReason.VISIBLE_CHALLENGE,
+                challenge_observed=True,
+                challenge_visible=True,
+                challenge_blocking=True,
+                browser_ready_for_manual_action=True,
+            )
+        return SourceActionRequired(
+            "ACTION_REQUIRED_USER_LOGIN=true; "
+            "Reason=Challenge text present in page content but not confirmed visible by a browser "
+            f"observation; {evidence}; BrowserReadyForManualAction=false; {step}",
+            reason=HumanActionReason.CHALLENGE_TEXT_UNVERIFIED,
+            challenge_observed=True,
+            challenge_visible=False,
+            challenge_blocking=False,
+            browser_ready_for_manual_action=False,
+        )
+
+    async def _challenge_visibility(self) -> tuple[str, str]:
+        """Probe the live page for the challenge words: ``visible``, ``hidden`` or ``unclassified``.
+
+        Rule 23: DOM or text presence is not an active challenge.  This asks the
+        browser where each occurrence is rendered, using the same typed probe as
+        CNKI and OfficialWeb, and never touches the page.
+
+        ``hidden`` is claimed only when at least one occurrence was found, every
+        one was inspected completely, and every one was proven not rendered --
+        ``is_visible()`` false, placed wholly off-screen above or left, or inside
+        a frame that is not in view.  No occurrence at all is *not* hidden: a
+        backend without text probes returns none, and the words came from
+        somewhere.  Any doubt is ``unclassified``, which stops as before.
+        """
+
+        if self.browser is None:
+            return "unclassified", "VisibilityProbe=unavailable"
+        try:
+            observation = await self.browser.execute(
+                ObserveCommand(
+                    include_html=False,
+                    include_visible_text=False,
+                    text_probes=_CHALLENGE_PROBES,
+                )
+            )
+        except Exception as exc:  # the probe is evidence-gathering, never fatal
+            return "unclassified", f"VisibilityProbe=failed:{type(exc).__name__}"
+        nodes = tuple(getattr(observation, "target_observations", ()) or ())
+        complete = getattr(observation, "inspection_complete", False) is True
+        visible = hidden = unknown = 0
+        for node in nodes:
+            if getattr(node, "blocking_overlay", False):
+                visible += 1
+                continue
+            if getattr(node, "inspection_complete", False) is not True:
+                unknown += 1
+                continue
+            box = getattr(node, "bounding_box", None) or {}
+            offscreen = bool(box) and (
+                float(box.get("x", 0)) + float(box.get("width", 0)) <= 0
+                or float(box.get("y", 0)) + float(box.get("height", 0)) <= 0
+            )
+            rendered = getattr(node, "playwright_visible", None)
+            if rendered is False or offscreen or getattr(node, "frame_viewport_visible", True) is False:
+                hidden += 1
+            elif rendered is True:
+                visible += 1
+            else:
+                unknown += 1
+        evidence = (
+            f"VisibilityProbe=matches:{len(nodes)},visible:{visible},hidden:{hidden},"
+            f"unclassified:{unknown},complete:{str(complete).lower()}"
+        )
+        if visible:
+            return "visible", evidence
+        if nodes and complete and hidden == len(nodes):
+            return "hidden", evidence
+        return "unclassified", evidence
+
+    async def _clear_or_stop(
+        self, html: str, current_url: str, *, stage: str, content_present: bool
+    ) -> bool:
+        """Settle challenge words on a live page: ``True`` if proven hidden, else raise.
+
+        Returns ``False`` without probing when the page carries no challenge or
+        login text at all, so the caller's own handling (an interstitial, a
+        parse) is unchanged.  A login page is raised as a login, unprobed.
+        ``content_present`` is whether the page is already showing what it is
+        (an article title, a results list): there a rendered occurrence may be
+        the content itself -- an abstract about CAPTCHAs -- so it is reported as
+        unverified, never as a visible challenge.
+        """
+
+        try:
+            self.detect_interruption(html, url=current_url)
+            return False
+        except SourceActionRequired as exc:
+            if exc.reason is not HumanActionReason.CHALLENGE_TEXT_UNVERIFIED:
+                raise
+        verdict, evidence = await self._challenge_visibility()
+        if content_present and verdict == "visible":
+            verdict, evidence = "unclassified", f"{evidence},content_present:true"
+        self.last_challenge_probe = evidence
+        if verdict == "hidden":
+            # The words are page text.  Login gates still apply to this page.
+            self.detect_interruption(html, url=current_url, challenge_text_cleared=True)
+            return True
+        raise self._challenge_stop(stage, evidence, visible=verdict == "visible")
 
     @staticmethod
     def _no_fulltext_notice(
@@ -944,7 +1143,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
 
     @classmethod
     def observe_article_readiness(
-        cls, html: str, *, source_url: str
+        cls, html: str, *, source_url: str, challenge_text_cleared: bool = False
     ) -> ArticleReadinessObservation:
         """Whether the article page has said anything decisive about full text.
 
@@ -959,7 +1158,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         page_match = _ARTICLE_PATH.search(urlsplit(source_url).path)
         page_pii = page_match.group(1) if page_match else UNKNOWN
         try:
-            cls.detect_interruption(html, url=source_url)
+            cls.detect_interruption(html, url=source_url, challenge_text_cleared=challenge_text_cleared)
         except LiteratureSourceError:
             return ArticleReadinessObservation(
                 readiness=ArticleReadiness.INTERRUPTED, page_pii=page_pii
@@ -1046,11 +1245,15 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         waited_ms = int((time.monotonic() - started) * 1000)
         return html, current_url, verdict, waited_ms
 
-    async def _settled_search_page(self, *, source_url: str) -> tuple[str, str, SearchPageObservation]:
+    async def _settled_search_page(
+        self, *, source_url: str, challenge_text_cleared: bool = False
+    ) -> tuple[str, str, SearchPageObservation]:
         """Read the search page once it has decided what it is."""
 
         html, current_url, observation, _waited = await self._observe_until_decided(
-            lambda body, url: self.observe_search_page(body, source_url=url),
+            lambda body, url: self.observe_search_page(
+                body, source_url=url, challenge_text_cleared=challenge_text_cleared
+            ),
             timeout=SEARCH_RENDER_TIMEOUT_SECONDS,
             poll=SEARCH_RENDER_POLL_SECONDS,
         )
@@ -1115,7 +1318,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         return detail
 
     @classmethod
-    def observe_article_page(cls, html: str, *, source_url: str) -> ArticlePageState:
+    def observe_article_page(
+        cls, html: str, *, source_url: str, challenge_text_cleared: bool = False
+    ) -> ArticlePageState:
         """Classify an article page without extracting from it.
 
         Like ``observe_search_page`` this never raises, because it is polled
@@ -1124,7 +1329,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
         """
 
         try:
-            cls.detect_interruption(html, url=source_url)
+            cls.detect_interruption(html, url=source_url, challenge_text_cleared=challenge_text_cleared)
         except LiteratureSourceError:
             return ArticlePageState.INTERRUPTED
         parser = cls._parser(html)
@@ -1155,13 +1360,30 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
             poll=ARTICLE_RENDER_POLL_SECONDS,
         )
+        cleared = False
+        if state is ArticlePageState.INTERRUPTED and await self._clear_or_stop(
+            html,
+            current_url,
+            stage="article",
+            content_present=_article_title(self._parser(html)) != UNKNOWN,
+        ):
+            cleared = True
+            html, current_url, state, _waited = await self._observe_until_decided(
+                lambda body, url: self.observe_article_page(
+                    body, source_url=url, challenge_text_cleared=True
+                ),
+                timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
+                poll=ARTICLE_RENDER_POLL_SECONDS,
+            )
         if state is ArticlePageState.PUBLISHER_BLOCKED:
             raise self._publisher_block_stop(
                 "article", self.publisher_block_evidence(self._parser(html)) or "PublisherReference=unknown"
             )
         if state is ArticlePageState.PAGE_GATE:
             raise self._interstitial_stop("article")
-        return self.parse_article_html(html, source_url=current_url, search_query=search_query)
+        return self.parse_article_html(
+            html, source_url=current_url, search_query=search_query, challenge_text_cleared=cleared
+        )
 
     async def extract_abstract(self) -> str:
         html, current_url = await self._content()
@@ -1187,6 +1409,21 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
             poll=ARTICLE_RENDER_POLL_SECONDS,
         )
+        cleared = False
+        if observation.readiness is ArticleReadiness.INTERRUPTED and await self._clear_or_stop(
+            html,
+            current_url,
+            stage="article",
+            content_present=_article_title(self._parser(html)) != UNKNOWN,
+        ):
+            cleared = True
+            html, current_url, observation, waited_ms = await self._observe_until_decided(
+                lambda body, url: self.observe_article_readiness(
+                    body, source_url=url, challenge_text_cleared=True
+                ),
+                timeout=ARTICLE_RENDER_TIMEOUT_SECONDS,
+                poll=ARTICLE_RENDER_POLL_SECONDS,
+            )
         self.last_article_readiness = observation
         self.last_article_readiness_wait_ms = waited_ms
         if observation.readiness is ArticleReadiness.PENDING_RENDER:
@@ -1215,7 +1452,9 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
                 "control for this article; the PDF controls on it belong to other "
                 f"articles (first seen: PII {observation.pdf_control_pii})"
             )
-        return self.check_fulltext_access_html(html, source_url=current_url)
+        return self.check_fulltext_access_html(
+            html, source_url=current_url, challenge_text_cleared=cleared
+        )
 
     async def download_fulltext(self, record: LiteratureRecord, access: AccessDecision) -> Path:
         if not access.full_text_accessible or not access.authorized_access:

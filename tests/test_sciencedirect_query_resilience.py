@@ -195,6 +195,12 @@ class ScriptedPort:
             self.states = list(self.script(command.url))
             self.reads = 0
             return self._observation(None)
+        if isinstance(command, ObserveCommand) and command.text_probes:
+            # The challenge-visibility probe: read-only, logged apart from page
+            # reads, and it consumes no scripted state.  No probe evidence is
+            # served, so the adapter can never treat challenge words as hidden.
+            self.commands.append(("Probe", self.url))
+            return self._observation(None)
         if isinstance(command, ObserveCommand):
             self.commands.append(("Observe", self.url))
             state = self.states[min(self.reads, len(self.states) - 1)]
@@ -328,14 +334,15 @@ class SearchPageResumeTests(_FastWindows):
         port = self._existing("q", [CAPTCHA_FIXTURE])
         with self.assertRaises(SourceActionRequired):
             search(port, "q")
-        self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+        # One page read, then the read-only visibility probe; no navigation.
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Probe"])
         # The user's manual action changes the live page, not the adapter.
         port.states, port.reads = [results_page(card(*A1))], 0
         adapter, records = search(port, "q")
         self.assertEqual([r.stable_identifier for r in records], [A1[0]])
         self.assertEqual(records[0].search_query, "q")
         self.assertIs(adapter.last_search_observation.page_type, SearchPageType.RESULTS_PRESENT)
-        self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Observe"])
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Probe", "Observe"])
 
     def test_same_query_genuine_zero_is_reused(self) -> None:
         port = self._existing("q", [NO_RESULTS])
@@ -389,13 +396,15 @@ class SearchPageResumeTests(_FastWindows):
                 port = self._existing("new", [html], url="https://www.sciencedirect.com/search?qs=old")
                 with self.assertRaises(SourceActionRequired):
                     search(port, "new")
-                self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+                # One page read and no navigation; CAPTCHA words also get the
+                # read-only visibility probe.
+                self.assertEqual([kind for kind, _ in port.commands if kind != "Probe"], ["Observe"])
 
     def test_challenge_with_result_cards_cannot_be_reused_as_normal_results(self) -> None:
         port = self._existing("q", [CAPTCHA_FIXTURE + results_page(card(*A1))])
         with self.assertRaises(SourceActionRequired):
             search(port, "q")
-        self.assertEqual([kind for kind, _ in port.commands], ["Observe"])
+        self.assertEqual([kind for kind, _ in port.commands], ["Observe", "Probe"])
 
     def test_institutional_login_handoff_is_not_discarded_by_navigation(self) -> None:
         port = self._existing("q", [LOGIN_FIXTURE], url="https://cas.example.invalid/login")
