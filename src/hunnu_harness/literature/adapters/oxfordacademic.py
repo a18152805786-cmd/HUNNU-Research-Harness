@@ -536,7 +536,11 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
         confirmed = (
             verification.verified
             and (not title_evidence_required or title_match)
-            and (doi_match if expected_doi != UNKNOWN else title_match and author_match)
+            and (
+                verification.doi_or_citation_matched
+                if expected_doi != UNKNOWN
+                else title_match and author_match
+            )
         )
         return OxfordPDFIdentityResult(confirmed, title_match, doi_match, author_match)
 

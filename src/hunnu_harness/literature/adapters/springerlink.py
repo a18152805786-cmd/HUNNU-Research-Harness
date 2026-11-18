@@ -392,7 +392,9 @@ class SpringerLinkAdapter(LiteratureSourceAdapter):
             first_author != UNKNOWN
             and first_author.replace(" ", "") in normalize_person(text).replace(" ", "")
         )
-        confirmed = proof.verified and title_match and (doi_match if expected_doi != UNKNOWN else author_match)
+        confirmed = proof.verified and title_match and (
+            proof.doi_or_citation_matched if expected_doi != UNKNOWN else author_match
+        )
         return SpringerPDFIdentityResult(confirmed, title_match, doi_match, author_match)
 
     def _quarantine(self, path: Path) -> Path:

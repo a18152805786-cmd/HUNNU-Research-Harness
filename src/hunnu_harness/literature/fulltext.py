@@ -179,10 +179,24 @@ class ExternalIdentityVerificationResult:
     extracted_dois: tuple[str, ...] = ()
     reason: str = UNKNOWN
     bounded_local_doi: str = "not_attempted"
+    # "matched" only when a supplied DOI is printed nowhere in the PDF and the
+    # first page instead carries the title, the first author's surname and the
+    # article's own volume and first page (see _citation_identity_matches).
+    citation_verification: str = "not_attempted"
 
     @property
     def verified(self) -> bool:
         return self.decision == ExternalIdentityDecision.VERIFIED
+
+    @property
+    def doi_or_citation_matched(self) -> bool:
+        """The DOI was printed and matched, or -- with no DOI printed at all --
+        the title, first author, volume and first page all matched instead."""
+
+        return (
+            self.doi_verification == DOIContentVerification.MATCHED
+            or self.citation_verification == "matched"
+        )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -192,6 +206,7 @@ class ExternalIdentityVerificationResult:
             "ClaimedDOI": self.claimed_doi,
             "ExtractedDOIs": list(self.extracted_dois),
             "BoundedLocalDOI": self.bounded_local_doi,
+            "CitationVerification": self.citation_verification,
             "Reason": self.reason,
         }
 
@@ -596,6 +611,26 @@ def verify_external_paper_identity(
             f"External identity verified by normalized title content; {evidence}",
             bounded_local_doi,
         )
+    if (
+        claimed_doi != UNKNOWN
+        and doi_verification == DOIContentVerification.NOT_AVAILABLE
+        and title_verification == "matched"
+        and _citation_identity_matches(first_page_text or "", record)
+    ):
+        # Older scans (pre-2000s JSTOR, Blackwell or Elsevier PDFs) print no
+        # DOI anywhere. With no DOI in the file at all -- a conflicting DOI
+        # stopped above -- four independent first-page facts stand in for it.
+        return ExternalIdentityVerificationResult(
+            ExternalIdentityDecision.VERIFIED,
+            doi_verification,
+            title_verification,
+            claimed_doi,
+            extracted_dois,
+            "External identity verified by title, first author, volume and first page "
+            f"because the PDF prints no DOI; {evidence}",
+            bounded_local_doi,
+            "matched",
+        )
     return ExternalIdentityVerificationResult(
         ExternalIdentityDecision.UNVERIFIED,
         doi_verification,
@@ -605,3 +640,48 @@ def verify_external_paper_identity(
         f"PDF content does not provide sufficient independent identity evidence; {evidence}",
         bounded_local_doi,
     )
+
+
+_CITATION_GAP_RE = r"[^A-Za-z]{1,16}?"
+
+
+def _first_author_surname(name: str) -> str:
+    raw = str(name or "").strip()
+    if not raw or raw == UNKNOWN:
+        return UNKNOWN
+    family = raw.split(",", 1)[0] if "," in raw else raw.split()[-1]
+    return normalize_title(family)
+
+
+def _citation_identity_matches(first_page_text: str, record: LiteratureRecord) -> bool:
+    """Title is checked by the caller; this needs the other three facts.
+
+    The surname must stand as whole words on the first page, and the volume
+    must be followed, within a short run of non-letters (a year in brackets,
+    a comma or a stop, and at most a ``pp.`` before the page), by the first
+    page -- the journal's citation line, e.g. ``59.473-494``, ``70, 281-315``,
+    ``58 (2000) 3-27`` or ``Vol. 59, pp. 473-494``. All values come from
+    the publisher's own article metadata, never from the PDF.
+    """
+
+    surname = _first_author_surname(record.first_author)
+    volume = str(record.volume or "").strip()
+    pages = str(record.pages_or_article_number or "").strip()
+    first_page = re.split(r"\s*[-‐-―]\s*", pages, maxsplit=1)[0] if pages else ""
+    if (
+        surname == UNKNOWN
+        or len(surname.replace(" ", "")) < 2
+        or not re.fullmatch(r"\d{1,4}", volume)
+        or not re.fullmatch(r"\d{1,6}", first_page)
+    ):
+        return False
+    normalized_text = normalize_title(first_page_text)
+    if normalized_text == UNKNOWN or not re.search(
+        rf"(?<!\w){re.escape(surname)}(?!\w)", normalized_text
+    ):
+        return False
+    citation = re.compile(
+        rf"(?<!\d){re.escape(volume.lstrip('0') or '0')}(?!\d){_CITATION_GAP_RE}"
+        rf"(?:pp?\.\s*)?(?<!\d){re.escape(first_page.lstrip('0') or '0')}(?!\d)"
+    )
+    return citation.search(first_page_text) is not None

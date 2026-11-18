@@ -1538,7 +1538,7 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             record.target_identity_confirmed = bool(
                 proof.verified
                 and record.target_title_matched
-                and (normalize_doi(record.doi) == UNKNOWN or record.target_doi_matched)
+                and (normalize_doi(record.doi) == UNKNOWN or proof.doi_or_citation_matched)
             )
             if not record.target_identity_confirmed:
                 raise SourceLayoutChanged("Captured ScienceDirect PDF failed local target identity validation")
