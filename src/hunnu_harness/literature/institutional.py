@@ -30,7 +30,13 @@ HUNNU_OFFICIAL_PORTAL = "https://www.hunnu.edu.cn/"
 HUNNU_LIBRARY_HOME = "https://lib.hunnu.edu.cn/"
 HUNNU_OXFORD_ROUTE_URL_ENV = "HUNNU_OXFORD_ROUTE_URL"
 _SNAPSHOT_SETTLE_DELAY_SECONDS = 2.0
-_SNAPSHOT_SETTLE_MAX_ATTEMPTS = 3
+# The library home page is an application shell that renders its menu after
+# load: about 2 s on a warm profile, and on 2026-11-18 a run straight after
+# ``browser-start`` still saw the bare shell after the old 3 observations
+# (~4 s) and stopped with "no Database Navigation entry". Six observations
+# (~10 s) cover a cold start; the wait still ends at the first observation
+# that shows the evidence, and every observation still checks for a login gate.
+_SNAPSHOT_SETTLE_MAX_ATTEMPTS = 6
 
 
 class InstitutionalResolutionTrigger(str, Enum):

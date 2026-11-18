@@ -14,7 +14,7 @@ from urllib.parse import quote, urlsplit
 from hunnu_harness.browser.commands import (
     BrowserObservation, NavigateCommand, ObserveCommand, PageHandle, SessionHandle,
 )
-from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceLayoutChanged
+from hunnu_harness.literature.adapters.base import SourceActionRequired, SourceLayoutChanged, SourceUnavailable
 from hunnu_harness.literature.adapters.oxfordacademic import OxfordAcademicAdapter
 from hunnu_harness.literature.institutional import InstitutionalResolutionTrigger, InstitutionalRouteResult
 from hunnu_harness.literature.models import LiteratureSearchRequest
@@ -25,6 +25,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "literature"
 DOI = "10.1111/ectj.12097"
 TITLE = "Double/debiased machine learning for treatment and structural parameters"
 ARTICLE = "https://academic.oup.com/ectj/article/21/1/C1/5056401"
+LOOKUP = "https://academic.oup.com/ectj/article-lookup/doi/" + DOI
 
 
 def payload(doi=DOI, title=TITLE, landing=ARTICLE):
@@ -235,6 +236,49 @@ class OxfordPublicDOILookupTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises((SourceActionRequired, SourceLayoutChanged)):
                 await adapter.open_result(record)
             self.assertEqual(len(port.navigations), 2)
+
+    async def test_doi_lookup_landing_is_followed_only_to_the_same_article(self):
+        # Crossref registers older Oxford articles with /article-lookup/doi/<DOI>;
+        # failing this means those papers can never be fetched by DOI again.
+        port = MetadataPort(metadata=payload(landing=LOOKUP), article_url=LOOKUP)
+        port.article_final_url = ARTICLE
+        records = await OxfordAcademicAdapter(port).search(DOI, request())
+        self.assertEqual(port.navigations, ["https://api.crossref.org/works/" + quote(DOI, safe=""), LOOKUP])
+        self.assertTrue(records[0].target_identity_confirmed)
+        self.assertEqual(records[0].stable_identifier, "5056401")
+
+    async def test_doi_lookup_for_another_doi_or_with_escapes_never_navigates(self):
+        bad = (
+            "https://academic.oup.com/ectj/article-lookup/doi/10.1111/ectj.other",
+            LOOKUP + "?token=secret", LOOKUP + "#x", LOOKUP.replace("https://", "http://"),
+            LOOKUP.replace("academic.oup.com", "academic.oup.com.evil.example"),
+            "https://academic.oup.com/ectj/article-lookup/doi/10.1111%2Fectj.12097",
+            "https://academic.oup.com/ectj/article-lookup/doi/../../10.1111/ectj.12097",
+            "https://academic.oup.com/ectj/article-lookup/doi/10.1111/ectj.12097.pdf",
+        )
+        for landing in bad:
+            with self.subTest(landing=landing):
+                port = MetadataPort(metadata=payload(landing=landing), article_url=landing)
+                with self.assertRaises(SourceLayoutChanged):
+                    await OxfordAcademicAdapter(port).search(DOI, request())
+                self.assertEqual(len(port.navigations), 1)
+
+    async def test_doi_lookup_that_does_not_reach_the_requested_article_stops(self):
+        original = (FIXTURES / "oxfordacademic_article_purchased.html").read_text(encoding="utf-8")
+        cases = (
+            (original, LOOKUP),  # no redirect: still on the lookup page
+            (original, "https://academic.oup.com/ectj"),  # redirected to a non-article page
+            (original, "https://evil.example/ectj/article/21/1/C1/5056401"),
+            (original.replace(DOI, "10.1111/ectj.other"), ARTICLE),  # a different article
+            (original.replace(TITLE, "A different article"), ARTICLE),
+        )
+        for html, final_url in cases:
+            with self.subTest(final_url=final_url, html=html[:60]):
+                port = MetadataPort(metadata=payload(landing=LOOKUP), article_html=html, article_url=LOOKUP)
+                port.article_final_url = final_url
+                with self.assertRaises((SourceLayoutChanged, SourceUnavailable)):
+                    await OxfordAcademicAdapter(port).search(DOI, request())
+                self.assertEqual(len(port.navigations), 2)
 
     async def test_verified_institutional_gateway_still_uses_existing_article_rewrite(self):
         port = MetadataPort()

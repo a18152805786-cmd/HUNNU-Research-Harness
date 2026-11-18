@@ -60,6 +60,14 @@ _ARTICLE_PATH = re.compile(
     r"(?P<page>[^/?#]+)/(?P<identifier>\d+)",
     re.IGNORECASE,
 )
+# Crossref registers many older Oxford articles (DOIs carried over from
+# Blackwell or JSTOR) with a DOI-lookup landing page rather than the canonical
+# article path; Oxford answers it with a redirect to the article. It is only a
+# navigation entry: the article identity is still locked on the page it lands on.
+_DOI_LOOKUP_PATH = re.compile(
+    r"/(?P<journal>[a-z0-9_-]+)/article-lookup/doi/(?P<doi>10\.\d{4,9}/[^?#]+)",
+    re.IGNORECASE,
+)
 _PDF_PATH = re.compile(r"/[a-z0-9_-]+/article-pdf/[^?#]+\.pdf$", re.IGNORECASE)
 _REJECT_PDF_LABELS = (
     "supplement",
@@ -157,6 +165,17 @@ def _article_match(value: str) -> re.Match[str] | None:
 def _stable_identifier(value: str) -> str:
     match = _article_match(value)
     return match.group("identifier") if match else UNKNOWN
+
+
+def _doi_lookup_match(value: str, doi: str) -> re.Match[str] | None:
+    """A DOI-lookup path on the Oxford host whose DOI is exactly ``doi``."""
+
+    match = _DOI_LOOKUP_PATH.fullmatch(urlsplit(value).path.rstrip("/"))
+    if match is None or normalize_doi(doi) == UNKNOWN:
+        return None
+    if normalize_doi(match.group("doi")) != normalize_doi(doi):
+        return None
+    return match
 
 
 def _canonical_article_url(value: str) -> str:
@@ -710,29 +729,42 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
                 and not parsed.query and not parsed.fragment
                 and "%" not in parsed.path
                 and re.search(r"[\x00-\x20\x7f\\]", landing) is None
-                and _ARTICLE_PATH.fullmatch(parsed.path.rstrip("/")) is not None
                 and all(
                     part not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9._-]+", part)
                     for part in parsed.path.split("/")[1:]
                 )
                 and ".pdf" not in parsed.path.casefold()
+            )
+            canonical = (
+                safe
+                and _ARTICLE_PATH.fullmatch(parsed.path.rstrip("/")) is not None
                 and landing == _canonical_article_url(landing)
             )
+            lookup = (
+                safe
+                and not canonical
+                and landing == f"https://{cls.official_host}{parsed.path}"
+                and _doi_lookup_match(landing, requested_doi) is not None
+            )
         except ValueError:
-            safe = False
-        if not safe:
+            canonical = lookup = False
+        if not (canonical or lookup):
             raise SourceLayoutChanged(
-                "Oxford exact DOI primary URL was not a canonical unsigned Oxford article landing page"
+                "Oxford exact DOI primary URL was not a canonical unsigned Oxford article landing page "
+                "or an Oxford DOI-lookup page for the requested DOI"
             )
         paper_id = stable_paper_id(doi=requested_doi)
+        # A lookup landing carries no article identifier of its own: it stays
+        # UNKNOWN here and is read from the article page Oxford redirects to,
+        # where the DOI and title must still match (``identity_matches``).
         return LiteratureRecord(
             paper_id=paper_id,
             title=titles[0].strip(),
             doi=requested_doi,
             source_database=cls.name,
-            source_page=_canonical_article_url(landing),
+            source_page=_canonical_article_url(landing) if canonical else UNKNOWN,
             navigation_url=landing,
-            stable_identifier=_stable_identifier(landing),
+            stable_identifier=_stable_identifier(landing) if canonical else UNKNOWN,
             search_query=requested_doi,
             canonical_paper_id=paper_id,
         )
@@ -877,26 +909,39 @@ class OxfordAcademicAdapter(LiteratureSourceAdapter):
                     return
             raise SourceLayoutChanged("Oxford DOI lookup page identity changed before the workflow opened it")
         target = record.navigation_url if record.navigation_url != UNKNOWN else record.source_page
+        doi_lookup = _doi_lookup_match(target, record.doi) is not None
         if (
             self._gateway_trusted()
             and _host(target) == self.official_host
             and self._institutional_route is not None
             and _host(self._institutional_route.publisher_navigation_url) == self.hunnu_gateway_host
         ):
-            article = _article_match(target)
+            article = _article_match(target) or _doi_lookup_match(target, record.doi)
             if article is None:
                 raise SourceLayoutChanged("Oxford article path is unavailable for institutional routing")
             target = self._gateway_navigation(article.group(0))
         if not self._is_trusted_url(
             target,
             institutional_route_verified=self._gateway_trusted(),
-        ) or _article_match(target) is None:
+        ) or (_article_match(target) is None and _doi_lookup_match(target, record.doi) is None):
             raise SourceLayoutChanged("Result URL is not a trusted stable Oxford article page")
         self._expected_record = record
         self._detail_record = None
         if self.browser is None:
             raise SourceUnavailable("Browser command port is unavailable")
         await self.browser.execute(NavigateCommand(target))
+        if doi_lookup:
+            # The lookup page is only an entry: Oxford must have redirected to
+            # a stable article page on the trusted route before anything on it
+            # is read. Staying on the lookup path, or landing elsewhere, stops.
+            html, current_url = await self._content()
+            self.detect_interruption(html, url=current_url)
+            if not self._is_trusted_url(
+                current_url, institutional_route_verified=self._gateway_trusted()
+            ) or _article_match(current_url) is None:
+                raise SourceLayoutChanged(
+                    "Oxford DOI-lookup page did not redirect to a trusted stable article page"
+                )
 
     async def extract_metadata(self, *, search_query: str) -> LiteratureRecord:
         html, current_url = await self._content()
