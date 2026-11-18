@@ -185,6 +185,14 @@ class _ScienceDirectHTMLParser(HTMLParser):
         self._list_stack: list[bool] = []
         self._item_depth = 0
         self.result_cards = 0
+        # Older ScienceDirect article pages carry no citation_author meta and
+        # no JSON-LD; the byline in <div id="author-group"> is the only place
+        # the authors are named, as given-name / surname span pairs.
+        self.author_group_names: list[str] = []
+        self._author_group_div_depth = 0
+        self._author_name_field: str | None = None
+        self._author_name_parts: list[str] = []
+        self._pending_given_name = ""
 
     @property
     def _in_results(self) -> bool:
@@ -215,9 +223,30 @@ class _ScienceDirectHTMLParser(HTMLParser):
             self._anchor_stack.append((attributes.get("href", ""), attributes, []))
         elif lowered == "script" and "ld+json" in attributes.get("type", "").casefold():
             self._json_ld_depth += 1
+        if lowered == "div":
+            if self._author_group_div_depth:
+                self._author_group_div_depth += 1
+            elif attributes.get("id", "") == "author-group":
+                self._author_group_div_depth = 1
+        elif lowered == "span" and self._author_group_div_depth and self._author_name_field is None:
+            classes = _classes(attributes)
+            if "given-name" in classes:
+                self._author_name_field, self._author_name_parts = "given", []
+            elif "surname" in classes:
+                self._author_name_field, self._author_name_parts = "surname", []
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.casefold()
+        if lowered == "div" and self._author_group_div_depth:
+            self._author_group_div_depth -= 1
+        elif lowered == "span" and self._author_name_field is not None:
+            value = " ".join(self._author_name_parts).strip()
+            if self._author_name_field == "given":
+                self._pending_given_name = value
+            elif value:
+                self.author_group_names.append(f"{self._pending_given_name} {value}".strip())
+                self._pending_given_name = ""
+            self._author_name_field, self._author_name_parts = None, []
         if lowered == "a" and self._anchor_stack:
             href, attributes, parts = self._anchor_stack.pop()
             self.anchors.append(
@@ -240,6 +269,8 @@ class _ScienceDirectHTMLParser(HTMLParser):
         if not stripped:
             return
         self.text_parts.append(stripped)
+        if self._author_name_field is not None:
+            self._author_name_parts.append(stripped)
         if self._anchor_stack:
             self._anchor_stack[-1][2].append(stripped)
         if self._json_ld_depth:
@@ -652,6 +683,8 @@ class ScienceDirectAdapter(LiteratureSourceAdapter):
             if not isinstance(json_authors, list):
                 json_authors = [json_authors]
             authors = tuple(filter(None, (_json_name(author) for author in json_authors)))
+        if not authors:
+            authors = tuple(dict.fromkeys(parser.author_group_names))
 
         date = _meta_first(parser, "citation_publication_date", "citation_date", "dc.date")
         if date == UNKNOWN:

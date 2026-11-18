@@ -237,5 +237,47 @@ class ScienceDirectAdapterAsyncTests(unittest.IsolatedAsyncioTestCase):
             await adapter.download_fulltext(record, access)
 
 
+
+SYNTHETIC_BYLINE_ONLY_ARTICLE = """<html lang="en"><head>
+<title>A Synthetic Study of Ledger Design - ScienceDirect</title>
+<meta name="citation_title" content="A Synthetic Study of Ledger Design">
+<meta name="citation_doi" content="10.9999/S0000-0000(00)00000-0">
+<meta name="citation_journal_title" content="Journal of Synthetic Fixtures">
+<meta name="citation_volume" content="58"><meta name="citation_firstpage" content="3">
+<meta name="citation_lastpage" content="27"><meta name="citation_publication_date" content="2000/01/01">
+</head><body><h1>A Synthetic Study of Ledger Design</h1>
+<div class="content-authors"><div id="author-group" class="author-group">
+<span class="sr-only">Author links open overlay panel</span>
+<button type="button"><span><span class="react-xocs-alternative-link"><span class="given-name">Alice</span>
+<span class="text surname">Van Example</span> </span><span class="author-ref"><sup>a</sup></span></span></button>,
+<a href="/author/1/bob-sample"><span><span class="given-name">Bob</span> <span class="text surname">Sample-Jones</span></span></a>
+<div class="affiliation"><span class="surname-note">not a name</span></div>
+</div></div>
+<p>An unrelated <span class="surname">Outsider</span> outside the byline.</p>
+</body></html>"""
+
+
+class ScienceDirectBylineAuthorsTests(unittest.TestCase):
+    # Older articles have neither citation_author meta nor JSON-LD; without the
+    # byline the first author is unknown and a DOI-less scan can never be
+    # identified by its citation.
+    def test_byline_given_name_and_surname_pairs_become_the_authors(self):
+        record = ScienceDirectAdapter.parse_article_html(
+            SYNTHETIC_BYLINE_ONLY_ARTICLE,
+            source_url="https://www.sciencedirect.com/science/article/pii/S0000000000000000",
+        )
+        self.assertEqual(record.authors, ("Alice Van Example", "Bob Sample-Jones"))
+        self.assertEqual(record.volume, "58")
+
+    def test_meta_authors_still_win_over_the_byline(self):
+        html = SYNTHETIC_BYLINE_ONLY_ARTICLE.replace(
+            "<head>", '<head><meta name="citation_author" content="Carol Meta">'
+        )
+        record = ScienceDirectAdapter.parse_article_html(
+            html, source_url="https://www.sciencedirect.com/science/article/pii/S0000000000000000",
+        )
+        self.assertEqual(record.authors, ("Carol Meta",))
+
+
 if __name__ == "__main__":
     unittest.main()

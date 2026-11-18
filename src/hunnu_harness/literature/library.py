@@ -1178,6 +1178,14 @@ class ExternalPaperImporter:
             stable_identifier=str(
                 self._metadata_value(metadata, "source_locator", "SourceLocator", default=UNKNOWN)
             ),
+            # Only used when the PDF prints no DOI: then the title, first author,
+            # volume and first page together must be on its first page.
+            volume=str(self._metadata_value(metadata, "volume", "Volume", default=UNKNOWN)).strip() or UNKNOWN,
+            pages_or_article_number=str(
+                self._metadata_value(
+                    metadata, "pages_or_article_number", "PagesOrArticleNumber", default=UNKNOWN
+                )
+            ).strip() or UNKNOWN,
         )
         validation = AuthorizedFullTextValidator.validate(
             _windows_io_path(staged_pdf),

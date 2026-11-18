@@ -72,6 +72,21 @@ class ExternalImportIdentityGateTests(unittest.TestCase):
         self.assertIn("TitleVerification=matched", result.reason)
         self.assertTrue(result.managed_path.exists())
 
+    def test_doi_less_scan_imports_on_title_author_volume_and_first_page(self) -> None:
+        # With the DOI printed nowhere, the citation stands in for it; without
+        # volume and pages in the metadata the same file stays unverified.
+        text = "\n".join(("Journal of Identity Safety 58 (2000) 3-27", TITLE_A, "ADA AUTHOR"))
+        _, staged = self._stage_text(text)
+        metadata = self._metadata(doi=DOI_A)
+        refused = self.importer.import_staged_pdf(staged.staged_path, metadata)
+        self.assertNotEqual(refused.disposition, LibraryDisposition.NEW_PAPER)
+
+        _, staged = self._stage_text(text, name="candidate-2.pdf")
+        metadata.update({"Volume": "58", "PagesOrArticleNumber": "3-27"})
+        result = self.importer.import_staged_pdf(staged.staged_path, metadata)
+        self.assertEqual(result.disposition, LibraryDisposition.NEW_PAPER)
+        self.assertTrue(result.managed_path.exists())
+
     def test_clearly_wrong_title_fails_closed_before_managed_or_catalog_write(self) -> None:
         _, staged = self._stage_text(TITLE_A)
         metadata = self._metadata(title=TITLE_B)
