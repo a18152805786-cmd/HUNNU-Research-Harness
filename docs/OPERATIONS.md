@@ -40,6 +40,28 @@ codex mcp add playwright npx "@playwright/mcp@0.0.79"
 codex mcp list
 ```
 
+### Playwright 自带 Chromium 版本对不上
+
+现象：直接调用 `chromium.launch()` 或 `launch_persistent_context()` 且没传 `executable_path` 时，报 `Executable doesn't exist at ...\ms-playwright\chromium-<修订号>\...`。
+
+原因：每个 playwright 版本钉死一个 Chromium 修订号（见 `.venv\Lib\site-packages\playwright\driver\package\browsers.json`），而 `%LOCALAPPDATA%\ms-playwright` 里可能只有别的版本装的另一个修订号（例如 venv 的 playwright 1.62.0 要 1234，目录里只有 1208）。
+
+对 Harness 本身没有影响：`discover_chrome_executable()` 先认 `HUNNU_RESEARCH_CHROME`，再找系统 Chrome，找到就传给 `executable_path`，不会走自带 Chromium。只有临时写的验收 / 截图脚本不传路径时才会撞上。
+
+处理（任选其一）：
+
+- 最省事：脚本里复用 Harness 的发现函数，指向系统 Chrome。不装任何东西，也不碰专用 profile（验收用临时 `user_data_dir`）。
+
+  ```python
+  from hunnu_harness.browser.playwright_backend import discover_chrome_executable
+  exe = discover_chrome_executable()
+  ctx = await p.chromium.launch_persistent_context(user_data_dir=tmp, headless=True, executable_path=str(exe))
+  ```
+
+- 想用自带浏览器：`.venv\Scripts\python.exe -m playwright install chromium`（约 150MB），装出与当前 playwright 匹配的修订号。不要沿用旧修订号的目录。
+
+已实测：playwright 1.62.0（Chromium 151）驱动系统 Chrome 157，无头启动、渲染、截图均正常；`tests.test_chrome_discovery` 通过。主版本差一档，遇到只在新 Chrome 上出现的怪异行为时，再装匹配的自带版本对照。
+
 ## CNRDS
 
 **入口与权限**（2026-09-28 实测，详见 [INSTITUTIONAL_DATA_ACCESS.md](INSTITUTIONAL_DATA_ACCESS.md)）：图书馆主页 → 数据库导航 → “CNRDS中国研究数据服务平台(商学院)” → 网络地址 → CNRDS 登录页 → 用户本人点“学校登录”（校园网 IP 绑定，无需账号密码）。学校账号是全校共用的 `schooluser`，只订阅 29 个基础库；公司特色库、经济特色库（供应链 SCRD、ESG、新质生产力 NQPD 等）要个人账号，只能由用户本人注册。
