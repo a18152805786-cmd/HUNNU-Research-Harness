@@ -295,6 +295,11 @@ class AuthorizedFullTextValidator:
         if full_text_format == FullTextFormat.PDF:
             pdf = PDFValidator.validate(path)
             title_check = cls._verify_pdf_title(path, record)
+            pdf_error = pdf.error
+            if pdf.passed and not expected_extension:
+                # Without this the failure surfaced as reason "unknown": the
+                # PDF itself was fine, only its name lacked ".pdf".
+                pdf_error = f"Unexpected file extension {path.suffix or '(none)'!r} for a declared PDF: {path.name}"
             return FullTextValidationResult(
                 path,
                 full_text_format,
@@ -305,7 +310,7 @@ class AuthorizedFullTextValidator:
                 pdf.file_size_bytes,
                 pdf_validation_passed=pdf.passed,
                 content_title_verification=title_check,
-                error=pdf.error,
+                error=pdf_error,
             )
 
         if full_text_format == FullTextFormat.CAJ:
