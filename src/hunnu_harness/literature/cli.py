@@ -388,6 +388,12 @@ async def _run_live_into(args: argparse.Namespace, report: CliReport) -> tuple[i
     report.put("Status", result.status.value)
     report.put("Results", len(result.records))
     report.put("Downloads", len(result.downloads))
+    run_errors = list(getattr(result, "errors", None) or [])
+    if result.status == RunStatus.NO_RESULTS and run_errors:
+        # Why nothing came back -- "no bounded query could be generated" and
+        # a search that ran and matched nothing are different failures, and
+        # the report must not leave an Agent to guess which one it got.
+        report.put("Errors", run_errors, plain=json.dumps(run_errors, ensure_ascii=False))
     report.put("PdfDownloadReadiness", pdf_readiness)
     report.put("ResearchChromeDirectPdfDownloadConfigured", pdf_readiness["ResearchChromeDirectPdfDownloadConfigured"])
     if request.restricted_search:

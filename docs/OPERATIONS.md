@@ -150,6 +150,17 @@ CNKI 的一框式检索一次只检一个字段，所以指定刊名时按「文
 
 **只读列表（`ListingOnly`）。** 只想先拉一份候选清单时，在受限请求里加 `"ListingOnly": true`，并把 `MaxDownloads` 设为 0（不满足就判为无效请求）。每条已确认的结果行按页面所写原样保留——题名、刊名、年份、作者——不再逐条打开文章：不做精确题名重锁检索，不开详情页，不查全文权限。一次 15 条的期刊检索由约 30 次页面访问降到 1 次。这些记录没有经过身份锁，永远不会成为下载候选；选中的文章之后按精确题名下载（`acquire --title` 或 `acquire-batch` 的条目），那一步照常打开、锁定、核对。`acquire` 输出的 `SearchRestriction` 里会写 `"ListingOnly": true`，检索日志的 `ResultsInspected` 为 0。
 
+**请求 JSON 的字段名（2026-11-25）。** `acquire --request-json` 读的是文献请求格式，检索词只从 `KeywordsCN`、`KeywordsEN`、`ExactTitles`、`DOIs`、`Authors`、`SourceJournals`、`ResearchQuestion` 生成。`Query` 是 `agent-route` 的字段：请求里只有 `Query` 时，以前会静默返回 `NO_RESULTS`，浏览器停在原页面，看起来像"知网查无结果"；现在会在启动浏览器前报 `INVALID_REQUEST`，并说明该用哪个字段。`NO_RESULTS` 的报告还会带上 `Errors`，用来区分"没生成检索式"和"检索了但没命中"。
+
+**没有扩展名的下载（2026-11-25）。** 知网有时把文件名给成光秃秃的 `pdf`。以前文件落成 `staging\pdf`，校验要求声明为 PDF 的文件必须以 `.pdf` 结尾，于是报 `DOWNLOAD_FAILED`、原因 `unknown`，其实文件是对的。现在本地执行器在落盘后检查：文件名没有扩展名时，只有文件头证明了格式（`%PDF-`，或 CAJ 的 `CAJ`/`HNLC`/`KDH`），才补上请求的扩展名；文件头对不上就保留原名，照样被校验拒收。扩展名不符时，报错会写明是扩展名问题。
+
+**待查：知网页面身份锁时有时无地停下（2026-11-25）。** 同一天、同一台机器上，`acquire --source cnki` 时成时败，失败时报 `SOURCE_LAYOUT_CHANGED`。检索日志写的是 `TargetPageIdentity=uncertain; CNKI automation stopped before any business action`，从发出检索到停下约 2 秒，最终页面是正常的"检索-中国知网"。
+- 同一条受限检索，前两次失败、隔几分钟后第三次成功；
+- 一篇论文按题名下载，连续三次失败，其中一次先 `browser-stop`，确认没有 Chrome 进程后再试，仍然失败。
+- 身份锁要求当前知网页面能凭稳定网址加标题唯一锁定（`cnki_challenge.py`），这是有意的保护，**不应为让报错消失而放松**。
+- 待查的方向：自启浏览器是否恢复了上次会话里同一网址的检索页（造成重复页面）；结果页加载完成之前是否就做了身份判断。
+- 查清之前的做法：失败后隔几分钟再试，或在 Research Chrome 里手动关掉多余的知网标签页，不要连续重试同一篇。
+
 **批量队列（`acquire-batch`，规则 75）。** 多篇论文写进一个队列文件，由一个进程一篇接一篇地跑完，每篇走的都是上面 `acquire` 的同一条路径（限速、写前记账、身份锁、校验、SHA-256、manifest、归档、分类都不变）：
 
 ```powershell

@@ -278,6 +278,30 @@ class LiteratureSearchRequest:
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "LiteratureSearchRequest":
+        # `Query` is the agent-route field (AgentRequestRouter parses it into
+        # keywords and a ResearchQuestion).  This mapping reads no such field:
+        # a request carrying only `Query` plans no search at all, and the run
+        # used to come back as a silent NO_RESULTS with the Research Chrome
+        # never leaving whatever page it was on (found live 2026-11-21).
+        # Refuse it here, before any browser starts, and say what to use.
+        query = _value(mapping, "Query", "query")
+        if isinstance(query, str) and query.strip():
+            searchable = (
+                ("KeywordsCN", "keywords_cn"),
+                ("KeywordsEN", "keywords_en"),
+                ("ExactTitles", "exact_titles"),
+                ("DOIs", "dois"),
+                ("Authors", "authors"),
+                ("SourceJournals", "source_journals"),
+                ("ResearchQuestion", "research_question"),
+            )
+            if not any(_value(mapping, *names) for names in searchable):
+                raise ValueError(
+                    "'Query' is the agent-route field; a literature request read here plans its searches "
+                    "only from KeywordsCN, KeywordsEN, ExactTitles, DOIs, Authors, SourceJournals or "
+                    "ResearchQuestion, so this request would search nothing. Put the search terms in "
+                    "KeywordsCN (Chinese) or KeywordsEN (English), or send the request through agent-route"
+                )
         original = str(
             _value(
                 mapping,

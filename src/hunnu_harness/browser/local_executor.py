@@ -48,6 +48,12 @@ from .commands import (
 from .transport import BrowserTransportError
 from ..paths import _windows_io_path
 
+# File signatures that prove a requested suffix for an extension-less download.
+_SUFFIX_SIGNATURES: dict[str, tuple[bytes, ...]] = {
+    ".pdf": (b"%PDF-",),
+    ".caj": (b"CAJ", b"HNLC", b"KDH"),
+}
+
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
@@ -567,6 +573,36 @@ class LocalPlaywrightExecutor:
 
         return matches
 
+    @staticmethod
+    def _restore_requested_suffix(path: Path, requested_filename: str) -> Path:
+        """Give an extension-less download the suffix the command asked for,
+        but only when the file's own signature proves that format.
+
+        Found live 2026-11-25: a source served a valid PDF whose browser-suggested
+        name was the bare word ``pdf``.  The file landed as ``staging/pdf``;
+        the validator, which requires ``.pdf`` for a declared PDF, rejected it,
+        and the run reported DOWNLOAD_FAILED with reason ``unknown``.  A file
+        whose bytes do not match the requested format keeps its name, so the
+        validator still refuses it.
+        """
+        requested_suffix = Path(requested_filename or "").suffix.casefold()
+        if path.suffix or requested_suffix not in _SUFFIX_SIGNATURES:
+            return path
+        try:
+            with _windows_io_path(path).open("rb") as stream:
+                header = stream.read(16)
+        except OSError:
+            return path
+        if not any(header.startswith(marker) for marker in _SUFFIX_SIGNATURES[requested_suffix]):
+            return path
+        target = path.with_name(f"{path.name}{requested_suffix}")
+        counter = 1
+        while _windows_io_path(target).exists():
+            target = path.with_name(f"{path.name}_{counter}{requested_suffix}")
+            counter += 1
+        _windows_io_path(path).rename(_windows_io_path(target))
+        return target
+
     async def _download(self, command: DownloadCommand) -> DownloadArtifact:
         page = self._require_page()
         locator = self._resolve_locator(command.target)
@@ -600,7 +636,7 @@ class LocalPlaywrightExecutor:
                 directed = await self._directed_capture(locator, command)
                 if directed is not None:
                     artifact = DownloadArtifact.from_path(
-                        directed.path,
+                        self._restore_requested_suffix(Path(directed.path), command.suggested_filename),
                         suggested_filename=command.suggested_filename,
                         source_url=self._page_url(page),
                         page=self.page_handle,
@@ -623,6 +659,7 @@ class LocalPlaywrightExecutor:
                 await _maybe_await(save_as(str(target)))
                 if not _windows_io_path(target).is_file():
                     raise DownloadFailure("Playwright download completed without a local file")
+                target = self._restore_requested_suffix(target, command.suggested_filename)
                 artifact = DownloadArtifact.from_path(
                     target,
                     suggested_filename=filename,
